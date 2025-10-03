@@ -12,11 +12,15 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn produce_links(&self) -> Vec<String> {
-        self.ls
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| load_config(&self.config).unwrap())
+    fn produce(&mut self) -> &Vec<String> {
+        if self.ls.is_none() {
+            self.ls = Some(load_config(&self.config).unwrap());
+        }
+        self.ls.as_ref().unwrap()
+    }
+
+    pub fn produce_links(&mut self) -> Vec<&str> {
+        self.produce().iter().map(|s| s.as_str()).collect()
     }
 }
 
