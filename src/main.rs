@@ -13,7 +13,7 @@ fn criteria(item: &str) -> Result<String, ItemError> {
     } else {
         Err(ItemError {
             item: item.to_string(),
-            message: "Item is not a valid directory.".to_string(),
+            message: "No such directory found.".to_string(),
         })
     }
 }
