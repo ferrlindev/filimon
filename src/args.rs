@@ -38,85 +38,106 @@ fn load_config(config_path: &str) -> Result<Vec<String>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, File};
     use std::io::Write;
-    use tempfile::TempDir;
 
     #[test]
-    fn test_produce_links_with_lns_provided() {
-        let args = Args {
-            ls: Some(vec!["link1".to_string(), "link2".to_string()]),
-            config: "dummy_config.json".to_string(),
+    fn test_parse_default() {
+        let args = Args::parse_from(vec!["prog"]);
+        assert_eq!(args.ls, None);
+        assert_eq!(args.config, "config.json");
+    }
+
+    #[test]
+    fn test_parse_ls() {
+        let args = Args::parse_from(vec!["prog", "--ls", "a,b,c"]);
+        assert_eq!(
+            args.ls,
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        assert_eq!(args.config, "config.json");
+    }
+
+    #[test]
+    fn test_parse_config() {
+        let args = Args::parse_from(vec!["prog", "--config", "other.json"]);
+        assert_eq!(args.ls, None);
+        assert_eq!(args.config, "other.json");
+    }
+
+    #[test]
+    fn test_produce_links_with_ls() {
+        let mut args = Args {
+            ls: Some(vec!["a".to_string(), "b".to_string()]),
+            config: "config.json".to_string(),
         };
         let links = args.produce_links();
-        assert_eq!(links, vec!["link1".to_string(), "link2".to_string()]);
+        assert_eq!(links, vec!["a", "b"]);
+        assert_eq!(args.ls, Some(vec!["a".to_string(), "b".to_string()]));
     }
 
     #[test]
-    fn test_produce_links_without_lns_loads_from_config() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test_config.json");
-        let file_path_str = file_path.to_str().unwrap();
+    fn test_load_config_success() {
+        let config_path = "test_config_success.json";
+        let mut file = File::create(config_path).unwrap();
+        file.write_all(b"{\"ls\": [\"x\", \"y\"]}").unwrap();
+        let res = load_config(config_path).unwrap();
+        assert_eq!(res, vec!["x".to_string(), "y".to_string()]);
+        fs::remove_file(config_path).unwrap();
+    }
 
-        let json_content = r#"{"lns": ["config_link1", "config_link2"]}"#;
-        let mut file = fs::File::create(file_path_str).unwrap();
-        file.write_all(json_content.as_bytes()).unwrap();
+    #[test]
+    fn test_load_config_file_not_found() {
+        let res = load_config("nonexistent.json");
+        assert!(res.is_err());
+    }
 
-        let args = Args {
+    #[test]
+    fn test_load_config_invalid_json() {
+        let config_path = "test_config_invalid.json";
+        fs::write(config_path, "not json").unwrap();
+        let res = load_config(config_path);
+        assert!(res.is_err());
+        fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn test_produce_with_load_success() {
+        let config_path = "test_config_produce.json";
+        fs::write(config_path, "{\"ls\": [\"p\", \"q\"]}").unwrap();
+        let mut args = Args {
             ls: None,
-            config: file_path_str.to_string(),
+            config: config_path.to_string(),
         };
+        let ls = args.produce();
+        assert_eq!(ls, &vec!["p".to_string(), "q".to_string()]);
+
         let links = args.produce_links();
-        assert_eq!(
-            links,
-            vec!["config_link1".to_string(), "config_link2".to_string()]
-        );
-
-        // TempDir cleans up automatically on drop
+        assert_eq!(links, vec!["p", "q"]);
+        assert_eq!(args.ls, Some(vec!["p".to_string(), "q".to_string()]));
+        fs::remove_file(config_path).unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "called `Result::unwrap()` on an `Err` value")]
-    fn test_produce_links_panics_on_load_config_error() {
-        let args = Args {
+    #[should_panic]
+    fn test_produce_panic_file_not_found() {
+        let mut args = Args {
             ls: None,
-            config: "nonexistent_config.json".to_string(),
+            config: "nonexistent.json".to_string(),
         };
-        let _ = args.produce_links(); // Should panic on unwrap() due to file not found
+        args.produce();
     }
 
     #[test]
-    fn test_load_config_valid_json() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("valid_config.json");
-        let file_path_str = file_path.to_str().unwrap();
-
-        let json_content = r#"{"lns": ["valid_link1", "valid_link2"]}"#;
-        let mut file = fs::File::create(file_path_str).unwrap();
-        file.write_all(json_content.as_bytes()).unwrap();
-
-        let loaded_links = load_config(file_path_str).unwrap();
-        assert_eq!(
-            loaded_links,
-            vec!["valid_link1".to_string(), "valid_link2".to_string()]
-        );
-
-        // TempDir cleans up automatically
-    }
-
-    #[test]
-    #[should_panic(expected = "called `Result::unwrap()` on an `Err` value")]
-    fn test_load_config_invalid_json_panics_on_unwrap() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("invalid_config.json");
-        let file_path_str = file_path.to_str().unwrap();
-
-        let invalid_json = r#"{"lns": ["link1", ]}"#; // Invalid trailing comma
-        let mut file = fs::File::create(file_path_str).unwrap();
-        file.write_all(invalid_json.as_bytes()).unwrap();
-
-        let _ = load_config(file_path_str).unwrap(); // Panics on deserialization error
-
-        // TempDir cleans up automatically (won't reach here)
+    #[should_panic]
+    fn test_produce_panic_invalid_json() {
+        let config_path = "test_config_panic.json";
+        fs::write(config_path, "not json").unwrap();
+        let mut args = Args {
+            ls: None,
+            config: config_path.to_string(),
+        };
+        args.produce();
+        fs::remove_file(config_path).unwrap();
     }
 }

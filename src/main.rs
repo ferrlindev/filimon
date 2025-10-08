@@ -2,7 +2,7 @@ mod args;
 mod check;
 
 use args::Args;
-use check::{ItemError, validate_with};
+use check::{ItemError, ValidateWithExt};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
@@ -29,15 +29,7 @@ fn is_valid_directory(path: &str) -> bool {
 async fn main() -> Result<()> {
     let mut args = Args::parse();
     let links = args.produce_links();
-    let result = validate_with(links, criteria);
-
-    // for debugging purposes only.
-    println!("Valid items {:?}", result.valid);
-    println!("Invalid items:");
-    for error in result.invalid {
-        println!(" - {}", error);
-    }
-
+    let result = links.validate_with(criteria);
     let paths: Vec<PathBuf> = result
         .valid
         .clone()
@@ -58,7 +50,6 @@ async fn main() -> Result<()> {
     })?;
 
     wx.config.pathset(paths);
-    println!("Watching for changes in {:?}", result.valid);
     let _ = wx.main().await.into_diagnostic()?;
 
     Ok(())
