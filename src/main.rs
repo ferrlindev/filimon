@@ -5,6 +5,7 @@ use args::Args;
 use check::{ItemError, ValidateWithExt};
 use clap::Parser;
 use std::path::{Path, PathBuf};
+use tokio;
 
 use miette::{IntoDiagnostic, Result};
 use watchexec::Watchexec;
