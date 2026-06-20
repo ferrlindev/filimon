@@ -8,7 +8,7 @@ name = "fili"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"]}
+clap = { version = "4", features = ["derive","env"]}
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
 scraper = "0.21"
 serde = { version = "1", features = ["derive"]}
@@ -17,6 +17,9 @@ url = "2"
 regex = "1"
 tempfile = "3"
 watchexec = "8"
+watchexec-events = "6"
 watchexec-signals = "5"
 tokio = { version = "1", features = ["full"] }
 miette ={ version = "7", features = ["fancy"]}
+gline-rs = "1.0"
+orp = "0.9"

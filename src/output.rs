@@ -6,7 +6,7 @@
 // In a production WISE deployment, this module would push to a MongoDB / Elasticsearch. For portability
 // we write to a local JSON file and print a human-readable summary to stdout.
 //
-use crate::models::ExtractedArticles;
+use crate::models::ExtractedArticle;
 use std::fs::File;
 use std::io::Write;
 
@@ -20,7 +20,7 @@ pub fn save_json(articles: &[ExtractedArticle], path: &str) -> std::io::Result<(
 }
 
 /// Print a single-article summary to stdout in a WISE pipeline log style.
-pub fn print_summary(article: &ExtractedArticles) {
+pub fn print_summary(article: &ExtractedArticle) {
     let bar = "--".repeat(60);
     println!("\n{bar}");
     println!(" ■  {}", article.url);
@@ -58,11 +58,10 @@ pub fn print_summary(article: &ExtractedArticles) {
     println!("{bar}");
 }
 
-pub fn print_run_summary(total_crawled: usize, accepted: usize, output_path: &str) {
+pub fn print_run_summary(accepted: usize, output_path: &str) {
     println!("\n╔══════════════════════════════════════════╗");
     println!("║           WISE Pipeline Summary           ║");
     println!("╠══════════════════════════════════════════╣");
-    println!("║  Pages crawled : {total_crawled:<25}║");
     println!("║  Articles kept : {accepted:<25}║");
     println!("║  Output file   : {output_path:<25}║");
     println!("╚══════════════════════════════════════════╝");

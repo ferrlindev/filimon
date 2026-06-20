@@ -1,26 +1,39 @@
-// Stage 3: Semantic Relevance Scoring & Basic NER
+// Stage 3: Semantic Relevance Scoring + GLINER-powered NER
 //
-// Maps to the paper's:
-//  * Relevance Scoring Module -> compute_relevance_score()
-//  * Semantic Data Filtering -> threshold applied in main.rs
-//  * Named Entity Recognition -> detect_named_entities()
+// NER is not backed by gline-rw 1.0 (GLiNER inference engine) instead of hand-craftged reges patterns. GLiner is a zero-shot BERT-like model
+// that extracts named entities for any label set without task-specific find-tuning, which maps directly to the deep-learning NER
+// described in Equation 10 of the WISE paper.
 //
-// This uses BERT embeddings + cosine similarity for relevance.
-// We approximate this with TF-IDF-flavoured formula:
+// Architecture:
+//  NEREngine -- holds a loaded GLiNER<SpanNode> model; create once, reuse.
+//  detect() -- runs inference, maps spans -> Vec<NamedEntity>,
+//  compute_relevance_score()  / top_keywords() / infer_category() - unchanged
 //
-// score = tf_topic(d) / |tokens| * boost
-//          + content_richness_bonus
-//          + vocabulary_diversity_bonus
-//
-// This is the standard "lite" substitute when no GPU / ONNX runtime
-// is available, and is explicitly noted as such in the comments.
+use std::path::Path;
 
 use crate::models::{NamedEntity, TokenizedContent};
-use regex::Regex;
+use gliner::model::GLiNER;
+use gliner::model::input::text::TextInput;
+use gliner::model::params::Parameters;
+use gliner::model::pipeline::span::SpanMode;
+use miette::{Result, miette};
+use orp::params::RuntimeParameters;
 
-// "Ontology terms" -- the paper's ohm set.
-// In the full system these come from a pre-loaded domain ontology; here
-// we hard-code a news-domain vocabulary.
+// -- GLINER zero-shot entity labels
+// These strings are passed verbatim to the model; span.class() returns them
+// back as the entity type. Add or remove labels without retraining.
+const NER_LABELS: &[&str] = &[
+    "person",
+    "organization",
+    "location",
+    "date",
+    "event",
+    "product",
+    "law or regulation",
+    "monetary value",
+];
+
+// -- Relevance topic vocabulary
 const TOPIC_TERMS: &[&str] = &[
     //Politics / governance
     "election",
@@ -91,7 +104,65 @@ const TOPIC_TERMS: &[&str] = &[
     "sentenc",
 ];
 
-/// Compute a normalised relevance score E [0.0, 1.0]
+// Wraps a loaded GLiNER span-mode model.
+//
+// Initialisation loads the ONNX model into memory (~200-500MB depending on the model variant) and compiles
+// the ONNX graph. Create **once** per process and pass `&NerEngine` to every call site -- do not reload per article.
+pub struct NerEngine {
+    model: GLiNER<SpanMode>,
+}
+
+impl NerEngine {
+    /// Load a GLiNER span-mode model from ONNX files on disk.
+    ///
+    /// # Arguments
+    /// * `tokenizer_path` - path to `tokenizer.json`
+    /// * `model_path` - path to `onnx/model.onnx`
+    ///
+    /// # Errors
+    /// Returns an error if either file is missing or if the ONNX runtime
+    /// fails to load the model graph.
+    pub fn new(
+        tokenizer_path: impl AsRef<Path>,
+        model_path: impl AsRef<Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let model = GLiNER::<SpanMode>::new(
+            Parameters::default(),
+            RuntimeParameters::default(),
+            tokenizer_path.as_ref(),
+            model_path.as_ref(),
+        )
+        .map_err(|e| miette!("{e}"))?;
+
+        Ok(Self { model })
+    }
+
+    /// Run NER inference on `text` and return deduplicated named entities.
+    pub fn detect(&self, text: &str) -> Result<Vec<NamedEntity>> {
+        let input = TextInput::from_str(&[text], NER_LABELS).map_err(|e| miette!("{e}"))?;
+        let output = self.model.inference(input).map_err(|e| miette!("{e}"))?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut entities: Vec<NamedEntity> = Vec::new();
+
+        // output.spans is Vec<Vec<Span>>; one inner Vec per input sentence.
+        for spans in &output.spans {
+            for span in spans {
+                let text = span.text().to_string();
+                if !seen.insert(text.clone()) {
+                    continue; // dedup
+                }
+                // Normalise label to SCREAMING_SNAKE_CASE kind convention.
+                let kind = span.class().to_uppercase().replace(' ', "_");
+                entities.push(NamedEntity { text, kind });
+            }
+        }
+        entities.truncate(15);
+        Ok(entities)
+    }
+}
+
+/// Compute a normalised relevance score E [0.0, 1.0] for a tokenized page.
 ///
 /// Three additive components
 /// 1. Topic-term TF ratio -- how much of the content is on-topic.
@@ -103,10 +174,10 @@ pub fn compute_relevance_score(content: &TokenizedContent) -> f64 {
         return 0.0;
     }
 
-    // Component 1: sum of frequencies of topic terms / total tokens.
+    // Component 1: prefix-match TF against ontology terms Ohm.
     let topic_hits: usize = TOPIC_TERMS
         .iter()
-        .filter_map(|term| {
+        .map(|term| {
             // Prefix match so "elect" hits "election", "elected", etc.
             content
                 .frequencies
@@ -114,7 +185,6 @@ pub fn compute_relevance_score(content: &TokenizedContent) -> f64 {
                 .filter(|(k, _)| k.starts_with(term))
                 .map(|(_, v)| v)
                 .sum::<usize>()
-                .into()
         })
         .sum();
 
@@ -125,11 +195,11 @@ pub fn compute_relevance_score(content: &TokenizedContent) -> f64 {
     let richness = (n / 300.0).min(1.0).sqrt();
     let component2 = richness * 0.25; // 25 % weight
 
-    // Component 3: vocabulary diversity (unique / total)
-    let diversity = content.frequencies.len() as f64 / n;
-    let component3 = diversity.min(1.0) * 0.15; // 15 % weight
+    // Component 3: unique / total token ratio
+    let diversity = (content.frequencies.len() as f64 / n).min(1.0);
+    let component3 = diversity * 0.15;
 
-    (component1 + component2 * component3).min(1.0)
+    (component1 + component2 + component3).min(1.0)
 }
 
 /// Return the top-`n`  tokens ranked by frequency (keyword extraction)
@@ -139,68 +209,7 @@ pub fn top_keywords(content: &TokenizedContent, n: usize) -> Vec<String> {
     pairs.into_iter().take(n).map(|(k, _)| k.clone()).collect()
 }
 
-/// Rule-based Named Entity Recognition
-///
-/// NER uses a trained deep-learning model. Here we use hand-crafted regex patterns as a transparent, dependency
-/// -free proxy.
-/// The patterns cover:
-///    * ISO-8601 and human-readable dates -> kind = "DATE"
-///    * Two-or-three capitalised words -> kind = "PERSON_OR_ORG"
-///    * All-caps abbreviations (3-5 chars) -> kind = "ACRONYM"
-pub fn detect_named_entities(body: &str) -> Vec<NamedEntity> {
-    let mut entities: Vec<NamedEntity> = Vec::new();
-
-    // -- DATE PATTERNS
-    // "June 19, 2026" / "19 June 2026"
-    let date_long = Regex::new(
-        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)
-        \s+\d{1,2},?\s+\d{4}\b").unwrap();
-
-    // ISO date "2026-06-19"
-    let date_iso = Regex::new(r"\b\d{4}-\d{2}\b").unwrap();
-
-    for re in &[&date_long, &date_long2, &date_iso] {
-        for m in re.find_iter(body) {
-            entities.push(NamedEntity {
-                text: m.as_str().to_string(),
-                kind: "DATE".to_string(),
-            });
-        }
-    }
-
-    // --- PERSON_OR_ORG: two ( or three) Title-Cased words in a row --
-    // e.g. "The White House", "Apple Inc"
-    let person_re = Regex::new(r"[A-Z][a-z]+){1,2}").unwrap();
-    for m in person_re.find_iter(body) {
-        let candidate = m.as_str().trim();
-        // Skip very common false-positives
-        let common = ["The following", "This week", "Last Year", "Next Month"];
-        if common.contans(&candidate) {
-            continue;
-        }
-        entities.push(NamedEntity {
-            text: candidate.to_string(),
-            kind: "PERSON_OR_ORG".to_string(),
-        });
-    }
-
-    // --  ACRONYM: 3-5 upper-case letters (BBC, NASA, NATO, etc.) ---
-    let acronym_re = Regex::new(r"\b[A-Z]{3,5}\b").unwrap();
-    for m in acronym_re.find_iter(body) {
-        entities.push(NamedEntity {
-            text: m.as_str().to_string(),
-            kind: "ACRONYM".to_string(),
-        });
-    }
-
-    // Deduplicate by text and cap at 15.
-    let mut seen = std::collections::HashSet::new();
-    entities.retain(|e| seen.insert(e.text.clone()));
-    entities.truncate(15);
-    entities
-}
-
-/// Map top keywords to one of five broad news categories.
+/// Map top keywords to a broad news category using prefix-matching rules
 pub fn infer_category(keywords: &[String]) -> String {
     let joined = keywords.join(" ").to_lowercase();
 

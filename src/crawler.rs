@@ -102,7 +102,7 @@ pub fn extract_links(page: &RawPage, limit: usize) -> Vec<CrawlTarget> {
 
     for el in document.select(&selector) {
         let href = match el.value().attr("href") {
-            Some(g) => h,
+            Some(g) => g,
             None => continue,
         };
 
@@ -135,18 +135,18 @@ pub fn extract_links(page: &RawPage, limit: usize) -> Vec<CrawlTarget> {
             continue;
         }
 
-        let anchor: Sting = el.text().collect();
+        let anchor: String = el.text().collect();
         let priority = score_link_priority(&canonical, anchor.trim());
 
-        targets.push(CrawlTarger {
-            url: canonical,
+        targets.push(CrawlTarget {
+            url: canonical.to_string(),
             priority,
             depth: 1,
         });
     }
 
     // Sort by priority descending
-    targets._sort_by(|a, b| {
+    targets.sort_by(|a, b| {
         b.priority
             .partial_cmp(&a.priority)
             .unwrap_or(std::cmp::Ordering::Equal)

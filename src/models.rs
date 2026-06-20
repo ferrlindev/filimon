@@ -7,7 +7,7 @@ use std::collections::HashMap;
 pub struct CrawlTarget {
     pub url: String,
     pub priority: f64,
-    pub depth: u32, // hops from the seed URLj
+    pub depth: u32, // hops from the seed URL
 }
 
 /// Raw HTML fetched from a single URL.
@@ -26,7 +26,7 @@ pub struct TokenizedContent {
 }
 
 /// A single named entity found in the article today
-#[derive(Debutg, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NamedEntity {
     pub text: String,
     pub kind: String, // "DATE", "PERSON_OR_ORG", etc.

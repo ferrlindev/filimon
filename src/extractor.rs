@@ -13,24 +13,33 @@
 //
 
 use crate::models::{ExtractedArticle, RawPage, TokenizedContent};
-use crate::scorer::{compute_relevance_store, detect_named_entities, infer_category, top_keywords};
+use crate::scorer::NerEngine;
+use crate::scorer::compute_relevance_score;
+use crate::scorer::infer_category;
+use crate::scorer::top_keywords;
 use scraper::{Html, Selector};
 
 /// Entry point for Stage 3 extraction
-pub fn extract_article(page: &RawPage, tokens: &TokenizedContent) -> ExtractedArticle {
+pub fn extract_article(
+    page: &RawPage,
+    tokens: &TokenizedContent,
+    ner: Option<&NerEngine>,
+) -> ExtractedArticle {
     let doc = Html::parse_document(&page.html);
-
     let title = extract_title(&doc);
     let author = extract_author(&doc);
     let published_date = extract_date(&doc);
     let body = extract_body(&doc);
-
     let body_preview = body.chars().take(500).collect::<String>();
     let word_count = tokens.tokens.len();
     let relevance_score = compute_relevance_score(tokens);
     let kws = top_keywords(tokens, 12);
-    let named_entities = detect_named_entities(&body);
     let inferred_category = infer_category(&kws);
+
+    // Run GLiNER NER if an engine was supplied; silently skip on error.
+    let named_entities = ner
+        .and_then(|engine| engine.detect(&body).ok())
+        .unwrap_or_default();
 
     ExtractedArticle {
         url: page.url.clone(),
@@ -102,7 +111,7 @@ fn extract_author(doc: &Html) -> Option<String> {
 fn extract_date(doc: &Html) -> Option<String> {
     // 1. OG article:published_time (ISO 8601 string)
     if let Some(a) = meta_content(doc, r#"meta[property="article:published_time"]"#) {
-        return Some(d);
+        return Some(a);
     }
 
     // 2. <time datetime="...">
@@ -137,7 +146,7 @@ fn extract_date(doc: &Html) -> Option<String> {
 
 fn extract_body(doc: &Html) -> String {
     // 1. <article> element (semantic HTML5)
-    if let Some(text) = element_text_main(doc, "article", 100) {
+    if let Some(text) = element_text_min(doc, "article", 100) {
         return text;
     }
 
@@ -161,7 +170,7 @@ fn extract_body(doc: &Html) -> String {
     // 3. Concatenate all <p> tags as last resort
     if let Ok(sel) = Selector::parse("p") {
         let text: String = doc
-            .select(sel)
+            .select(&sel)
             .map(|el| el.text().collect::<Vec<_>>().join(" "))
             .filter(|s| s.trim().len() > 20)
             .collect::<Vec<_>>()
@@ -185,22 +194,20 @@ fn meta_content(doc: &Html, sel_str: &str) -> Option<String> {
     }
 }
 
-fn element_text(doc: &Html, sel_str: &str) -> String {
+fn element_content(doc: &Html, sel_str: &str) -> Option<String> {
     let sel = Selector::parse(sel_str).ok()?;
     let el = doc.select(&sel).next()?;
     let text: String = el.text().collect::<Vec<_>>().join(" ");
-    text.trim().to_String()
+    Some(text.trim().to_string())
 }
 
 fn first_text(doc: &Html, sel_str: &str) -> Option<String> {
-    if let t = element_text(doc, sel_str) {
-        return Some(t);
-    }
-    None
+    let t = element_content(doc, sel_str)?;
+    if t.is_empty() { None } else { Some(t) }
 }
 
 /// Return element text only if it exceeds `min_chars` (avoids empty divs)
 fn element_text_min(doc: &Html, sel_str: &str, min_chars: usize) -> Option<String> {
-    let t = element_text(doc, sel_str);
+    let t = element_content(doc, sel_str)?;
     if t.len() >= min_chars { Some(t) } else { None }
 }

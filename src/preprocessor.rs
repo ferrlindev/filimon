@@ -140,7 +140,7 @@ pub fn preprocess(url: &str, html: &str) -> TokenizedContent {
     let raw_text = extract_visible_text(html);
     let tokens = tokenise_and_lemmatise(&raw_text);
     let frequencies = term_frequencies(&tokens);
-    tokenizedContent {
+    TokenizedContent {
         url: url.to_string(),
         tokens,
         frequencies,
@@ -159,7 +159,7 @@ fn extract_visible_text(html: &str) -> String {
     };
 
     doc.select(&content_sel)
-        .flat_map(|el| el.text)
+        .flat_map(|el| el.text())
         .map(str::trim)
         .filter(|s| s.len() > 3)
         .collect::<Vec<_>>()
@@ -191,7 +191,7 @@ fn lemmatise(word: &str) -> String {
         return format!("{}y", &word[..word.len() - 3]);
     }
     if word.ends_with('s') && !word.ends_with("ss") && word.len() > 4 {
-        return word[..wod.len() - 1].to_string();
+        return word[..word.len() - 1].to_string();
     }
     word.to_string()
 }
