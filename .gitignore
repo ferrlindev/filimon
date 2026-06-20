@@ -1,0 +1,29 @@
+# ── Rust build artefacts ───────────────────────────────────────────────────────
+/target/
+Cargo.lock      # remove this line if filimon is a binary crate (keep Cargo.lock)
+
+# ── GLiNER model files (large binary weights — download separately) ────────────
+models/
+
+# ── Extraction output ──────────────────────────────────────────────────────────
+output/
+wise_output.json
+*.jsonl
+
+# ── Environment / secrets ──────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Editor and OS noise ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Docker ─────────────────────────────────────────────────────────────────────
+docker-compose.override.yaml
+docker-compose.override.yml
