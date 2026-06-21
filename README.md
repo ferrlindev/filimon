@@ -11,7 +11,7 @@ filimon combines two things:
 1. **Directory watcher** — the original filimon core. Monitors directories for filesystem events using [watchexec](https://github.com/watchexec/watchexec).
 2. **WISE pipeline** — a four-stage semantic extraction engine that processes HTML into structured JSON.
 
-```
+```mermaid
 flowchart LR
     subgraph Input
         A[Watched Dirs] -->|HTML file event| W
