@@ -1,0 +1,39 @@
+# ── Rust build artefacts (largest exclusion — can be several GB) ──────────────
+target/
+
+# ── GLiNER model files (mounted as a volume at runtime, never baked in) ───────
+models/
+
+# ── Extraction results ─────────────────────────────────────────────────────────
+output/
+wise_output.json
+
+# ── Git ────────────────────────────────────────────────────────────────────────
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# ── Cargo cache (downloaded by cargo fetch inside the image) ──────────────────
+.cargo/registry/
+.cargo/git/
+
+# ── Editor and OS noise ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Docker files (no need to copy into the build context) ─────────────────────
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# ── Docs and CI (not needed to compile the binary) ────────────────────────────
+README.md
+LICENSE*
+*.md
+.env
+.env.*
