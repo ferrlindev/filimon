@@ -243,3 +243,9 @@ None. No external service configuration is required.
 ---
 *Phase: 01-plugin-contract-configuration*
 *Completed: 2026-11-03*
+
+## Self-Check: PASSED
+
+- Files present: src/plugins/error.rs, src/plugins/config.rs, 01-03-SUMMARY.md
+- Commits on branch since base a4cb7be: 7213ee3, a82efaa, 26ab7a0, df9cb35, 68fed3c, a67a9ef (tasks), 40fc55b (SUMMARY)
+- Plan verification re-run: `cargo test --bin fili` 39 passed; clippy exit 0 with no `src/plugins/` lines; all 19 plan-named tests pass; acceptance greps (`UnknownFetcher`, the five `fili::config::` codes, `url::Host::parse`, `fn collects_all_problems`) found
