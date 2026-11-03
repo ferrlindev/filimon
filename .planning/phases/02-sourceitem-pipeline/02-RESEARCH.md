@@ -348,7 +348,7 @@ D-03 removes a topic, so this partly counts as a removal phase.
 
 | Category | Items Found | Action Required |
 |----------|-------------|------------------|
-| Stored data | Local cluster has topic `filimon-articles` (live `fluvio topic list`: `filimon-articles computed 1 1 7days … resolution::provisioned`). Existing `filimon-raw-pages` records are old `RawPage {url, html}` JSON. They are still chain-compatible, but `--from-beginning` replays them as news | Code edit only: stop creating the topic. Optionally document `fluvio topic delete filimon-articles` in README as operator cleanup. No data migration needed (old raw-pages records parse) |
+| Stored data | Local cluster has topic `filimon-articles` (live `fluvio topic list`: `filimon-articles computed 1 1 7days … resolution::provisioned`). Existing `filimon-raw-pages` records are old `RawPage {url, html}` JSON. They are still chain-compatible, but `--from-beginning` replays them as news | Code edit only: stop creating the topic. README does not document a delete step (D-03; resolved as Open Question 3). No data migration needed (old raw-pages records parse) |
 | Live service config | SmartModules `filimon/map-preprocess@0.1.0`, `filimon/map-extract@0.1.0`, `filimon/filter-relevance@0.1.0` are loaded on the local cluster (live `fluvio sm list`). `docker-compose.yml:131-132` comments describe a stream-processor that "outputs to filimon-articles" | Update the docker-compose comment (doc only). SmartModules stay untouched |
 | OS-registered state | None. No launchd/systemd/cron entries reference filimon (no such files in repo; the stream-processor exists only as a docker-compose profile) | None |
 | Secrets/env vars | None reference the articles topic (`TOKENIZER_PATH`, `MODEL_PATH`, `FILI_REGISTRY`, `FLUVIO_CLUSTER_ADDR` unaffected) | None |
@@ -449,7 +449,7 @@ Automated: a `#[cfg(test)]` helper that uses `TypedProducer::send` against a scr
 
 **Deprecated/outdated:**
 - `TOPIC_ARTICLES` / `filimon-articles`: removed by D-03.
-- `transforms-extract-only.yaml` / `transforms-filter-only.yaml` reference intermediate topics (`filimon-extracted`, `filimon-preprocessed`) that no code creates. They are not in D-03's list. Leave them, or mention them in an open question.
+- `transforms-extract-only.yaml` / `transforms-filter-only.yaml` reference intermediate topics (`filimon-extracted`, `filimon-preprocessed`) that no code creates. They are not in D-03's list. Leave them (resolved as Open Question 5).
 
 ## Assumptions Log
 
@@ -464,17 +464,18 @@ Automated: a `#[cfg(test)]` helper that uses `TypedProducer::send` against a scr
 | A7 | After a `SmartModuleRuntimeError` with `RetryMode::Disabled`, the news stream should be treated as terminated (not resumable past the bad offset) | Pitfall 2 | If the stream would continue, stopping early loses later news in that run. Low risk because fili-produced records cannot be poison after Pitfall 1's fix |
 | A8 | The README's model download (`urchade/gliner_small-v2.1` snapshot) yields `onnx/model.onnx` | Environment | If the repo lacks ONNX weights, the live SC4 check needs a different source (e.g. an ONNX-exported repo) |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Should `--enrich-ner` fail hard when the model cannot load?**
+1. **Should `--enrich-ner` fail hard when the model cannot load?** — RESOLVED: No. `load_ner_engine` keeps its silent fallback unchanged (existing behavior, Pitfall 4). SC4 is proven with the injected detector in unit tests, and the live SC4 run with the GLiNER model is a human-check after the model download (Plan 02-02, Task 2; Plan 02-01 lists the fallback as untouched).
    - What we know: today it prints `NER: ✗ unavailable` and continues. The model files are missing locally.
    - What's unclear: whether changing that counts as fixing an existing gap (out of scope).
    - Recommendation: keep the behavior, prove SC4 with the injected detector, and make the live SC4 check a human-verify step after the model download.
-2. **`--source` flag shape**
+2. **`--source` flag shape** — RESOLVED: `--source <both|news|social>` as a clap `ValueEnum` (`SourceFilter { Both, News, Social }` in `src/cli.rs`), default `both`. Preflight checks only the topics and SmartModules of the selected sources (Plan 02-02, Task 3).
    - Recommendation: `--source <both|news|social>` as a clap `ValueEnum`, default `both`. Preflight only checks topics/SMs for the selected sources.
-3. **Delete the stale `filimon-articles` topic on the local cluster?**
-   - Recommendation: document `fluvio topic delete filimon-articles` as optional operator cleanup in README. Plans must not run it automatically.
-4. **Unused `--threshold` CLI flag** (`src/cli.rs:29-31`, default 0.05) is not wired to the chain. Leave it untouched (existing gap). Do not pass it as a SmartModule param (filter-relevance ignores params; it uses a constant).
+3. **Delete the stale `filimon-articles` topic on the local cluster?** — RESOLVED: No, and README does not document it either. Per D-03 nothing may document the retired topic, so README carries no cleanup step for it, not even an optional delete line. No plan deletes the topic on the local cluster; it is left alone (Plan 02-03, "Planner decisions recorded for this plan" and Task 1). This supersedes the recommendation below.
+   - Recommendation (superseded by D-03, see resolution above): document `fluvio topic delete filimon-articles` as optional operator cleanup in README. Plans must not run it automatically.
+4. **Unused `--threshold` CLI flag** (`src/cli.rs:29-31`, default 0.05) is not wired to the chain. — RESOLVED: Leave it untouched (existing gap). It is not passed as a SmartModule param, because filter-relevance ignores params and uses a constant (Plan 02-01 "Untouched on purpose"; Plan 02-02, Task 3 keeps `--threshold` unchanged).
+5. **Intermediate-topic transforms files** (`transforms-extract-only.yaml`, `transforms-filter-only.yaml`, see State of the Art) — RESOLVED: Leave them untouched. They are not in D-03's list, and no Phase 2 plan modifies them.
 
 ## Environment Availability
 
