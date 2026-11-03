@@ -20,14 +20,15 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - ✓ Typed Fluvio producer/consumer layer over JSON records (`src/streaming.rs`) — existing
 - ✓ WISE pipeline as chained SmartModules: `map-preprocess` → `map-extract` → `filter-relevance` (threshold 0.05) — existing
 - ✓ Consumer reads `articles` topic, optionally enriches with GLiNER NER (batch/`--limit` mode), writes JSON — existing
+- ✓ WIT package `filimon:plugin@0.1.0` defining `source` (exports init/poll; imports fetch, log) and `fetcher` worlds; stub crates build components from the WIT alone — Phase 1
+- ✓ `filimon.toml` registry + per-plugin TOML load into typed config; `.env` secrets resolved per plugin alias only; errors name plugin and field/key — Phase 1
 
 ### Active
 
-- [ ] WIT package defining the source-plugin contract (plugin exports init/poll; host imports fetch, logging, config/secret access)
 - [ ] Plugin host in `fili` built on the WASM component model, loading `.wasm` components listed in an explicit registry (`filimon.toml`)
 - [ ] Host-provided HTTP fetch import with per-plugin domain allowlist, timeouts, and rate limiting
 - [ ] Host-driven polling: host calls `poll(cursor)` on a schedule, persists the returned cursor, produces items to Fluvio
-- [ ] Per-plugin TOML settings file (e.g. subreddits, channels, queries); API keys loaded from `.env` and passed to the plugin by the host
+- [ ] Host passes each plugin's resolved settings and secrets into `init` (loading/validation done in Phase 1; delivery needs the Phase 3 host)
 - [ ] Generic host-managed OAuth (PKCE + local callback): `fili auth login <plugin>`, token storage and refresh on the host; plugin TOML declares endpoints/scopes; plugin receives only access tokens via WIT
 - [ ] Unified `SourceItem` envelope covering news pages and social posts; each source type routed to an appropriate SmartModule chain; all paths converge on the same NER-enriched JSON output
 - [ ] Reference Reddit plugin (official Reddit API) as a separately built `.wasm` component
@@ -84,6 +85,9 @@ A user-supplied WASM component, written only against filimon's published WIT con
 | Social items pass through (no social SmartModule chain in v1) | Keep v1 minimal; filtering deferred to v2 | — Pending |
 | Reddit: subreddits + user feed; YouTube: channel uploads + user subscriptions | User-selected v1 feeds; search/comments deferred | — Pending |
 | Skip project-level research | User decision at init; per-phase research remains enabled | — Pending |
+| Plugin components target `wasm32-unknown-unknown` (no WASI imports) | Every capability is an explicit WIT import; smallest attack surface | ✓ Phase 1 — host acceptance of wasip1 components open for Phase 3 |
+| Hand-written literal-or-reject `.env` parser (dotenvy removed) | dotenvy 0.15 always expands `$` from the process env (CR-01); verbatim-or-reject closes it and stays reversible | ✓ Phase 1 (01-05) |
+| Secrets wrapped in redacting `Secret` newtype; diagnostics carry alias/env names only | Secret values never reach Debug, tracing or rendered reports | ✓ Phase 1 |
 
 ## Evolution
 
@@ -103,4 +107,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-11-03 after initialization*
+*Last updated: 2026-11-03 after Phase 1*

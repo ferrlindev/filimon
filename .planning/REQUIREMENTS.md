@@ -9,8 +9,8 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Plugin Contract (WIT)
 
-- [ ] **WIT-01**: A versioned WIT package in the repo defines a `source` world — plugin exports `init(settings, secrets)` and `poll(cursor, access-token) -> (items, next-cursor)`; host provides `fetch` and `log` imports, and supplies settings, the plugin's named secrets, and access tokens via the `init`/`poll` parameters
-- [ ] **WIT-02**: The same WIT package defines a `fetcher` world — fetcher exports `fetch(request) -> response`; host provides a low-level outbound-HTTP capability import
+- [x] **WIT-01**: A versioned WIT package in the repo defines a `source` world — plugin exports `init(settings, secrets)` and `poll(cursor, access-token) -> (items, next-cursor)`; host provides `fetch` and `log` imports, and supplies settings, the plugin's named secrets, and access tokens via the `init`/`poll` parameters
+- [x] **WIT-02**: The same WIT package defines a `fetcher` world — fetcher exports `fetch(request) -> response`; host provides a low-level outbound-HTTP capability import
 - [ ] **WIT-03**: A plugin built outside the filimon repo, using only the published WIT, loads and runs in `fili` without rebuilding `fili`
 
 ### Plugin Host
@@ -126,8 +126,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| WIT-01 | Phase 1 | Pending |
-| WIT-02 | Phase 1 | Pending |
+| WIT-01 | Phase 1 | Complete |
+| WIT-02 | Phase 1 | Complete |
 | WIT-03 | Phase 8 | Pending |
 | HOST-01 | Phase 3 | Pending |
 | HOST-02 | Phase 3 | Pending |

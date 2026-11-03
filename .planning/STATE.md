@@ -1,19 +1,19 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 01
-current_phase_name: Plugin Contract & Configuration
-status: executing
-stopped_at: Phase 1 context gathered
-last_updated: "2026-11-03T11:53:23.171Z"
+current_phase: 2
+current_phase_name: SourceItem Pipeline
+status: planning
+stopped_at: Phase 01 complete, ready to plan Phase 2
+last_updated: "2026-11-03T13:01:45.651Z"
 last_activity: 2026-11-03
-last_activity_desc: Phase 01 execution started
-state_head: 4821ae52ebeb472325f278d383bc1520b0a76929
+last_activity_desc: Phase 01 complete, transitioned to Phase 2
+state_head: 6b7ea10418d575d96a816db31b2807bce7e7d6b9
 progress:
   total_phases: 8
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 6
-  completed_plans: 4
-  percent: 0
+  completed_plans: 6
+  percent: 13
 ---
 
 # Project State
@@ -23,21 +23,21 @@ progress:
 See: .planning/PROJECT.md (updated 2026-11-03)
 
 **Core value:** A user-supplied WASM component, written only against filimon's published WIT contract and listed in the registry, can stream items from a social platform into Fluvio and come out the other end as enriched records alongside news articles.
-**Current focus:** Phase 01 — Plugin Contract & Configuration
+**Current focus:** Phase 2 — SourceItem Pipeline
 
 ## Current Position
 
-Phase: 01 (Plugin Contract & Configuration) — EXECUTING
-Plan: 5 of 6
-Status: Executing Phase 01
-Last activity: 2026-11-03 — Phase 01 execution started
+Phase: 2 — SourceItem Pipeline
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-11-03 — Phase 01 complete, transitioned to Phase 2
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 13%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
+- Total plans completed: 6
 - Average duration: -
 - Total execution time: 0.0 hours
 
@@ -45,7 +45,7 @@ Progress: [░░░░░░░░░░] 0%
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 01 | 6 | - | - |
 
 **Recent Trend:**
 - Last 5 plans: -
@@ -63,6 +63,9 @@ Recent decisions affecting current work:
 - [Roadmap]: Horizontal layers (user choice): contract/config → SourceItem pipeline → host → CLI → fetchers → OAuth → plugins → integration/docs. Full assembly happens in Phase 8.
 - [Roadmap]: Pipeline (PIPE-01) and config (CONF-*) come before the host because HOST-01/03/04 depend on them. The CLI comes before fetchers and OAuth so later phases can be checked with `fili plugins run-once`.
 - [Roadmap]: WIT-03 (external plugin loads without rebuilding `fili`) is proven in Phase 8 together with DOCS-01, using the authoring guide as the acceptance path.
+- [Phase 1]: WIT package `filimon:plugin@0.1.0` is the contract; only `access-token: option<string>` crosses into `poll` (no refresh token, no TLS-weakening switch).
+- [Phase 1]: `.env` parsed by a hand-written literal-or-reject parser (dotenvy removed, CR-01); values never expanded.
+- [Phase 1]: UAT 3/3 passed; SECURITY.md verified with threats_open: 0 (6 accepted low-severity risks logged).
 
 ### Pending Todos
 
@@ -87,6 +90,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-03T08:32:05.943Z
-Stopped at: Phase 1 context gathered
-Resume file: .planning/phases/01-plugin-contract-configuration/01-CONTEXT.md
+Last session: 2026-11-03T13:05:00Z
+Stopped at: Phase 01 complete, ready to plan Phase 2
+Resume file: None
