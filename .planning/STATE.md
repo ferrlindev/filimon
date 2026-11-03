@@ -71,6 +71,7 @@ None yet.
 ### Blockers/Concerns
 
 - [Phase 3]: The host must satisfy every `source` world import to instantiate a component. The `fetch` and token imports have no real backing until Phase 5 and Phase 6, so plan-phase should define an explicit interim "not configured" error.
+- [Phase 3]: Phase 1 builds and documents plugins for `wasm32-unknown-unknown` (no WASI imports). Phase 3 research must decide whether the host accepts wasip1-built components, which carry `wasi:*` imports: reject them with a clear error, or link a locked-down WASI context (01-RESEARCH.md A1, Open Question 4).
 - [Phase 7]: Reddit's API needs OAuth even for read-only subreddit access. Research must settle whether RDDT-01 uses app-only credentials (CONF-02 secrets) or the Phase 6 PKCE login.
 - [Phase 2/8]: Consumer NER only runs in batch/`--limit` mode (an existing gap, out of scope). PIPE-04 and TEST-04 are verified in that mode.
 - [Brownfield]: Build on the uncommitted `fluvio-wise` work. Do not fix its known gaps, and never modify the `fluvio/` reference checkout.

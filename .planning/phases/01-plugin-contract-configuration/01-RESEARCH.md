@@ -777,20 +777,27 @@ pub registry: PathBuf,
 | A10 | `src/bindings.rs` in stub crates should be gitignored (regenerated from WIT on each build, which strengthens the "WIT alone" proof) | Open Question 2 | Low |
 | A11 | Plugin names must be unique across `sources` and `fetchers`, and limited to `[a-z0-9_-]` | Security / Open Question 3 | Low; avoids ambiguity for Phase 4 `fili plugins check <name>` and cursor-file naming |
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+All five questions are settled for Phase 1 (2026-11-03, plan revision). Each outcome is a CONTEXT.md "Claude's Discretion" choice or an extension of a locked decision, contradicts no D-NN, needs no user ruling, and is implemented by the plan cited.
 
 1. **Should a missing `component` `.wasm` be a Phase 1 config error?**
    - What we know: D-14 lists missing file (plugin TOML), malformed TOML, missing secret, unknown fetcher. It does not name the component file.
    - What's unclear: whether `load_registry` should stat component paths.
    - Recommendation: resolve the path in Phase 1 but leave the existence check to Phase 3/4 (`fili plugins check`). The sample registry then loads in tests without built `.wasm` files. Alternatively, add the check behind a flag.
+   - **RESOLVED:** No. Phase 1 resolves each `component` path relative to the registry directory (D-13) and does not stat it; no `ComponentMissing` variant and no flag. ROADMAP Phase 1 SC4 names the missing plugin TOML file, which is the "missing file" of D-14. Loading components belongs to HOST-01 (Phase 3), and a missing or broken component is reported by `fili plugins check` (CLI-02, Phase 4 SC2). Implemented by 01-02 Task 1 (no existence check, A9) and 01-04 Task 1 (the sample registry loads in tests without built `.wasm` files).
 2. **Commit or ignore `plugins/*/src/bindings.rs`?**
    - Recommendation: ignore it, plus `plugins/*/target/`. cargo-component regenerates it on every build, so a committed copy can only go stale.
+   - **RESOLVED:** Ignore both. Each stub crate carries its own `.gitignore` with `/target/` and `/src/bindings.rs` (A10), so the root `.gitignore` stays untouched. Implemented by 01-01 Task 1 (stub-source; acceptance runs `git check-ignore` on both paths and confirms `Cargo.lock` stays committable) and Task 2 (stub-fetcher gets the identical `.gitignore`).
 3. **Name rules for plugins.**
    - Recommendation: reject names outside `[a-z0-9_-]+` and names used in both `[sources]` and `[fetchers]`. Also reject an enabled source that references a disabled or unknown fetcher. Each is a `ConfigError` with a span.
+   - **RESOLVED:** Adopted as recommended (A11, Security V5). `InvalidName` rejects names outside `[a-z0-9_-]+`, `DuplicateName` rejects a name used under both tables, and `UnknownFetcher` / `DisabledFetcher` reject an enabled source pointing at an undefined or disabled fetcher; each names the plugin and field with a span. Implemented by 01-03 Task 1 (`UnknownFetcher`) and Task 2 (`InvalidName`, `DuplicateName`, `DisabledFetcher`). The 01-04 sample satisfies every rule.
 4. **Which target is officially supported for third-party plugins (A1)?**
    - Recommendation: Phase 1 documents `wasm32-unknown-unknown` in `plugins/README.md` and the stubs. Flag it for Phase 3 research, which must decide whether to accept wasip1-built components at all.
+   - **RESOLVED (Phase 1 scope):** `wasm32-unknown-unknown` is the target Phase 1 builds and documents. Each stub's `rust-toolchain.toml` and `.cargo/config.toml` select it, `plugins/README.md` explains why, and both stub verifies assert no `wasi:` import. Implemented by 01-01 Tasks 1 and 2. Whether the Phase 3 host accepts wasip1-built components (reject with a clear error, or link a locked-down WASI context) is a component-instantiation decision, which CONTEXT.md places outside Phase 1. It is handed to Phase 3 research through STATE.md Blockers/Concerns and places no requirement on Phase 1.
 5. **Empty secret values (`KEY=` in `.env`).**
-   - Recommendation: treat an empty value as missing, with a distinct message ("set but empty"). [ASSUMED]
+   - Recommendation: treat an empty value as missing, with a distinct message ("set but empty").
+   - **RESOLVED:** Adopted as a recorded decision, not an assumption. It extends the "missing secret" case of D-14 and CONF-03: an empty effective value (process env first, then `.env`, per D-12) is an `EmptySecret` error naming the plugin, alias and env var, never the value. Implemented by 01-02 Task 2 (`empty_secret_value_is_error`) and ordered with the other secret problems by 01-03 Task 3. Reversible: dropping the check removes one variant.
 
 ## Environment Availability
 
