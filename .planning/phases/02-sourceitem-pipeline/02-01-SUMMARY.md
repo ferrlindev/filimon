@@ -275,6 +275,11 @@ None. No external service configuration is required.
 - PIPE-02 is also declared by 02-03, so it was not marked complete in REQUIREMENTS.md yet (shared-ID gate). Only PIPE-01 was marked.
 - Human check still open (end-of-phase): `fili produce https://www.bbc.co.uk/news --depth 2` then `fili consume --from-beginning --limit 50` against the live site.
 
+## Self-Check: PASSED
+
+- All 9 key files exist on disk.
+- Commits 4b09728, eaf86b5, ce9a969, cdcacfd and 0c3c91a are ancestors of HEAD.
+
 ---
 *Phase: 02-sourceitem-pipeline*
 *Completed: 2026-11-03*
