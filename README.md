@@ -8,39 +8,43 @@ A Rust-based semantic news crawler that implements the [WISE framework](https://
 
 filimon is a streaming-first news extraction pipeline:
 
-1. **Fluvio Streaming** — Records flow through topics with SmartModule transformations
-2. **WISE Pipeline** — Four-stage semantic extraction implemented as chainable SmartModules
+1. **Fluvio Streaming** — Every item enters as a `SourceItem` JSON record. News pages go to `filimon-raw-pages`; social posts go to `filimon-social-items`
+2. **WISE Pipeline** — Four-stage semantic extraction implemented as chainable SmartModules, applied to the news stream only
 3. **GLiNER NER** — Zero-shot Named Entity Recognition in the main application (ONNX models too large for WASM)
 
 ```mermaid
 flowchart LR
     subgraph Input
-        A[CLI produce] -->|RawPage JSON| T1
-        B[File watcher] -->|RawPage JSON| T1
-        C[HTTP crawler] -->|RawPage JSON| T1
+        A[CLI produce] -->|"SourceItem (news) JSON"| T1
+        B[File watcher] -->|"SourceItem (news) JSON"| T1
+        C[HTTP crawler] -->|"SourceItem (news) JSON"| T1
+        P["Source plugins (Phase 3) / fluvio produce"] -->|"SourceItem (social) JSON"| T2
     end
 
     subgraph Fluvio Pipeline
-        T1[filimon-raw-pages] -->|SmartModule| SM1[map-preprocess]
+        T1[filimon-raw-pages] -->|"applied by fili consume on its stream"| SM1[map-preprocess]
         SM1 -->|PreprocessedBundle| SM2[map-extract]
         SM2 -->|ExtractedArticle| SM3[filter-relevance]
-        SM3 -->|filtered| T2[filimon-articles]
+        T2[filimon-social-items]
     end
 
     subgraph Output
-        T2 --> CON[Consumer + NER]
-        CON --> JSON[(wise_output.json)]
+        SM3 -->|"news (filtered)"| CON[fili consume + NER]
+        T2 -->|"social (no SmartModules)"| CON
+        CON --> JSON[(output/wise_output.json)]
     end
 ```
+
+`fili consume` opens one stream on `filimon-raw-pages` with the three SmartModules attached and one plain stream on `filimon-social-items`, merges them, and writes every record into one JSON array.
 
 ### Pipeline Stages (SmartModules)
 
 | Stage | SmartModule | Input | Output |
 |-------|-------------|-------|--------|
-| 1 | `map-preprocess` | `RawPage` (url, html) | `PreprocessedBundle` (tokens, frequencies) |
+| 1 | `map-preprocess` | `SourceItem` (news), read as `RawPage` (url, html) | `PreprocessedBundle` (tokens, frequencies) |
 | 2 | `map-extract` | `PreprocessedBundle` | `ExtractedArticle` (title, body, relevance) |
 | 3 | `filter-relevance` | `ExtractedArticle` | Pass/reject based on relevance >= 0.05 |
-| 4 | Consumer app | `ExtractedArticle` | JSON with optional NER enrichment |
+| 4 | `fili consume` | `ExtractedArticle` (news) and `SourceItem` (social) | One JSON array of output records, with optional NER enrichment |
 
 ---
 
@@ -120,10 +124,16 @@ fluvio version
 
 ```bash
 fluvio topic create filimon-raw-pages
-fluvio topic create filimon-articles
+fluvio topic create filimon-social-items
 
 # Verify
 fluvio topic list
+```
+
+`fili produce`, `fili file` and `fili watch` create `filimon-raw-pages` automatically if it is missing. `fili` never creates `filimon-social-items`; create it by hand. Before it opens any stream, `fili consume` checks that every topic and SmartModule it needs exists, and stops with an error that names each missing one, for example:
+
+```
+Topic `filimon-social-items` not found. Create it with: fluvio topic create filimon-social-items
 ```
 
 ### 5. Build and Load SmartModules
@@ -164,17 +174,29 @@ transforms:
   - uses: filimon/filter-relevance@0.1.0
 EOF
 
-# Produce a test record
-echo '{"url":"https://example.com/news","html":"<html><head><title>Breaking News</title></head><body><h1>Tech Market Surges</h1><p>The technology market experienced significant growth today as investors rallied around artificial intelligence stocks.</p></body></html>"}' | fluvio produce filimon-raw-pages
+# Produce a news SourceItem (the chain reads only its url and html)
+echo '{"source_type":"news","platform":"example.com","id":"https://example.com/news","url":"https://example.com/news","title":null,"text":"","html":"<html><head><title>Breaking News</title></head><body><h1>Tech Market Surges</h1><p>The technology market experienced significant growth today as investors rallied around artificial intelligence stocks.</p></body></html>"}' | fluvio produce filimon-raw-pages
 
-# Consume with full pipeline
+# Check the SmartModule chain by hand
 fluvio consume filimon-raw-pages -B -d --transforms-file transforms.yaml
 ```
 
 Expected output:
 ```json
-{"url":"https://example.com/news","title":"Tech Market Surges","author":null,"published_date":null,"body_preview":"The technology market experienced significant growth today...","word_count":16,"relevance_score":0.43,"top_keywords":["artificial","intelligence","market","technology"],"named_entities":[],"inferred_category":"Business"}
+{"url":"https://example.com/news","title":"Tech Market Surges","author":null,"published_date":null,"body_preview":"The technology market experienced significant growth today as investors rallied around artificial intelligence stocks.","word_count":17,"relevance_score":0.4477471976888375,"top_keywords":["market","around","artificial","break","experienc","growth","intelligence","investor","news","ralli","significant","stock"],"named_entities":[],"inferred_category":"Business"}
 ```
+
+Then send a social `SourceItem` and read both kinds with `fili`:
+
+```bash
+# Produce a social SourceItem (no SmartModules touch this topic)
+echo '{"source_type":"social","platform":"reddit","id":"t3_fili02","url":"https://www.reddit.com/r/rust/comments/fili02","title":null,"text":"lol cat","author":"u1","published":"2024-10-27T03:33:20.123Z","raw":{"score":3}}' | fluvio produce filimon-social-items
+
+# Read news (through the chain) and social items into output/wise_output.json
+fili consume --from-beginning --limit 10
+```
+
+The social record `t3_fili02` appears in the output even though its text, `lol cat`, would be dropped by `filter-relevance` if it were sent as news: social items never pass through the SmartModule chain. `--limit` counts news and social records together, so raise it if the topics already hold many records.
 
 ---
 
@@ -183,33 +205,58 @@ Expected output:
 ### Modes
 
 ```bash
-# Produce raw HTML to the pipeline
+# Crawl pages and produce them as news SourceItems
 fili produce https://techcrunch.com
 
-# Consume processed articles
+# Read news and social items into output/wise_output.json
 fili consume --limit 10
 
 # Watch directories and produce HTML files
-fili watch /tmp/articles
+fili --ls /tmp/articles watch
 
 # Process local files
 fili file ./samples/article.html
 ```
 
+### `fili consume`
+
+`fili consume` reads news from `filimon-raw-pages` through the three SmartModules and social items from `filimon-social-items` with no SmartModules, and merges both into one output.
+
+| Flag | Meaning |
+|------|---------|
+| `--limit <N>` | Stop after N records, counting news and social together. `0` (the default) streams without end and prints records instead of writing a file |
+| `--from-beginning` | Start at the first record of each topic |
+| `--source <SOURCE>` | `both` (default), `news` or `social`. Only the selected topics and SmartModules are opened and checked |
+| `--output <PATH>` | JSON output file in `--limit` mode [default: `output/wise_output.json`] |
+| `--enrich-ner` | Run GLiNER NER on news and social records, in `--limit` mode only |
+
+In `--limit` mode the output file is one JSON array. Every record has the same fields; `article` is set for news and `null` for social:
+
+```json
+[
+  {"source_type":"news","platform":"local","id":"file://examples/fixtures/news-article.html","url":"file://examples/fixtures/news-article.html","title":"Parliament passes national climate policy bill","text":"Parliament passes national climate policy bill The government won a decisive vote in parliament today...","author":"Jane Reporter","published":"2024-05-01T09:00:00Z","raw":null,"entities":[],"article":{"relevance_score":0.48933290145634056,"top_keywords":["bill","climate","policy","national","parliament","economy","energy","government","next","passe","research","said"],"inferred_category":"Politics","word_count":70,"published_raw":"2024-05-01T10:00:00+01:00"}},
+  {"source_type":"social","platform":"reddit","id":"t3_fili02","url":"https://www.reddit.com/r/rust/comments/fili02","title":null,"text":"lol cat","author":"u1","published":"2024-10-27T03:33:20.123Z","raw":{"score":3},"entities":[],"article":null}
+]
+```
+
+`published` is an RFC 3339 UTC timestamp or `null`; for news, the date string exactly as the page gave it is kept in `article.published_raw`. `entities` stays empty unless `--enrich-ner` is set and a model is available. Page HTML is never written to the output.
+
 ### CLI Options
 
 ```
 Commands:
-  produce   Crawl URL and produce to Fluvio
-  consume   Consume processed articles from Fluvio
-  watch     Watch directories for HTML files
-  file      Process local HTML files
+  produce  Produce crawled pages to Fluvio for pipeline processing
+  consume  Consume news (through the news chain modules) and social items from Fluvio into one JSON output, with optional NER enrichment
+  watch    Watch directories and produce HTML files to Fluvio
+  file     Produce local HTML files to Fluvio
 
 Options:
-  --tokenizer <PATH>   GLiNER tokenizer.json [env: TOKENIZER_PATH]
-  --model <PATH>       GLiNER model.onnx [env: MODEL_PATH]
-  --output <PATH>      JSON output file [env: OUTPUT_PATH]
-  --threshold <FLOAT>  Minimum relevance score [default: 0.05]
+  --tokenizer <TOKENIZER>  Path to GLiNER tokenizer.json (for NER on consume) [env: TOKENIZER_PATH]
+  --model <MODEL>          Path to GLiNER onnx/model.onnx (for NER on consume) [env: MODEL_PATH]
+  --registry <REGISTRY>    Path to the plugin registry (filimon.toml) [env: FILI_REGISTRY]
+  --threshold <THRESHOLD>  Relevance threshold for filtering [0.0 - 1.0] [default: 0.05]
+  --config <CONFIG>        Path to JSON config file for watch mode [default: config.json]
+  --ls <LS>                Comma-separated directories to watch (override config files)
 ```
 
 ---
@@ -290,9 +337,10 @@ models/
 |----------|-------------|---------|
 | `TOKENIZER_PATH` | GLiNER tokenizer.json | `models/gliner_small-v2.1/tokenizer.json` |
 | `MODEL_PATH` | GLiNER model.onnx | `models/gliner_small-v2.1/onnx/model.onnx` |
-| `OUTPUT_PATH` | JSON results file | `wise_output.json` |
 
-> filimon runs without a model — NER fields will be empty. All other pipeline stages function normally.
+The JSON output file is set with `fili consume --output <PATH>` (default `output/wise_output.json`).
+
+> filimon runs without a model — `entities` will be empty. All other pipeline stages function normally.
 
 ---
 
@@ -342,8 +390,10 @@ filimon/
 ├── src/
 │   ├── main.rs          # CLI, Fluvio producer/consumer
 │   ├── check.rs         # Directory validation
-│   ├── models.rs        # Shared data structs (RawPage, ExtractedArticle, etc.)
-│   ├── streaming.rs     # Fluvio client wrapper, typed producer/consumer
+│   ├── models.rs        # Shared data structs (SourceItem, ExtractedArticle, OutputRecord, etc.)
+│   ├── streaming.rs     # Fluvio client wrapper, topic names, news SmartModule chain, preflight
+│   ├── commands/
+│   │   └── consume.rs   # fili consume: merges news (chain) and social streams, NER, JSON output
 │   ├── scorer.rs        # GLiNER NER engine
 │   └── output.rs        # JSON serialization, console output
 ├── smartmodules/
