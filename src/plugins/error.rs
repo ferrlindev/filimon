@@ -95,6 +95,25 @@ pub enum ConfigError {
         span: SourceSpan,
     },
 
+    /// An enabled source's `fetcher` names no `[fetchers.<name>]` table.
+    #[error(
+        "`sources.{plugin}.fetcher` references fetcher `{fetcher}`, which is not defined under [fetchers]"
+    )]
+    #[diagnostic(
+        code(fili::config::unknown_fetcher),
+        help("defined fetchers: {defined}")
+    )]
+    UnknownFetcher {
+        plugin: String,
+        fetcher: String,
+        /// Comma-separated defined fetcher names, or `none`.
+        defined: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not defined under [fetchers]")]
+        span: SourceSpan,
+    },
+
     /// The `.env` file exists but cannot be used. Never carries line content.
     #[error(
         "cannot use `{path}`{}: {reason}",

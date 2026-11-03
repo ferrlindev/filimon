@@ -736,4 +736,52 @@ config = "beta.toml"
             "{KEY} leaked into the process env"
         );
     }
+
+    // ── Diagnostics (CONF-03) ─────────────────────────────────────────────────
+
+    /// Renders the full miette report as a terminal would show it, without
+    /// colour. The wide width stops wrapping from splitting asserted text.
+    fn render(errors: &ConfigErrors) -> String {
+        let mut out = String::new();
+        miette::GraphicalReportHandler::new_themed(miette::GraphicalTheme::unicode_nocolor())
+            .with_width(400)
+            .render_report(&mut out, errors)
+            .expect("render report");
+        out
+    }
+
+    #[test]
+    fn unknown_fetcher() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+fetcher = "htp"
+
+[fetchers.http]
+component = "http.wasm"
+"#,
+        );
+        write(&dir, "alpha.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("an unknown fetcher is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::UnknownFetcher { plugin, fetcher, .. }
+                    if plugin == "alpha" && fetcher == "htp"
+            ),
+            "{errors:?}"
+        );
+        let report = render(&errors);
+        for needle in ["sources.alpha.fetcher", "htp", "filimon.toml", "http"] {
+            assert!(report.contains(needle), "missing {needle:?} in:\n{report}");
+        }
+    }
 }
