@@ -179,3 +179,9 @@ None. Operators copy `examples/plugins/.env.example` to `.env` next to their reg
 ---
 *Phase: 01-plugin-contract-configuration*
 *Completed: 2026-11-03*
+
+## Self-Check: PASSED
+
+- Files present: examples/plugins/{filimon,stub,reddit,youtube}.toml, examples/plugins/.env.example, src/plugins/mod.rs, src/cli.rs, 01-04-SUMMARY.md
+- Commits on branch: bc41121, 2a99044 (tasks), 48f15dc (SUMMARY)
+- Plan verification re-run: cargo test --bin fili 26 passed; fili --help shows --registry with FILI_REGISTRY and filimon.toml; examples/plugins/.env ignored and absent
