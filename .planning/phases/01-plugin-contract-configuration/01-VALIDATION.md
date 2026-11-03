@@ -40,19 +40,21 @@ created: "2026-11-03"
 
 ## Per-Task Verification Map
 
-Filled in by the planner/executor against the final task IDs. Requirement → test map from research:
+Filled in by the planner against the final task IDs (all commands run from the repo root; test filters use `-- --exact` where a single test is named):
 
-| Requirement | Behavior | Test Type | Automated Command | File Exists | Status |
-|-------------|----------|-----------|-------------------|-------------|--------|
-| WIT-01 | `wit/` parses; `source` world exports `init`,`poll`, imports `log`,`fetch` | smoke | `wasm-tools component wit wit/ \| grep -E 'export (init\|poll)\|import (log\|fetch)'` | ❌ W0 | ⬜ pending |
-| WIT-01 | stub source builds from `../../wit` and conforms to `source` | integration | `cd plugins/stub-source && cargo component build --release && wasm-tools component targets ../../wit -w source target/wasm32-unknown-unknown/release/stub_source.wasm` | ❌ W0 | ⬜ pending |
-| WIT-02 | `fetcher` world exports `fetch`, imports outbound-http; stub conforms | integration | same as above with `-w fetcher` on `stub_fetcher.wasm` | ❌ W0 | ⬜ pending |
-| WIT-01/02 | negative: stub source does NOT satisfy `fetcher` | smoke | `! wasm-tools component targets wit -w fetcher <stub_source.wasm>` | ❌ W0 | ⬜ pending |
-| CONF-01 | sample registry + plugin TOMLs load into typed config; paths relative to registry dir | unit | `cargo test --bin fili plugins::config::tests::loads_sample_registry` | ❌ W0 | ⬜ pending |
-| CONF-02 | plugin receives only its aliased secrets; process env overrides `.env` | unit | `cargo test --bin fili plugins::secrets::tests` | ❌ W0 | ⬜ pending |
-| CONF-03 | missing plugin TOML / malformed TOML / missing secret / unknown fetcher each name plugin + field/key | unit | `cargo test --bin fili plugins::config::tests` | ❌ W0 | ⬜ pending |
-| CONF-03 | multiple problems across plugins all reported (D-14) | unit | `cargo test --bin fili plugins::config::tests::collects_all_problems` | ❌ W0 | ⬜ pending |
-| CONF-02 (security) | rendered diagnostics never contain secret values | unit | `cargo test --bin fili plugins::` (redaction test) | ❌ W0 | ⬜ pending |
+| Task | Requirement | Behavior | Test Type | Automated Command | File Exists | Status |
+|------|-------------|----------|-----------|-------------------|-------------|--------|
+| 01-01 T1 | WIT-01 | `wit/` parses; `source` world exports `init`,`poll`, imports `log`,`fetch`; stub source builds from `../../wit` and conforms to `source`; no `wasi:` imports | integration | `wasm-tools component wit wit/` + greps, `(cd plugins/stub-source && cargo component build --release) && wasm-tools component targets wit -w source plugins/stub-source/target/wasm32-unknown-unknown/release/stub_source.wasm` | ❌ W0 | ⬜ pending |
+| 01-01 T2 | WIT-02 | `fetcher` world exports `fetch`, imports outbound-http; stub fetcher conforms; stub source rejected against `fetcher`; one package line across `wit/*.wit` | integration | `(cd plugins/stub-fetcher && cargo component build --release) && wasm-tools component targets wit -w fetcher plugins/stub-fetcher/target/wasm32-unknown-unknown/release/stub_fetcher.wasm && ! wasm-tools component targets wit -w fetcher plugins/stub-source/target/wasm32-unknown-unknown/release/stub_source.wasm` | ❌ W0 | ⬜ pending |
+| 01-02 T1 | CONF-01 | registry + plugin TOML + `.env` load into typed config; paths relative to registry dir; disabled sources not read | unit | `cargo test --bin fili plugins::config::tests::` | ❌ W0 | ⬜ pending |
+| 01-02 T2 | CONF-02 | plugin receives only its aliased secrets; process env overrides `.env`; empty/case-mismatched secrets are errors; `Secret(***)` redaction; no process-env mutation | unit | `cargo test --bin fili plugins::` + `test -d src/plugins && ! grep -rnE 'set_var\|remove_var' src/plugins/` | ❌ W0 | ⬜ pending |
+| 01-03 T1 | CONF-03 | unknown fetcher → diagnostic naming `sources.<name>.fetcher` with registry span | unit | `cargo test --bin fili plugins::config::tests::unknown_fetcher -- --exact` | ❌ W0 | ⬜ pending |
+| 01-03 T2 | CONF-03 | missing/malformed registry, missing plugin file, disabled fetcher, name rules, duplicate names | unit | `cargo test --bin fili plugins::config::tests::` | ❌ W0 | ⬜ pending |
+| 01-03 T3 | CONF-03 | malformed plugin TOML / unknown key / zero interval / missing secret / bad allowlist / bad backoff; collect-all with deterministic order (D-14); rendered report omits secret values | unit | `cargo test --bin fili plugins::` | ❌ W0 | ⬜ pending |
+| 01-04 T1 | CONF-01, CONF-02 | committed `examples/plugins/` sample loads; per-plugin secret isolation (SC3); `.env.example` matches declared env vars | unit | `cargo test --bin fili plugins::tests::` | ❌ W0 | ⬜ pending |
+| 01-04 T2 | CONF-01 (D-13) | `--registry` / `FILI_REGISTRY`, default `filimon.toml`, global flag, feeds the loader | unit | `cargo test --bin fili cli::tests::` | ❌ W0 | ⬜ pending |
+
+Clippy is scoped to new code (the in-progress root crate has pre-existing warnings): `cargo clippy --bin fili --message-format=short 2> /tmp/fili-clippy.txt && ! grep -E '^src/plugins/' /tmp/fili-clippy.txt`. The full-crate `-D warnings` form in "Full suite command" above would fail on pre-existing warnings outside this phase.
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
