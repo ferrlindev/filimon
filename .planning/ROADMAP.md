@@ -28,7 +28,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Depends on**: Nothing (first phase)
 **Requirements**: WIT-01, WIT-02, CONF-01, CONF-02, CONF-03
 **Success Criteria** (what must be TRUE):
-  1. A versioned WIT package in the repo defines a `source` world and a `fetcher` world, and both validate with `wasm-tools`. The `source` world exports `init(config)` and `poll(cursor) -> (items, next-cursor)` and imports `fetch`, `log`, and settings/secret/token access. The `fetcher` world exports `fetch(request) -> response` and imports a low-level outbound-HTTP capability.
+  1. A versioned WIT package in the repo defines a `source` world and a `fetcher` world, and both validate with `wasm-tools`. The `source` world exports `init(settings, secrets)` and `poll(cursor, access-token) -> (items, next-cursor)` and imports `fetch` and `log`; settings, the plugin's named secrets, and access tokens reach the plugin through the `init`/`poll` parameters. The `fetcher` world exports `fetch(request) -> response` and imports a low-level outbound-HTTP capability.
   2. A stub source crate and a stub fetcher crate each generate bindings from the WIT package alone (via `cargo component`) and compile to a valid component for their world.
   3. A sample `filimon.toml` registry that points to per-plugin TOML files (subreddits or channels, interval, allowlist) loads into typed config. Each plugin's resolved secrets contain only the `.env` keys its own TOML names.
   4. A missing plugin TOML file, malformed TOML, or missing `.env` secret produces an error that names both the plugin and the field or key at fault.

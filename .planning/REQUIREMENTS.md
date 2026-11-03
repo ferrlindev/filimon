@@ -9,7 +9,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Plugin Contract (WIT)
 
-- [ ] **WIT-01**: A versioned WIT package in the repo defines a `source` world — plugin exports `init(config)` and `poll(cursor) -> (items, next-cursor)`; host provides `fetch`, `log`, and settings/secret/token access imports
+- [ ] **WIT-01**: A versioned WIT package in the repo defines a `source` world — plugin exports `init(settings, secrets)` and `poll(cursor, access-token) -> (items, next-cursor)`; host provides `fetch` and `log` imports, and supplies settings, the plugin's named secrets, and access tokens via the `init`/`poll` parameters
 - [ ] **WIT-02**: The same WIT package defines a `fetcher` world — fetcher exports `fetch(request) -> response`; host provides a low-level outbound-HTTP capability import
 - [ ] **WIT-03**: A plugin built outside the filimon repo, using only the published WIT, loads and runs in `fili` without rebuilding `fili`
 
