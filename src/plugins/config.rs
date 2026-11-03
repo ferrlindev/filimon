@@ -255,15 +255,21 @@ pub fn load_registry_with_env(
 
     // Pass 2: `.env` is read only when some enabled source declares secrets,
     // so a `.env` shared with other tools cannot break plugin-free registries.
+    // `None` means the file is unusable: its DotenvInvalid problems are
+    // recorded here in line order, and pass 3 reports no MissingSecret.
     let dotenv_path = base_dir.join(".env");
-    let dotenv = if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
-        secrets::read_dotenv(&dotenv_path).unwrap_or_else(|mut problems| {
-            registry_problems.append(&mut problems);
-            HashMap::new()
-        })
-    } else {
-        HashMap::new()
-    };
+    let dotenv: Option<HashMap<String, String>> =
+        if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
+            match secrets::read_dotenv(&dotenv_path) {
+                Ok(map) => Some(map),
+                Err(mut problems) => {
+                    registry_problems.append(&mut problems);
+                    None
+                }
+            }
+        } else {
+            Some(HashMap::new())
+        };
 
     // Pass 3: resolve secrets per enabled source and assemble the output.
     let mut sources = BTreeMap::new();
@@ -273,7 +279,7 @@ pub fn load_registry_with_env(
             let Some(parsed) = parsed.remove(name) else {
                 continue;
             };
-            match finish_plugin(name, parsed, &dotenv, &dotenv_path, env) {
+            match finish_plugin(name, parsed, dotenv.as_ref(), &dotenv_path, env) {
                 Ok(plugin) => Some(plugin),
                 Err(mut missing) => {
                     source_problems
@@ -320,7 +326,7 @@ pub fn load_registry_with_env(
 fn finish_plugin(
     name: &str,
     parsed: ParsedPlugin,
-    dotenv: &HashMap<String, String>,
+    dotenv: Option<&HashMap<String, String>>,
     dotenv_path: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<PluginConfig, Vec<ConfigError>> {

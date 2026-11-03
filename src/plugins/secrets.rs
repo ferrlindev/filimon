@@ -52,7 +52,8 @@ pub type ResolvedSecrets = BTreeMap<String, Secret>;
 ///
 /// Comments are whole lines whose first non-whitespace character is `#`, or
 /// text after whitespace that follows a value. LF and CRLF line endings and
-/// one leading byte-order mark are accepted.
+/// one leading byte-order mark are accepted. A key set twice is rejected, so
+/// no value depends on line order.
 ///
 /// The file is read once and parsed from that in-memory text. Parsing takes
 /// only the line text: the process environment is never read or modified.
@@ -71,6 +72,7 @@ pub fn read_dotenv(path: &Path) -> Result<HashMap<String, String>, Vec<ConfigErr
     let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
 
     let mut values = HashMap::new();
+    let mut first_line: HashMap<String, usize> = HashMap::new();
     let mut problems = Vec::new();
     // Line numbers are counted, never found by searching the text.
     for (index, line) in body.lines().enumerate() {
@@ -78,7 +80,14 @@ pub fn read_dotenv(path: &Path) -> Result<HashMap<String, String>, Vec<ConfigErr
         match parse_line(line) {
             Ok(None) => {}
             Ok(Some((key, value))) => {
-                values.insert(key, value);
+                if let Some(first) = first_line.get(&key) {
+                    // The key is an env var name, which diagnostics may carry.
+                    let reason = format!("duplicate key `{key}` (first set on line {first})");
+                    problems.push(dotenv_invalid(path, Some(number), reason));
+                } else {
+                    first_line.insert(key.clone(), number);
+                    values.insert(key, value);
+                }
             }
             Err(reason) => problems.push(dotenv_invalid(path, Some(number), reason.to_string())),
         }
@@ -233,6 +242,11 @@ fn check_trailer(trailer: &str) -> Result<(), &'static str> {
 /// case-sensitive. Only the aliases in `aliases` are resolved, so a plugin
 /// never sees another plugin's secrets or unrelated `.env` keys.
 ///
+/// `dotenv` is `None` when the `.env` file was unusable. The caller has then
+/// already recorded its `DotenvInvalid` problems and must fail the load, so
+/// an alias found nowhere is not reported as missing: that `MissingSecret`
+/// would send the operator to the wrong fix.
+///
 /// # Errors
 /// Returns one `ConfigError` per alias that cannot be resolved (missing) or
 /// whose effective value is empty, labelled at that alias's env var name in
@@ -242,7 +256,7 @@ pub fn resolve_secrets(
     plugin_path: &Path,
     plugin_text: &str,
     aliases: &BTreeMap<String, toml::Spanned<String>>,
-    dotenv: &HashMap<String, String>,
+    dotenv: Option<&HashMap<String, String>>,
     dotenv_path: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedSecrets, Vec<ConfigError>> {
@@ -254,7 +268,8 @@ pub fn resolve_secrets(
 
     for (alias, env_var) in aliases {
         let name = env_var.get_ref();
-        match env(name).or_else(|| dotenv.get(name).cloned()) {
+        let from_dotenv = || dotenv.and_then(|map| map.get(name).cloned());
+        match env(name).or_else(from_dotenv) {
             Some(value) if value.is_empty() => problems.push(ConfigError::EmptySecret {
                 plugin: plugin.to_string(),
                 alias: alias.clone(),
@@ -265,6 +280,8 @@ pub fn resolve_secrets(
             Some(value) => {
                 resolved.insert(alias.clone(), Secret(value));
             }
+            // The unusable `.env` already explains why the fallback is absent.
+            None if dotenv.is_none() => {}
             None => problems.push(ConfigError::MissingSecret {
                 plugin: plugin.to_string(),
                 alias: alias.clone(),
@@ -499,7 +516,7 @@ lower_case=v
             Path::new("alpha.toml"),
             plugin_text,
             &aliases,
-            &dotenv,
+            Some(&dotenv),
             Path::new(".env"),
             &|_| None,
         )
