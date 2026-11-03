@@ -126,12 +126,51 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| WIT-01 | Phase 1 | Pending |
+| WIT-02 | Phase 1 | Pending |
+| WIT-03 | Phase 8 | Pending |
+| HOST-01 | Phase 3 | Pending |
+| HOST-02 | Phase 3 | Pending |
+| HOST-03 | Phase 3 | Pending |
+| HOST-04 | Phase 3 | Pending |
+| HOST-05 | Phase 3 | Pending |
+| FETCH-01 | Phase 5 | Pending |
+| FETCH-02 | Phase 5 | Pending |
+| FETCH-03 | Phase 5 | Pending |
+| FETCH-04 | Phase 5 | Pending |
+| CONF-01 | Phase 1 | Pending |
+| CONF-02 | Phase 1 | Pending |
+| CONF-03 | Phase 1 | Pending |
+| AUTH-01 | Phase 6 | Pending |
+| AUTH-02 | Phase 6 | Pending |
+| AUTH-03 | Phase 6 | Pending |
+| AUTH-04 | Phase 6 | Pending |
+| PIPE-01 | Phase 2 | Pending |
+| PIPE-02 | Phase 2 | Pending |
+| PIPE-03 | Phase 2 | Pending |
+| PIPE-04 | Phase 2 | Pending |
+| CLI-01 | Phase 4 | Pending |
+| CLI-02 | Phase 4 | Pending |
+| CLI-03 | Phase 4 | Pending |
+| CLI-04 | Phase 4 | Pending |
+| RDDT-01 | Phase 7 | Pending |
+| RDDT-02 | Phase 7 | Pending |
+| RDDT-03 | Phase 7 | Pending |
+| YTUB-01 | Phase 7 | Pending |
+| YTUB-02 | Phase 7 | Pending |
+| YTUB-03 | Phase 7 | Pending |
+| TEST-01 | Phase 7 | Pending |
+| TEST-02 | Phase 8 | Pending |
+| TEST-03 | Phase 8 | Pending |
+| TEST-04 | Phase 8 | Pending |
+| DOCS-01 | Phase 8 | Pending |
+| DOCS-02 | Phase 8 | Pending |
 
 **Coverage:**
 - v1 requirements: 39 total
-- Mapped to phases: 0
-- Unmapped: 39 ⚠️
+- Mapped to phases: 39
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-11-03*
-*Last updated: 2026-11-03 after initial definition*
+*Last updated: 2026-11-03 after roadmap creation (traceability mapped)*
