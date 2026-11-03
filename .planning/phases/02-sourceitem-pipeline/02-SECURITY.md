@@ -11,7 +11,7 @@ created: "2026-11-03"
 # Phase 2 — Security
 
 > Per-phase security contract: threat register, accepted risks, and audit trail.
-> Register source: `<threat_model>` blocks in 02-01, 02-02 and 02-03 PLAN.md (authored at plan time). No `## Threat Flags` were raised in any SUMMARY.md.
+> Register source: `<threat_model>` blocks in 02-01, 02-02, 02-03 and 02-04 PLAN.md (authored at plan time). No `## Threat Flags` were raised in any SUMMARY.md.
 
 ---
 
@@ -32,7 +32,7 @@ created: "2026-11-03"
 | Threat ID | Category | Component | Severity | Disposition | Mitigation | Status |
 |-----------|----------|-----------|----------|-------------|------------|--------|
 | T-02-01 | Denial of Service | SourceItem serialization; news stream in consume.rs | medium | mitigate | `html` has `skip_serializing_if` (src/models.rs:136); `RetryMode::Disabled` (src/streaming.rs:141); tests news_item_is_rawpage_compatible, stream_error_omits_record_value pass | closed |
-| T-02-02 | Information Disclosure | `describe_stream_error`, `decode_news` | medium | mitigate | record value never printed; serde-quoted text scrubbed (02-01 deviation 1); tests stream_error_omits_record_value, decode_news_reports_bad_value_without_content pass ; **code review CR-01 (02-REVIEW.md): `redact_quoted` leaks a quoted value containing escaped quotes, the SmartModule hint is not redacted, and diagnostics reach stderr without `sanitize_for_terminal` (ESC passes through)** | open — below high threshold (non-blocking) |
+| T-02-02 | Information Disclosure | `describe_stream_error`, `decode_news` | medium | mitigate | Closed by gap plan 02-04 (CR-01): diagnostics come from `describe_json_error` (consume.rs:76, serde `classify()`/line/column only; `redact_quoted` deleted); SmartModule and other stream-error text reduced by `hint_summary` (consume.rs:102,175); every diagnostic printed via `print_diagnostic` → `output::sanitize_for_terminal` (consume.rs:505-510), no other non-comment `eprintln!`; tests decode_news_withholds_escaped_quote_content, decode_social_withholds_variant_value, stream_error_hint_withholds_quoted_value, diagnostic_line_strips_control_chars and cluster poison_news/poison_social pass | closed |
 | T-02-03 | Information Disclosure | `OutputRecord` / JSON output | low | mitigate | `OutputRecord` has no html field (0 matches in struct); test save_json_writes_array_without_html passes; live smokes (02-01, 02-03) show no `html` key | closed |
 | T-02-04 | Tampering | `print_summary` (operator terminal) | low | mitigate | `sanitize_for_terminal` (src/output.rs:31) on every record-derived string; test sanitize_strips_control_chars passes | closed |
 | T-02-05 | Denial of Service | consumer start-up, missing topic/SmartModule | medium | mitigate | `FluvioStream::preflight` (src/streaming.rs:155); cluster test missing_topic_is_named passes | closed |
@@ -48,6 +48,12 @@ created: "2026-11-03"
 | T-02-13 | Information Disclosure | README sample records | low | accept | synthetic samples, no secrets — see Accepted Risks | closed |
 | T-02-14 | Denial of Service | real topics on the dev cluster | low | accept | two small records per run, no deletion — see Accepted Risks | closed |
 | T-02-SC (02-03) | Tampering | package installs | high | accept | plan installs no packages — see Accepted Risks | closed |
+| T-02-15 | Information Disclosure | `decode_news` / `decode_social` parse diagnostics | medium | mitigate | `describe_json_error` (consume.rs:76) used at consume.rs:124,142; `fn redact_quoted` 0 matches; tests decode_news_withholds_escaped_quote_content, decode_social_withholds_variant_value, empty_and_malformed_values_are_reported pass | closed |
+| T-02-16 | Information Disclosure | `describe_stream_error` (SmartModule hint, other ErrorCode text) | medium | mitigate | `hint_summary` + `NO_DETAIL` (consume.rs:88-108), applied at consume.rs:175; tests stream_error_hint_withholds_quoted_value, other_stream_errors_withhold_record_value, hint_detail_truncates_by_chars, cluster poison_news_record_is_reported_without_value pass | closed |
+| T-02-17 | Tampering | consume stderr (terminal escape injection) | medium | mitigate | `diagnostic_line` → `output::sanitize_for_terminal(message)` (consume.rs:505-506), `print_diagnostic` is the only non-comment `eprintln!` (0 others); tests diagnostic_line_strips_control_chars, cluster poison_social_record_is_reported_without_value pass | closed |
+| T-02-18 | Repudiation | decode and stream paths (record accounting) | low | mitigate | zero-byte / invalid-UTF-8 / empty-variant records each give one topic+offset diagnostic; empty_and_malformed_values_are_reported and existing no-silent-drop tests pass | closed |
+| T-02-19 | Spoofing | Unicode format characters in terminal lines (review IN-05) | low | accept | diagnostics carry no record text after 02-04; Cf characters in ids/summaries remain open finding IN-05 — see Accepted Risks | closed |
+| T-02-SC (02-04) | Tampering | package installs | high | accept | no packages installed; Cargo.toml/Cargo.lock unchanged eb989bb..HEAD — see Accepted Risks | closed |
 
 *Status: open · closed · open — below high threshold (non-blocking)*
 *Severity: critical > high > medium > low — only open threats at or above workflow.security_block_on count toward threats_open*
@@ -64,6 +70,8 @@ created: "2026-11-03"
 | AR-02-03 | T-02-13 | README samples are synthetic (example.com, made-up reddit id) | plan 02-03 threat model | 2026-11-03 |
 | AR-02-04 | T-02-14 | Live run appends two small records per run to the dev cluster; retired `filimon-articles` left untouched | plan 02-03 threat model | 2026-11-03 |
 | AR-02-05 | T-02-SC (02-03) | Docs-only plan; no package installs | plan 02-03 threat model | 2026-11-03 |
+| AR-02-06 | T-02-19 | Diagnostics no longer carry record text; residual Unicode format characters (Cf) in ids/summaries tracked as review finding IN-05, out of scope for the gap | plan 02-04 threat model | 2026-11-04 |
+| AR-02-07 | T-02-SC (02-04) | No package installed; serde_json and fluvio are existing dependencies, Cargo.lock unchanged | plan 02-04 threat model | 2026-11-04 |
 
 *Accepted risks do not resurface in future audit runs.*
 
@@ -85,4 +93,12 @@ created: "2026-11-03"
 - [x] `threats_open: 0` confirmed
 - [x] `status: verified` set in frontmatter
 
-**Approval:** verified 2026-11-03
+**Approval:** verified 2026-11-04 (re-audit after gap plan 02-04; T-02-02 closed)
+
+## Security Audit 2026-11-03
+
+| Metric | Count |
+|---|---|
+| Threats found | 23 |
+| Closed | 23 |
+| Open | 0 |
