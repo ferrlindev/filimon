@@ -1137,4 +1137,261 @@ fetcher = "nope"
 
         load(&dir).expect("a disabled source's fetcher reference is not checked");
     }
+
+    // ── Plugin-file diagnostics ───────────────────────────────────────────────
+
+    /// Writes a registry with one enabled source `alpha` and the given
+    /// `alpha.toml` text.
+    fn alpha_with_plugin(dir: &TempDir, plugin_text: &str) {
+        write(
+            dir,
+            "filimon.toml",
+            "[sources.alpha]\ncomponent = \"alpha.wasm\"\nconfig = \"alpha.toml\"\n",
+        );
+        write(dir, "alpha.toml", plugin_text);
+    }
+
+    /// Loads `alpha` and returns its single `PluginFileMalformed` message,
+    /// asserting the problem names the plugin.
+    fn malformed_message(dir: &TempDir) -> String {
+        let errors = load(dir).expect_err("a malformed plugin file is an error");
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::PluginFileMalformed {
+            plugin, message, ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected PluginFileMalformed, got {:?}", errors.problems[0]);
+        };
+        assert_eq!(plugin, "alpha");
+        message.clone()
+    }
+
+    /// Loads `alpha` and returns the fields of its `InvalidValue` problems.
+    fn invalid_fields(dir: &TempDir) -> Vec<String> {
+        let errors = load(dir).expect_err("an invalid host value is an error");
+        errors
+            .problems
+            .iter()
+            .map(|problem| match problem {
+                ConfigError::InvalidValue { plugin, field, .. } => {
+                    assert_eq!(plugin, "alpha");
+                    field.clone()
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn malformed_plugin_toml() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, "[host\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("malformed plugin TOML is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::PluginFileMalformed { plugin, message, span: Some(_), .. }
+                    if plugin == "alpha" && message.contains("unclosed table")
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_host_key() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\npoll_intervall_secs = 60\n",
+        );
+
+        assert!(malformed_message(&dir).contains("poll_intervall_secs"));
+    }
+
+    #[test]
+    fn zero_poll_interval() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, "[host]\npoll_interval_secs = 0\n");
+
+        assert!(malformed_message(&dir).contains("nonzero"));
+    }
+
+    #[test]
+    fn missing_host_table() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, "[settings]\ngreeting = \"hi\"\n");
+
+        let message = malformed_message(&dir);
+        assert!(message.contains("missing field"), "{message}");
+        assert!(message.contains("host"), "{message}");
+    }
+
+    #[test]
+    fn invalid_allowlist_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\nallowlist = [\"api.example.com\", \"https://www.reddit.com/r\"]\n",
+        );
+
+        let errors = load(&dir).expect_err("a non-host allowlist entry is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::InvalidValue { plugin, field, span: Some(_), .. }
+                    if plugin == "alpha" && field == "host.allowlist[1]"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(
+            &render(&errors),
+            &["host.allowlist[1]", "https://www.reddit.com/r", "alpha.toml"],
+        );
+    }
+
+    #[test]
+    fn invalid_backoff() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.backoff]\nmultiplier = 0.5\n",
+        );
+        assert_eq!(invalid_fields(&dir), ["host.backoff.multiplier"]);
+
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.backoff]\ninitial_secs = 60\nmax_secs = 10\n",
+        );
+        assert_eq!(invalid_fields(&dir), ["host.backoff.max_secs"]);
+    }
+
+    #[test]
+    fn missing_secret() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.reddit]\ncomponent = \"reddit.wasm\"\nconfig = \"reddit.toml\"\n",
+        );
+        write(
+            &dir,
+            "reddit.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\nclient_id = \"REDDIT_CLIENT_ID\"\n",
+        );
+
+        let errors = load(&dir).expect_err("a missing secret is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::MissingSecret { plugin, .. } if plugin == "reddit"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(
+            &render(&errors),
+            &[
+                "host.secrets.client_id",
+                "REDDIT_CLIENT_ID",
+                "declared here",
+                "reddit.toml",
+            ],
+        );
+    }
+
+    // ── Collect-all report (D-14) ─────────────────────────────────────────────
+
+    #[test]
+    fn collects_all_problems() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources."Bad Name"]
+component = "bad.wasm"
+config = "bad.toml"
+
+[sources.alpha]
+component = "alpha.wasm"
+config = "missing.toml"
+
+[sources.beta]
+component = "beta.wasm"
+config = "beta.toml"
+
+[sources.gamma]
+component = "gamma.wasm"
+config = "gamma.toml"
+fetcher = "nope"
+"#,
+        );
+        write(&dir, "beta.toml", "[host\npoll_interval_secs = 60\n");
+        write(
+            &dir,
+            "gamma.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"GAMMA_TOKEN\"\n",
+        );
+
+        let first = load(&dir).expect_err("a broken registry fails closed");
+        let second = load(&dir).expect_err("a broken registry fails closed");
+
+        let order = |errors: &ConfigErrors| format!("{:?}", errors.problems);
+        assert_eq!(order(&first), order(&second), "problem order is stable");
+
+        let problems = &first.problems;
+        assert_eq!(problems.len(), 5, "{first:?}");
+        assert!(
+            matches!(&problems[0], ConfigError::InvalidName { plugin, .. } if plugin == "Bad Name"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[1], ConfigError::PluginFileMissing { plugin, .. } if plugin == "alpha"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[2], ConfigError::PluginFileMalformed { plugin, .. } if plugin == "beta"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[3], ConfigError::UnknownFetcher { plugin, .. } if plugin == "gamma"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[4], ConfigError::MissingSecret { plugin, .. } if plugin == "gamma"),
+            "{first:?}"
+        );
+
+        let report = render(&first);
+        assert!(report.contains("5 problem(s)"), "{report}");
+        assert_eq!(report.matches("fili::config::").count(), 5, "{report}");
+    }
+
+    #[test]
+    fn rendered_report_omits_secret_values() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\nenvtok = \"ALPHA_ENV\"\nmissing = \"ALPHA_MISSING\"\n",
+        );
+        write(&dir, ".env", "ALPHA_TOKEN=pa55-present-VALUE\n");
+        let env = |key: &str| (key == "ALPHA_ENV").then(|| "env-supplied-VALUE".to_string());
+
+        let errors = load_registry_with_env(&dir.path().join("filimon.toml"), &env)
+            .expect_err("a missing secret is an error");
+
+        let report = render(&errors);
+        assert!(report.contains("ALPHA_MISSING"), "{report}");
+        for value in ["pa55-present-VALUE", "env-supplied-VALUE"] {
+            assert!(!report.contains(value), "leaked {value:?} in:\n{report}");
+            assert!(!format!("{errors:?}").contains(value), "leaked {value:?}");
+        }
+    }
 }

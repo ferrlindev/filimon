@@ -60,6 +60,20 @@ pub enum ConfigError {
         span: Option<SourceSpan>,
     },
 
+    /// A plugin file parses, but a `[host]` value is out of range.
+    #[error("plugin `{plugin}` (`{path}`): `{field}`: {message}")]
+    #[diagnostic(code(fili::config::invalid_value))]
+    InvalidValue {
+        plugin: String,
+        path: String,
+        field: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("invalid value")]
+        span: Option<SourceSpan>,
+    },
+
     /// A `[host.secrets]` alias names an env var that is set nowhere.
     #[error(
         "plugin `{plugin}`: `host.secrets.{alias}` needs env var `{env_var}`, which is not set in the process environment or {dotenv}"
