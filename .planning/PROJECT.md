@@ -32,7 +32,10 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - [ ] Unified `SourceItem` envelope covering news pages and social posts; each source type routed to an appropriate SmartModule chain; all paths converge on the same NER-enriched JSON output
 - [ ] Reference Reddit plugin (official Reddit API) as a separately built `.wasm` component
 - [ ] Reference YouTube plugin (official YouTube Data API) as a separately built `.wasm` component
+- [ ] Fetcher plugins: a second WIT world (`fetcher`) so the HTTP client is itself a supplied WASM component; source plugins' fetch and (optionally) the news crawler route through the configured fetcher; default HTTP fetcher shipped; host still enforces allowlist/timeout
+- [ ] Plugin CLI: `fili plugins list | check | run-once`, plus a run command that polls all enabled sources
 - [ ] Fixture-based tests per plugin (recorded API responses; runs in CI without network or keys)
+- [ ] Integration tests running compiled Reddit/YouTube components inside the host against replayed fixtures into a local Fluvio topic; live mode when `.env` keys exist
 - [ ] Live end-to-end run: `fili` loads Reddit + YouTube plugins, polls real APIs, records flow through Fluvio, enriched JSON is produced alongside news articles
 
 ### Out of Scope
@@ -77,6 +80,10 @@ A user-supplied WASM component, written only against filimon's published WIT con
 | Unified `SourceItem` envelope, per-type SmartModule chains | Social posts aren't HTML; still converge on same enriched output | — Pending |
 | Ship Reddit + YouTube; defer X | X read access requires paid app tier regardless of user login | — Pending |
 | Leave existing `fluvio-wise` gaps alone | Keep milestone focused on plugin system | — Pending |
+| Fetcher is itself a WASM plugin (`fetcher` world) | Lets a future headless-browser fetcher (remote CDP) be supplied for crawling without host changes | — Pending |
+| Social items pass through (no social SmartModule chain in v1) | Keep v1 minimal; filtering deferred to v2 | — Pending |
+| Reddit: subreddits + user feed; YouTube: channel uploads + user subscriptions | User-selected v1 feeds; search/comments deferred | — Pending |
+| Skip project-level research | User decision at init; per-phase research remains enabled | — Pending |
 
 ## Evolution
 
