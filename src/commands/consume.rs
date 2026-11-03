@@ -252,17 +252,59 @@ impl EntityDetector for NerEngine {
 /// Longest social NER input, in characters.
 pub const NER_INPUT_CHARS: usize = 500;
 
-/// The text handed to the NER detector for one record. RED stub.
-pub fn ner_input(_record: &OutputRecord) -> String {
-    String::new()
+/// Lower-case label of a source type, as it appears in the JSON output.
+fn kind_label(kind: SourceType) -> &'static str {
+    match kind {
+        SourceType::News => "news",
+        SourceType::Social => "social",
+    }
 }
 
-/// Run the detector over every record. RED stub.
-pub fn enrich(
-    _records: &mut [OutputRecord],
-    _detector: Option<&dyn EntityDetector>,
-) -> Vec<String> {
-    Vec::new()
+/// The text handed to the NER detector for one record.
+///
+/// News uses its `text` (the body preview) unchanged. Social uses the title,
+/// a newline and the text, or only the text when there is no title, cut to
+/// the first `NER_INPUT_CHARS` characters (Unicode scalar values, never
+/// bytes). The record itself is never changed.
+pub fn ner_input(record: &OutputRecord) -> String {
+    match record.source_type {
+        SourceType::News => record.text.clone(),
+        SourceType::Social => {
+            let full = match record.title.as_deref() {
+                Some(title) if !title.is_empty() => format!("{title}\n{}", record.text),
+                _ => record.text.clone(),
+            };
+            full.chars().take(NER_INPUT_CHARS).collect()
+        }
+    }
+}
+
+/// Run the detector over every record and store the entities it returns.
+///
+/// With no detector nothing changes. A record whose NER input is blank is
+/// skipped. A detector error leaves that record unchanged and returns one
+/// diagnostic naming the record. Records are never dropped.
+pub fn enrich(records: &mut [OutputRecord], detector: Option<&dyn EntityDetector>) -> Vec<String> {
+    let Some(detector) = detector else {
+        return Vec::new();
+    };
+    let mut diagnostics = Vec::new();
+    for record in records.iter_mut() {
+        let input = ner_input(record);
+        if input.trim().is_empty() {
+            continue;
+        }
+        match detector.detect(&input) {
+            Ok(entities) => record.entities = entities,
+            Err(e) => diagnostics.push(format!(
+                "{} {}: NER failed ({})",
+                kind_label(record.source_type),
+                output::sanitize_for_terminal(&record.id),
+                truncate_detail(&e.to_string())
+            )),
+        }
+    }
+    diagnostics
 }
 
 /// Check the topics and chain, then open the merged news and social stream.
@@ -354,12 +396,11 @@ async fn consume_batch(
         eprintln!("  ✗ {message}");
     }
 
-    for record in &mut records {
-        if let Some(engine) = ner {
-            if let Ok(entities) = engine.detect(&record.text) {
-                record.entities = entities;
-            }
-        }
+    for message in enrich(&mut records, ner.map(|engine| engine as &dyn EntityDetector)) {
+        eprintln!("  ✗ {message}");
+    }
+
+    for record in &records {
         output::print_summary(record);
     }
 
