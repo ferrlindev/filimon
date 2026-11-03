@@ -32,7 +32,7 @@ created: "2026-11-03"
 | Threat ID | Category | Component | Severity | Disposition | Mitigation | Status |
 |-----------|----------|-----------|----------|-------------|------------|--------|
 | T-02-01 | Denial of Service | SourceItem serialization; news stream in consume.rs | medium | mitigate | `html` has `skip_serializing_if` (src/models.rs:136); `RetryMode::Disabled` (src/streaming.rs:141); tests news_item_is_rawpage_compatible, stream_error_omits_record_value pass | closed |
-| T-02-02 | Information Disclosure | `describe_stream_error`, `decode_news` | medium | mitigate | record value never printed; serde-quoted text scrubbed (02-01 deviation 1); tests stream_error_omits_record_value, decode_news_reports_bad_value_without_content pass | closed |
+| T-02-02 | Information Disclosure | `describe_stream_error`, `decode_news` | medium | mitigate | record value never printed; serde-quoted text scrubbed (02-01 deviation 1); tests stream_error_omits_record_value, decode_news_reports_bad_value_without_content pass ; **code review CR-01 (02-REVIEW.md): `redact_quoted` leaks a quoted value containing escaped quotes, the SmartModule hint is not redacted, and diagnostics reach stderr without `sanitize_for_terminal` (ESC passes through)** | open — below high threshold (non-blocking) |
 | T-02-03 | Information Disclosure | `OutputRecord` / JSON output | low | mitigate | `OutputRecord` has no html field (0 matches in struct); test save_json_writes_array_without_html passes; live smokes (02-01, 02-03) show no `html` key | closed |
 | T-02-04 | Tampering | `print_summary` (operator terminal) | low | mitigate | `sanitize_for_terminal` (src/output.rs:31) on every record-derived string; test sanitize_strips_control_chars passes | closed |
 | T-02-05 | Denial of Service | consumer start-up, missing topic/SmartModule | medium | mitigate | `FluvioStream::preflight` (src/streaming.rs:155); cluster test missing_topic_is_named passes | closed |
@@ -74,6 +74,7 @@ created: "2026-11-03"
 | Audit Date | Threats Total | Closed | Open | Run By |
 |------------|---------------|--------|------|--------|
 | 2026-11-03 | 17 | 17 | 0 | execute-phase verify:post (secure-phase, L1 grep depth; auditor skipped per short-circuit rule) |
+| 2026-11-03 | 17 | 16 | 1 (medium, non-blocking) | reopened T-02-02 after code review CR-01 |
 
 ---
 
