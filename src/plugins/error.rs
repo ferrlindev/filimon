@@ -114,6 +114,28 @@ pub enum ConfigError {
         span: SourceSpan,
     },
 
+    /// An enabled source's `fetcher` names a fetcher with `enabled = false`.
+    #[error("`sources.{plugin}.fetcher` references fetcher `{fetcher}`, which is disabled")]
+    #[diagnostic(code(fili::config::disabled_fetcher))]
+    DisabledFetcher {
+        plugin: String,
+        fetcher: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this fetcher has enabled = false")]
+        span: SourceSpan,
+    },
+
+    /// A plugin name uses characters outside `[a-z0-9_-]`, or is empty.
+    #[error("`{table}.{plugin}`: plugin names may only contain a-z, 0-9, '_' and '-'")]
+    #[diagnostic(code(fili::config::invalid_name))]
+    InvalidName { plugin: String, table: String },
+
+    /// The same name appears under both `[sources]` and `[fetchers]`.
+    #[error("`{plugin}` is defined under both [sources] and [fetchers]; plugin names must be unique")]
+    #[diagnostic(code(fili::config::duplicate_name))]
+    DuplicateName { plugin: String },
+
     /// The `.env` file exists but cannot be used. Never carries line content.
     #[error(
         "cannot use `{path}`{}: {reason}",

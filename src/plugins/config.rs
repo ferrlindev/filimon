@@ -815,4 +815,231 @@ component = "http.wasm"
             assert!(report.contains(needle), "missing {needle:?} in:\n{report}");
         }
     }
+
+    fn assert_contains(report: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(report.contains(needle), "missing {needle:?} in:\n{report}");
+        }
+    }
+
+    // ── Registry-level diagnostics ────────────────────────────────────────────
+
+    #[test]
+    fn registry_missing() {
+        let dir = TempDir::new().expect("tempdir");
+
+        let errors = load_registry_with_env(&dir.path().join("nonexistent.toml"), &no_env)
+            .expect_err("a missing registry is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors.problems[0], ConfigError::RegistryUnreadable { .. }),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["nonexistent.toml", "FILI_REGISTRY"]);
+    }
+
+    #[test]
+    fn registry_malformed() {
+        let dir = TempDir::new().expect("tempdir");
+        write(&dir, "filimon.toml", "[sources.alpha\ncomponent = \"a.wasm\"\n");
+
+        let errors = load(&dir).expect_err("malformed registry TOML is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::RegistryMalformed { span: Some(_), .. }
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn registry_unknown_key() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.alpha]\ncomponent = \"alpha.wasm\"\nconfg = \"x.toml\"\n",
+        );
+
+        let errors = load(&dir).expect_err("an unknown registry key is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::RegistryMalformed { message, .. } if message.contains("confg")
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_table_is_malformed() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+"#,
+        );
+
+        let errors = load(&dir).expect_err("a duplicate table is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors.problems[0], ConfigError::RegistryMalformed { .. }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn missing_plugin_file() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.alpha]\ncomponent = \"alpha.wasm\"\nconfig = \"missing.toml\"\n",
+        );
+
+        let errors = load(&dir).expect_err("a missing plugin file is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::PluginFileMissing { plugin, .. } if plugin == "alpha"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["sources.alpha.config", "missing.toml"]);
+    }
+
+    #[test]
+    fn disabled_fetcher() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+fetcher = "beta"
+
+[fetchers.beta]
+component = "beta.wasm"
+enabled = false
+"#,
+        );
+        write(&dir, "alpha.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("a disabled fetcher reference is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DisabledFetcher { plugin, fetcher, .. }
+                    if plugin == "alpha" && fetcher == "beta"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["sources.alpha.fetcher", "disabled"]);
+    }
+
+    #[test]
+    fn invalid_plugin_name() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources."Bad Name"]
+component = "bad.wasm"
+config = "bad.toml"
+
+[fetchers.UPPER]
+component = "upper.wasm"
+"#,
+        );
+
+        let errors = load(&dir).expect_err("invalid plugin names are errors");
+
+        assert_eq!(errors.problems.len(), 2, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::InvalidName { plugin, table }
+                    if plugin == "Bad Name" && table == "sources"
+            ),
+            "{errors:?}"
+        );
+        assert!(
+            matches!(
+                &errors.problems[1],
+                ConfigError::InvalidName { plugin, table }
+                    if plugin == "UPPER" && table == "fetchers"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["Bad Name", "UPPER"]);
+    }
+
+    #[test]
+    fn duplicate_plugin_name() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.shared]
+component = "shared.wasm"
+config = "shared.toml"
+
+[fetchers.shared]
+component = "shared-fetcher.wasm"
+"#,
+        );
+        write(&dir, "shared.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("a name in both tables is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DuplicateName { plugin } if plugin == "shared"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_fetcher_on_disabled_source_ignored() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.off]
+component = "off.wasm"
+config = "off.toml"
+enabled = false
+fetcher = "nope"
+"#,
+        );
+
+        load(&dir).expect("a disabled source's fetcher reference is not checked");
+    }
 }
