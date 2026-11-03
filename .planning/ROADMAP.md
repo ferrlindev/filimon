@@ -56,7 +56,7 @@ Plans:
   2. `fili produce <url>` and `fili file <paths>` still yield extracted articles at the consumer through `map-preprocess → map-extract → filter-relevance`. The news path does not regress.
   3. A social `SourceItem` produced to Fluvio reaches the consumer without any social-specific filtering, even when its text would fall below the news relevance threshold.
   4. In the consumer's existing NER mode (`--enrich-ner` with `--limit`), NER runs on social item text, and social and news records go to the same JSON output, each labelled with source type and platform.
-**Plans:** 3/3 plans executed
+**Plans:** 3/4 plans executed
 
 Plans:
 **Wave 1**
@@ -67,6 +67,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [x] 02-03-PLAN.md — README operator path proven live on both topics, codebase map and compose comment updated, no doc names the retired topic (PIPE-02, PIPE-03, PIPE-04)
+- [ ] 02-04-PLAN.md — Gap closure: content-free consume diagnostics (serde_json structured accessors, SmartModule hint prefix) and one sanitized stderr choke point; closes CR-01 / T-02-02 (PIPE-02, PIPE-03)
 
 ### Phase 3: Component Host Runtime
 **Goal**: `fili` hosts WASM components. It loads only what the registry lists, polls each source on its schedule, persists cursors across restarts, isolates failing plugins, and produces returned items to Fluvio as `SourceItem` records
