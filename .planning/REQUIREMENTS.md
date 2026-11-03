@@ -30,7 +30,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Config & Secrets
 
-- [ ] **CONF-01**: Each plugin has its own TOML settings file (subreddits, channels, intervals, allowlist) referenced from `filimon.toml`
+- [x] **CONF-01**: Each plugin has its own TOML settings file (subreddits, channels, intervals, allowlist) referenced from `filimon.toml`
 - [ ] **CONF-02**: API keys / client secrets load from `.env`; each plugin receives only the secrets its config names
 - [ ] **CONF-03**: Invalid config (missing file, bad TOML, missing secret) produces a clear error naming the plugin and field
 
@@ -138,7 +138,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FETCH-02 | Phase 5 | Pending |
 | FETCH-03 | Phase 5 | Pending |
 | FETCH-04 | Phase 5 | Pending |
-| CONF-01 | Phase 1 | Pending |
+| CONF-01 | Phase 1 | Complete |
 | CONF-02 | Phase 1 | Pending |
 | CONF-03 | Phase 1 | Pending |
 | AUTH-01 | Phase 6 | Pending |
