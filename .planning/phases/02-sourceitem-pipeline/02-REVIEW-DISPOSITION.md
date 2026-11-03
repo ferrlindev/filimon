@@ -3,38 +3,46 @@ phase: 02
 review: 02-REVIEW.md
 titles: json
 findings:
+  - id: WR-01
+    severity: warning
+    disposition: open
+    title: "One poison record permanently halts the news branch (carried forward, open)"
+  - id: WR-02
+    severity: warning
+    disposition: open
+    title: "Consume exits 0 and overwrites prior output when streams fail (carried forward, open)"
+  - id: WR-03
+    severity: warning
+    disposition: open
+    title: "`--enrich-ner` silently ignored in streaming mode (carried forward, open)"
+  - id: WR-04
+    severity: warning
+    disposition: open
+    title: "Social `published` validated but not normalized to UTC (carried forward, open)"
+  - id: WR-05
+    severity: warning
+    disposition: open
+    title: "Content-freedom of stream diagnostics depends on an unenforced cross-crate message convention"
+  - id: WR-06
+    severity: warning
+    disposition: open
+    title: "Undecodable records do not count toward `--limit`, so a batch run is unbounded"
+  - id: IN-01
+    severity: info
+    disposition: open
+    title: "Local decode diagnostics drop safe, struct-authored detail; `hint_summary` over-truncates fluvio-authored errors"
+  - id: IN-02
+    severity: info
+    disposition: open
+    title: "Unicode format characters (bidi overrides) pass the diagnostic choke point"
+  - id: IN-03
+    severity: info
+    disposition: open
+    title: "Offset assertions use single-digit `contains`, which can pass when the offset is missing"
   - id: CR-01
     severity: critical
     disposition: open
     title: "Diagnostics bypass terminal sanitization, and `redact_quoted` leaks record content"
-  - id: WR-01
-    severity: warning
-    disposition: open
-    title: "One poison record permanently halts the news branch"
-  - id: WR-02
-    severity: warning
-    disposition: open
-    title: "Consume reports success and overwrites prior output when streams fail"
-  - id: WR-03
-    severity: warning
-    disposition: open
-    title: "`--enrich-ner` in streaming mode loads the model and silently ignores it"
-  - id: WR-04
-    severity: warning
-    disposition: open
-    title: "Social `published` is not normalized to UTC, contradicting the output contract"
-  - id: IN-01
-    severity: info
-    disposition: open
-    title: "The phase leaves the old consumer API unused"
-  - id: IN-02
-    severity: info
-    disposition: open
-    title: "Stale commented-out code in main.rs references the removed `TOPIC_ARTICLES`"
-  - id: IN-03
-    severity: info
-    disposition: open
-    title: "`--threshold` is parsed but never applied"
   - id: IN-04
     severity: info
     disposition: open
@@ -55,28 +63,30 @@ findings:
     severity: info
     disposition: open
     title: "Already-defended-elsewhere — empty-parent guard before `create_dir_all`"
-open: 13
-total: 13
-recorded: 2026-11-03T20:52:59.537Z
+open: 15
+total: 15
+recorded: 2026-11-03T22:02:57.092Z
 ---
 
 # Phase 02: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| CR-01 | critical | open | - |
 | WR-01 | warning | open | - |
 | WR-02 | warning | open | - |
 | WR-03 | warning | open | - |
 | WR-04 | warning | open | - |
+| WR-05 | warning | open | - |
+| WR-06 | warning | open | - |
 | IN-01 | info | open | - |
 | IN-02 | info | open | - |
 | IN-03 | info | open | - |
-| IN-04 | info | open | - |
-| IN-05 | info | open | - |
-| IN-06 | info | open | - |
-| IN-07 | info | open | - |
-| IN-08 | info | open | - |
+| CR-01 | critical | open | - (not in the current review) |
+| IN-04 | info | open | - (not in the current review) |
+| IN-05 | info | open | - (not in the current review) |
+| IN-06 | info | open | - (not in the current review) |
+| IN-07 | info | open | - (not in the current review) |
+| IN-08 | info | open | - (not in the current review) |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
