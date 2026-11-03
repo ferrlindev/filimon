@@ -27,9 +27,6 @@ use crate::streaming::{
     FluvioStream, NEWS_CHAIN, TOPIC_RAW_PAGES, TOPIC_SOCIAL_ITEMS, news_chain,
 };
 
-/// Where batch mode writes its JSON output.
-pub const DEFAULT_OUTPUT: &str = "output/wise_output.json";
-
 /// Batch mode stops when no record arrives for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -308,47 +305,77 @@ pub fn enrich(records: &mut [OutputRecord], detector: Option<&dyn EntityDetector
     diagnostics
 }
 
-/// The topics and chain modules a `--source` selection needs. RED stub.
-pub fn required_inputs<'a>(
-    _source: SourceFilter,
-    _topics: &ConsumeTopics<'a>,
-) -> (Vec<&'a str>, &'static [&'static str]) {
-    (Vec::new(), &[])
+/// Whether a `--source` selection reads news.
+fn reads_news(source: SourceFilter) -> bool {
+    matches!(source, SourceFilter::Both | SourceFilter::News)
 }
 
-/// Check the topics and chain, then open the merged news and social stream.
+/// Whether a `--source` selection reads social items.
+fn reads_social(source: SourceFilter) -> bool {
+    matches!(source, SourceFilter::Both | SourceFilter::Social)
+}
+
+/// The topics and chain modules a `--source` selection needs.
+///
+/// The news chain modules are required only when news is selected.
+pub fn required_inputs<'a>(
+    source: SourceFilter,
+    topics: &ConsumeTopics<'a>,
+) -> (Vec<&'a str>, &'static [&'static str]) {
+    let mut needed = Vec::new();
+    if reads_news(source) {
+        needed.push(topics.raw_pages);
+    }
+    if reads_social(source) {
+        needed.push(topics.social);
+    }
+    let chain: &'static [&'static str] = if reads_news(source) { &NEWS_CHAIN } else { &[] };
+    (needed, chain)
+}
+
+/// Check the selected topics and chain, then open the merged stream.
 ///
 /// The social stream is opened with no chain modules, so the chain never sees
-/// social records. Preflight runs before any stream opens.
+/// social records. Preflight runs before any stream opens, and an unselected
+/// source is an empty branch.
 async fn open_incoming(
     stream: &FluvioStream,
     topics: &ConsumeTopics<'_>,
     offset: Offset,
+    source: SourceFilter,
 ) -> miette::Result<impl Stream<Item = Incoming> + Unpin + use<>> {
-    stream
-        .preflight(&[topics.raw_pages, topics.social], &NEWS_CHAIN)
-        .await?;
-    let news = stream
-        .topic_stream(topics.raw_pages, offset.clone(), news_chain())
-        .await?;
-    let social = stream
-        .topic_stream(topics.social, offset, Vec::new())
-        .await?;
-    Ok(merge_incoming(
-        news_incoming(news, topics.raw_pages),
-        social_incoming(social, topics.social),
-    ))
+    let (needed, chain) = required_inputs(source, topics);
+    stream.preflight(&needed, chain).await?;
+
+    let news = if reads_news(source) {
+        let raw = stream
+            .topic_stream(topics.raw_pages, offset.clone(), news_chain())
+            .await?;
+        news_incoming(raw, topics.raw_pages).boxed()
+    } else {
+        futures_util::stream::empty().boxed()
+    };
+    let social = if reads_social(source) {
+        let raw = stream
+            .topic_stream(topics.social, offset, Vec::new())
+            .await?;
+        social_incoming(raw, topics.social).boxed()
+    } else {
+        futures_util::stream::empty().boxed()
+    };
+    Ok(merge_incoming(news, social))
 }
 
-/// Check the topics and chain, then collect up to `limit` records of both
-/// kinds together.
+/// Check the selected topics and chain, then collect up to `limit` records of
+/// both kinds together.
 pub async fn collect_from_topics(
     stream: &FluvioStream,
     topics: &ConsumeTopics<'_>,
     offset: Offset,
     limit: usize,
+    source: SourceFilter,
 ) -> miette::Result<Collected> {
-    let merged = open_incoming(stream, topics, offset).await?;
+    let merged = open_incoming(stream, topics, offset, source).await?;
     Ok(collect_records(merged, limit, IDLE_TIMEOUT).await)
 }
 
@@ -357,10 +384,14 @@ pub async fn collect_from_topics(
 /// # Arguments
 /// * `from_beginning` - Start consuming from the beginning of the topics
 /// * `limit` - Maximum records across news and social (0 = unlimited streaming)
+/// * `source` - Which sources to read and preflight
+/// * `output` - JSON output file (batch mode)
 /// * `ner` - Optional NER engine for entity enrichment
 pub async fn run(
     from_beginning: bool,
     limit: usize,
+    source: SourceFilter,
+    output: &Path,
     ner: Option<&NerEngine>,
 ) -> miette::Result<()> {
     println!("[Consume] Connecting to Fluvio cluster...");
@@ -373,18 +404,36 @@ pub async fn run(
     };
 
     let topics = ConsumeTopics::default();
-    println!(
-        "[Consume] Reading {} through {}",
-        topics.raw_pages,
-        NEWS_CHAIN.join(" → ")
-    );
-    println!("[Consume] Reading {} with no SmartModules", topics.social);
+    if reads_news(source) {
+        println!(
+            "[Consume] Reading {} through {}",
+            topics.raw_pages,
+            NEWS_CHAIN.join(" → ")
+        );
+    }
+    if reads_social(source) {
+        println!("[Consume] Reading {} with no SmartModules", topics.social);
+    }
 
     if limit > 0 {
-        consume_batch(&stream, &topics, offset, limit, ner).await
+        let batch = Batch {
+            limit,
+            source,
+            output,
+            ner,
+        };
+        consume_batch(&stream, &topics, offset, &batch).await
     } else {
-        consume_stream(&stream, &topics, offset).await
+        consume_stream(&stream, &topics, offset, source).await
     }
+}
+
+/// Settings for one batch run.
+struct Batch<'a> {
+    limit: usize,
+    source: SourceFilter,
+    output: &'a Path,
+    ner: Option<&'a NerEngine>,
 }
 
 /// Consume a batch of records, enrich them, print them and write the JSON file.
@@ -392,14 +441,19 @@ async fn consume_batch(
     stream: &FluvioStream,
     topics: &ConsumeTopics<'_>,
     offset: Offset,
-    limit: usize,
-    ner: Option<&NerEngine>,
+    batch: &Batch<'_>,
 ) -> miette::Result<()> {
+    let Batch {
+        limit,
+        source,
+        output: path,
+        ner,
+    } = *batch;
     println!("[Consume] Will consume up to {limit} records.\n");
     let Collected {
         mut records,
         diagnostics,
-    } = collect_from_topics(stream, topics, offset, limit).await?;
+    } = collect_from_topics(stream, topics, offset, limit, source).await?;
 
     for message in &diagnostics {
         eprintln!("  ✗ {message}");
@@ -413,9 +467,9 @@ async fn consume_batch(
         output::print_summary(record);
     }
 
-    output::save_json(&records, Path::new(DEFAULT_OUTPUT))
-        .map_err(|e| miette::miette!("Failed to write {DEFAULT_OUTPUT}: {e}"))?;
-    output::print_run_summary(records.len(), DEFAULT_OUTPUT);
+    output::save_json(&records, path)
+        .map_err(|e| miette::miette!("Failed to write {}: {e}", path.display()))?;
+    output::print_run_summary(records.len(), &path.display().to_string());
     Ok(())
 }
 
@@ -424,8 +478,9 @@ async fn consume_stream(
     stream: &FluvioStream,
     topics: &ConsumeTopics<'_>,
     offset: Offset,
+    source: SourceFilter,
 ) -> miette::Result<()> {
-    let mut incoming = open_incoming(stream, topics, offset).await?;
+    let mut incoming = open_incoming(stream, topics, offset, source).await?;
     println!("[Consume] Press Ctrl+C to stop.\n");
 
     while let Some(item) = incoming.next().await {
@@ -924,10 +979,20 @@ mod tests {
             .await)
     }
 
-    /// Create a scratch topic `filimon-test-<kind>-<nanos>`.
+    /// Create a scratch topic `filimon-test-<kind>-<nanos>-<pid>-<n>`.
+    ///
+    /// The cluster tests run in parallel and the clock can be coarser than a
+    /// nanosecond, so the process id and a counter keep names unique.
     async fn create_scratch(admin: &fluvio::FluvioAdmin, kind: &str) -> miette::Result<String> {
         use fluvio::metadata::topic::TopicSpec;
-        let topic = format!("filimon-test-{kind}-{}", nanos());
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let topic = format!(
+            "filimon-test-{kind}-{}-{}-{}",
+            nanos(),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
         admin
             .create(topic.clone(), false, TopicSpec::new_computed(1, 1, None))
             .await
@@ -961,12 +1026,15 @@ mod tests {
         Err(miette::miette!("no producer for {topic}"))
     }
 
-    /// Create a raw-pages and a social scratch topic, run `body`, then delete both.
+    /// Create a raw-pages and a social scratch topic, run `body`, then delete
+    /// both, also when `body` fails an assertion (panics).
     async fn with_scratch_topics<F, Fut>(body: F) -> miette::Result<()>
     where
         F: FnOnce(String, String) -> Fut,
         Fut: std::future::Future<Output = miette::Result<()>>,
     {
+        use futures_util::FutureExt;
+
         let admin = admin().await?;
         let raw = create_scratch(&admin, "raw").await?;
         let social = match create_scratch(&admin, "social").await {
@@ -976,10 +1044,17 @@ mod tests {
                 return Err(e);
             }
         };
-        let result = body(raw.clone(), social.clone()).await;
+        let result = std::panic::AssertUnwindSafe(body(raw.clone(), social.clone()))
+            .catch_unwind()
+            .await;
         let deleted = delete_topics(&admin, &[raw, social]).await;
-        result?;
-        deleted
+        match result {
+            Ok(outcome) => {
+                outcome?;
+                deleted
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     #[tokio::test]
@@ -1000,7 +1075,9 @@ mod tests {
                 raw_pages: &raw,
                 social: &social,
             };
-            let collected = collect_from_topics(&stream, &topics, Offset::beginning(), 1).await?;
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 1, SourceFilter::Both)
+                    .await?;
             assert!(collected.diagnostics.is_empty(), "{:?}", collected.diagnostics);
             assert_eq!(collected.records.len(), 1);
 
@@ -1060,7 +1137,9 @@ mod tests {
                 raw_pages: &raw,
                 social: &social,
             };
-            let collected = collect_from_topics(&stream, &topics, Offset::beginning(), 3).await?;
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 3, SourceFilter::Both)
+                    .await?;
             assert!(collected.diagnostics.is_empty(), "{:?}", collected.diagnostics);
             assert_eq!(collected.records.len(), 2, "{:?}", collected.records);
 

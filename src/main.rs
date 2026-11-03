@@ -6,7 +6,8 @@
 // Modes:
 //   fili produce <URL>   Crawl URLs and produce news SourceItems to Fluvio
 //   fili file <PATH>     Produce local HTML files as news SourceItems
-//   fili consume         Read news through the SmartModule chain and write JSON
+//   fili consume         Read news through the SmartModule chain and social items
+//                        from filimon-social-items, merged, and write JSON
 //   fili watch           Watch directories and produce HTML to Fluvio
 //
 // Pipeline Architecture (via SmartModules):
@@ -66,14 +67,15 @@ async fn main() -> miette::Result<()> {
             from_beginning,
             limit,
             enrich_ner,
-            ..
+            source,
+            ref output,
         } => {
             let ner = if enrich_ner {
                 load_ner_engine(&cli.tokenizer, &cli.model)
             } else {
                 None
             };
-            run_consume(from_beginning, limit, ner.as_ref()).await?;
+            run_consume(from_beginning, limit, source, output, ner.as_ref()).await?;
         }
         Command::Watch => {
             run_watch(&cli).await?;

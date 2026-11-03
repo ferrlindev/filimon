@@ -80,26 +80,26 @@ pub enum Command {
         depth: usize,
     },
 
-    /// Consume processed articles from Fluvio (with optional NER enrichment).
+    /// Consume news (through the news chain modules) and social items from Fluvio into one JSON output, with optional NER enrichment.
     Consume {
         /// Consume from the beginning of the topic.
         #[arg(long)]
         from_beginning: bool,
 
-        /// Maximum number of articles to consume ( 0 = unlimited).
+        /// Maximum records across news and social (0 = unlimited streaming).
         #[arg(long, default_value_t = 0)]
         limit: usize,
 
-        /// Apply NER enrichment to consumed articles
+        /// NER for news and social records, batch mode only.
         #[arg(long)]
         enrich_ner: bool,
 
-        /// Which sources to read.
-        #[arg(long, value_enum)]
+        /// Which sources to read: both, news or social.
+        #[arg(long, value_enum, default_value_t = SourceFilter::Both)]
         source: SourceFilter,
 
         /// JSON output file (batch mode).
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_OUTPUT)]
         output: PathBuf,
     },
 
