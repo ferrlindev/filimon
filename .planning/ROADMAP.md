@@ -35,8 +35,11 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans:** 4 plans
 
 Plans:
+**Wave 1**
 - [ ] 01-01-PLAN.md — WIT package `filimon:plugin@0.1.0` (source + fetcher worlds) and stub source/fetcher components built with `cargo component`, checked with `wasm-tools component targets` (WIT-01, WIT-02)
 - [ ] 01-02-PLAN.md — `src/plugins/` config loader: registry → plugin TOML → `.env` secrets into typed `LoadedRegistry`, with per-plugin secret isolation and redaction (CONF-01, CONF-02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 01-03-PLAN.md — Collect-all miette diagnostics naming plugin + field/key for every config problem (CONF-03)
 - [ ] 01-04-PLAN.md — `examples/plugins/` sample registry and plugin TOMLs proven to load (SC3), plus the global `--registry` / `FILI_REGISTRY` flag (CONF-01, CONF-02)
 
