@@ -29,6 +29,9 @@ watchexec-events = "6"
 watchexec-signals = "5"
 tokio = { version = "1", features = ["full"] }
 miette = { version = "7", features = ["fancy"] }
+toml = "1"
+dotenvy = "0.15"
+thiserror = "2"
 gline-rs = "1.0"
 orp = "0.9"
 
@@ -45,6 +48,7 @@ members = [
     "smartmodules/map-preprocess",
     "smartmodules/map-extract",
 ]
+exclude = ["plugins"]
 
 [profile.release-lto]
 inherits = "release"
