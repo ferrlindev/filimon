@@ -20,12 +20,6 @@ last_mapped_at: 2026-11-03
 - Impact: Future Fluvio versions may remove these deprecated methods, forcing a breaking upgrade
 - Fix approach: Update to the non-deprecated consumer API when Fluvio releases a stable replacement or in the next major version bump
 
-**Invalid Rust Edition in Cargo.toml:**
-- Issue: `Cargo.toml` specifies `edition = "2024"` (line 4), which is not a valid Rust edition. Valid editions are 2015, 2018, 2021. This will cause compilation failure.
-- Files: `Cargo.toml`
-- Impact: Project cannot compile with `cargo build`; this is a blocking issue
-- Fix approach: Change `edition = "2024"` to `edition = "2021"` (the current stable edition)
-
 **Incomplete Refactoring:**
 - Issue: The transition from a unified CLI to a modular commands structure appears incomplete. Functions like `criteria()` and type conflicts suggest the refactoring wasn't fully validated before commit.
 - Files: `src/main.rs`, `src/commands/`, `src/cli.rs`
