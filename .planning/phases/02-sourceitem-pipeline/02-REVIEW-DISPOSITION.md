@@ -41,7 +41,7 @@ findings:
     title: "Offset assertions use single-digit `contains`, which can pass when the offset is missing"
   - id: CR-01
     severity: critical
-    disposition: open
+    disposition: fixed
     title: "Diagnostics bypass terminal sanitization, and `redact_quoted` leaks record content"
   - id: IN-04
     severity: info
@@ -81,7 +81,7 @@ recorded: 2026-11-03T22:02:57.092Z
 | IN-01 | info | open | - |
 | IN-02 | info | open | - |
 | IN-03 | info | open | - |
-| CR-01 | critical | open | - (not in the current review) |
+| CR-01 | critical | fixed | gap plan 02-04 (commits 1e895e0, e406c7a); incremental re-review 16e529d confirms all three parts resolved |
 | IN-04 | info | open | - (not in the current review) |
 | IN-05 | info | open | - (not in the current review) |
 | IN-06 | info | open | - (not in the current review) |
