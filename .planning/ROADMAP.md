@@ -32,7 +32,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. A stub source crate and a stub fetcher crate each generate bindings from the WIT package alone (via `cargo component`) and compile to a valid component for their world.
   3. A sample `filimon.toml` registry that points to per-plugin TOML files (subreddits or channels, interval, allowlist) loads into typed config. Each plugin's resolved secrets contain only the `.env` keys its own TOML names.
   4. A missing plugin TOML file, malformed TOML, or missing `.env` secret produces an error that names both the plugin and the field or key at fault.
-**Plans:** 4/4 plans executed
+**Plans:** 4/6 plans executed
 
 Plans:
 **Wave 1**
@@ -42,6 +42,10 @@ Plans:
 **Wave 2** *(blocked on Wave 1 completion)*
 - [x] 01-03-PLAN.md — Collect-all miette diagnostics naming plugin + field/key for every config problem (CONF-03)
 - [x] 01-04-PLAN.md — `examples/plugins/` sample registry and plugin TOMLs proven to load (SC3), plus the global `--registry` / `FILI_REGISTRY` flag (CONF-01, CONF-02)
+
+**Wave 3** *(gap closure; blocked on Wave 2 completion)*
+- [ ] 01-05-PLAN.md — Strict literal `.env` parser that replaces dotenvy `$` substitution (CR-01): values delivered verbatim or rejected by line number, no false MissingSecret cascade (WR-02), EmptySecret names its real source (WR-03), quoting rule documented (CONF-02, CONF-03)
+- [ ] 01-06-PLAN.md — `--registry` default test asserted from `Cli::command()` metadata so FILI_REGISTRY cannot skip it (IN-03) (CONF-01)
 
 ### Phase 2: SourceItem Pipeline
 **Goal**: Every pipeline record travels as a unified `SourceItem`. News keeps flowing through the WISE SmartModule chain, while social items pass straight through to the consumer and land, NER-enriched, in the same JSON output
@@ -129,7 +133,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Plugin Contract & Configuration | 4/4 | In Progress | - |
+| 1. Plugin Contract & Configuration | 4/6 | In Progress | - |
 | 2. SourceItem Pipeline | 0/TBD | Not started | - |
 | 3. Component Host Runtime | 0/TBD | Not started | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
