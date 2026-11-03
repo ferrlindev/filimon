@@ -6,7 +6,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::crawler;
-use crate::models::CrawlTarget;
+use crate::models::{CrawlTarget, SourceItem};
 use crate::streaming::{PipelineCoordinator, TOPIC_RAW_PAGES};
 
 /// Maximum links to extract per seed URL for priority ranking.
@@ -68,8 +68,9 @@ pub async fn run(urls: &[String], depth: usize) -> miette::Result<()> {
             };
 
             // Produce to Fluvio
+            let item = SourceItem::news(page.url, page.html);
             let locked = producer.lock().await;
-            locked.send(&target.url, &page).await?;
+            locked.send(&target.url, &item).await?;
             println!("    → Produced to {}", TOPIC_RAW_PAGES);
             total_produced += 1;
         }

@@ -24,7 +24,28 @@ pub fn save_json(records: &[OutputRecord], path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Make record text safe to print on a terminal.
+///
+/// Newline, carriage return and tab become a space; every other control
+/// character (including the ESC that starts ANSI sequences) is dropped.
+pub fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// Sanitize an optional field, showing `--` when it is None.
+fn field_or_dash(value: Option<&str>) -> String {
+    value.map_or_else(|| "--".to_string(), sanitize_for_terminal)
+}
+
 /// Print a single-record summary to stdout in a WISE pipeline log style.
+///
+/// Every record-derived string goes through `sanitize_for_terminal`.
 pub fn print_summary(record: &OutputRecord) {
     let bar = "--".repeat(60);
     let kind = match record.source_type {
@@ -32,20 +53,30 @@ pub fn print_summary(record: &OutputRecord) {
         SourceType::Social => "social",
     };
     println!("\n{bar}");
-    println!(" ■  [{kind}] {}  {}", record.platform, record.url);
+    println!(
+        " ■  [{kind}] {}  {}",
+        sanitize_for_terminal(&record.platform),
+        sanitize_for_terminal(&record.url)
+    );
     println!("{bar}");
-    println!(" Title  : {}", record.title.as_deref().unwrap_or("--"));
-    println!(" Author : {}", record.author.as_deref().unwrap_or("--"));
-    println!(" Published : {}", record.published.as_deref().unwrap_or("--"));
+    println!(" Title  : {}", field_or_dash(record.title.as_deref()));
+    println!(" Author : {}", field_or_dash(record.author.as_deref()));
+    println!(" Published : {}", field_or_dash(record.published.as_deref()));
 
     if let Some(article) = &record.article {
-        println!(" Category : {}", article.inferred_category);
+        println!(
+            " Category : {}",
+            sanitize_for_terminal(&article.inferred_category)
+        );
         println!(
             " Relevance : {:.3} | Words: {}",
             article.relevance_score, article.word_count
         );
         if !article.top_keywords.is_empty() {
-            println!(" Keywords : {}", article.top_keywords.join(", "));
+            println!(
+                " Keywords : {}",
+                sanitize_for_terminal(&article.top_keywords.join(", "))
+            );
         }
     }
 
@@ -54,13 +85,19 @@ pub fn print_summary(record: &OutputRecord) {
             .entities
             .iter()
             .take(5)
-            .map(|e| format!("{} [{}]", e.text, e.kind))
+            .map(|e| {
+                format!(
+                    "{} [{}]",
+                    sanitize_for_terminal(&e.text),
+                    sanitize_for_terminal(&e.kind)
+                )
+            })
             .collect();
         println!(" Entities : {}", entity_str.join("  •  "));
     }
 
     let preview_short: String = record.text.chars().take(200).collect();
-    println!(" Preview : {}", preview_short.replace('\n', " "));
+    println!(" Preview : {}", sanitize_for_terminal(&preview_short));
     println!("{bar}");
 }
 
@@ -106,6 +143,26 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 1);
         assert!(!text.contains("\"html\""), "{text}");
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        assert_eq!(sanitize_for_terminal("a\u{1b}[31mb\nc\td"), "a[31mb c d");
+        assert_eq!(sanitize_for_terminal("a\rb"), "a b");
+        assert_eq!(sanitize_for_terminal("Zürich 東京"), "Zürich 東京");
+    }
+
+    #[test]
+    fn save_json_keeps_original_text() {
+        let mut record = sample();
+        record.text = "line1\nline2\u{1b}[31m".to_string();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.json");
+        save_json(&[record], &path).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value[0]["text"], "line1\nline2\u{1b}[31m");
     }
 
     #[test]
