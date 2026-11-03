@@ -275,11 +275,20 @@ pub fn load_registry_with_env(
                 &dotenv_path,
                 env,
             ) {
-                Ok(secrets) => Some(PluginConfig {
-                    host: parsed.host,
-                    settings_toml: parsed.settings_toml,
-                    secrets,
-                }),
+                Ok(secrets) => {
+                    // Names only, never values: makes alias mappings auditable.
+                    let env_vars: Vec<&str> = parsed
+                        .aliases
+                        .values()
+                        .map(|v| v.get_ref().as_str())
+                        .collect();
+                    tracing::info!(plugin = %name, ?env_vars, "resolved plugin secrets");
+                    Some(PluginConfig {
+                        host: parsed.host,
+                        settings_toml: parsed.settings_toml,
+                        secrets,
+                    })
+                }
                 Err(mut missing) => {
                     problems.append(&mut missing);
                     continue;
@@ -301,18 +310,7 @@ pub fn load_registry_with_env(
         );
     }
 
-    let fetchers = registry
-        .fetchers
-        .iter()
-        .map(|(name, entry)| {
-            let fetcher = LoadedFetcher {
-                name: name.clone(),
-                component: base_dir.join(entry.component.get_ref()),
-                enabled: entry.enabled,
-            };
-            (name.clone(), fetcher)
-        })
-        .collect();
+    let fetchers = load_fetchers(&registry.fetchers, &base_dir);
 
     if !problems.is_empty() {
         return Err(ConfigErrors { problems });
@@ -323,6 +321,23 @@ pub fn load_registry_with_env(
         sources,
         fetchers,
     })
+}
+
+fn load_fetchers(
+    entries: &BTreeMap<String, FetcherEntry>,
+    base_dir: &Path,
+) -> BTreeMap<String, LoadedFetcher> {
+    entries
+        .iter()
+        .map(|(name, entry)| {
+            let fetcher = LoadedFetcher {
+                name: name.clone(),
+                component: base_dir.join(entry.component.get_ref()),
+                enabled: entry.enabled,
+            };
+            (name.clone(), fetcher)
+        })
+        .collect()
 }
 
 fn single(problem: ConfigError) -> ConfigErrors {
@@ -391,7 +406,10 @@ fn read_plugin(
     let host = HostConfig {
         poll_interval: Duration::from_secs(poll_interval_secs.get()),
         timeout: Duration::from_secs(timeout_secs.get()),
-        allowlist: allowlist.into_iter().map(toml::Spanned::into_inner).collect(),
+        allowlist: allowlist
+            .into_iter()
+            .map(toml::Spanned::into_inner)
+            .collect(),
         backoff: BackoffConfig {
             initial: Duration::from_secs(backoff.initial_secs.get()),
             max: Duration::from_secs(backoff.max_secs.get()),
@@ -607,14 +625,20 @@ config = "beta.toml"
         let alpha = secrets_of(&registry, "alpha");
         let beta = secrets_of(&registry, "beta");
 
-        assert_eq!(alpha.keys().map(String::as_str).collect::<Vec<_>>(), ["token"]);
+        assert_eq!(
+            alpha.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["token"]
+        );
         assert_eq!(beta.keys().map(String::as_str).collect::<Vec<_>>(), ["key"]);
         assert_eq!(alpha["token"].expose(), "alpha-value");
         assert_eq!(beta["key"].expose(), "beta-value");
 
         for secrets in [alpha, beta] {
             for env_var in ["UNRELATED_TOKEN", "ALPHA_TOKEN", "BETA_KEY"] {
-                assert!(!secrets.contains_key(env_var), "env var name {env_var} used as a key");
+                assert!(
+                    !secrets.contains_key(env_var),
+                    "env var name {env_var} used as a key"
+                );
             }
             assert!(secrets.values().all(|s| s.expose() != "unrelated-value"));
         }
@@ -682,14 +706,17 @@ config = "beta.toml"
         let errors = load(&dir).expect_err("a malformed .env is an error");
 
         assert!(
-            errors.problems.iter().any(|problem| matches!(
-                problem,
-                ConfigError::DotenvInvalid { line: Some(2), .. }
-            )),
+            errors
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, ConfigError::DotenvInvalid { line: Some(2), .. })),
             "{errors:?}"
         );
         for problem in &errors.problems {
-            assert!(!problem.to_string().contains("s3cr3t"), "leaked in: {problem}");
+            assert!(
+                !problem.to_string().contains("s3cr3t"),
+                "leaked in: {problem}"
+            );
         }
         assert!(!errors.to_string().contains("s3cr3t"));
         assert!(!format!("{errors:?}").contains("s3cr3t"));
@@ -704,6 +731,9 @@ config = "beta.toml"
         let registry = load(&dir).expect("registry loads");
 
         assert_eq!(secrets_of(&registry, "alpha")["token"].expose(), "x");
-        assert!(std::env::var(KEY).is_err(), "{KEY} leaked into the process env");
+        assert!(
+            std::env::var(KEY).is_err(),
+            "{KEY} leaked into the process env"
+        );
     }
 }

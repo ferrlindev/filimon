@@ -9,7 +9,10 @@
 
 #![cfg_attr(
     not(test),
-    allow(dead_code, reason = "consumed by the plugin host and CLI in Phases 3-4")
+    allow(
+        dead_code,
+        reason = "consumed by the plugin host and CLI in Phases 3-4"
+    )
 )]
 
 pub mod config;

@@ -117,8 +117,9 @@ fn line_containing(text: &str, offending: &str) -> Option<usize> {
 /// never sees another plugin's secrets or unrelated `.env` keys.
 ///
 /// # Errors
-/// Returns one `ConfigError` per alias that cannot be resolved, labelled at
-/// that alias's env var name in the plugin file.
+/// Returns one `ConfigError` per alias that cannot be resolved (missing) or
+/// whose effective value is empty, labelled at that alias's env var name in
+/// the plugin file.
 pub fn resolve_secrets(
     plugin: &str,
     plugin_path: &Path,
@@ -131,9 +132,19 @@ pub fn resolve_secrets(
     let mut resolved = ResolvedSecrets::new();
     let mut problems = Vec::new();
 
+    let plugin_src =
+        || NamedSource::new(plugin_path.display().to_string(), plugin_text.to_string());
+
     for (alias, env_var) in aliases {
         let name = env_var.get_ref();
         match env(name).or_else(|| dotenv.get(name).cloned()) {
+            Some(value) if value.is_empty() => problems.push(ConfigError::EmptySecret {
+                plugin: plugin.to_string(),
+                alias: alias.clone(),
+                env_var: name.clone(),
+                src: plugin_src(),
+                span: env_var.span().into(),
+            }),
             Some(value) => {
                 resolved.insert(alias.clone(), Secret(value));
             }
@@ -142,7 +153,7 @@ pub fn resolve_secrets(
                 alias: alias.clone(),
                 env_var: name.clone(),
                 dotenv: dotenv_path.display().to_string(),
-                src: NamedSource::new(plugin_path.display().to_string(), plugin_text.to_string()),
+                src: plugin_src(),
                 span: env_var.span().into(),
             }),
         }
@@ -213,7 +224,10 @@ mod tests {
 
     #[test]
     fn secret_debug_is_redacted() {
-        assert_eq!(format!("{:?}", Secret("pa55word".to_string())), "Secret(***)");
+        assert_eq!(
+            format!("{:?}", Secret("pa55word".to_string())),
+            "Secret(***)"
+        );
 
         let plugin = PluginConfig {
             host: HostConfig {
@@ -227,10 +241,7 @@ mod tests {
                 },
             },
             settings_toml: String::new(),
-            secrets: ResolvedSecrets::from([(
-                "token".to_string(),
-                Secret("pa55word".to_string()),
-            )]),
+            secrets: ResolvedSecrets::from([("token".to_string(), Secret("pa55word".to_string()))]),
         };
 
         let debug = format!("{plugin:?}");
