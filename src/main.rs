@@ -22,6 +22,7 @@ mod config;
 mod crawler;
 mod models;
 mod output;
+mod plugins;
 mod scorer;
 mod streaming;
 
