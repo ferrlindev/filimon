@@ -66,38 +66,62 @@ fn truncate_detail(s: &str) -> String {
     s.chars().take(MAX_DETAIL).collect()
 }
 
-/// Replace every double-quoted span of a serde error with `"…"`.
+/// Describe a JSON decode error by its class and position only.
 ///
-/// `serde_json` quotes the offending string value in `invalid type` errors, and
-/// that value can be page content. Field names use backticks and stay.
-fn redact_quoted(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_quotes = false;
-    for c in s.chars() {
-        if c == '"' {
-            if in_quotes {
-                out.push_str("…\"");
-            } else {
-                out.push('"');
-            }
-            in_quotes = !in_quotes;
-        } else if !in_quotes {
-            out.push(c);
-        }
+/// The result holds a fixed phrase and two numbers. serde's Display text
+/// quotes string values (escaped, inside double quotes) and prints variant
+/// names, unknown field names, numbers and characters inside backticks
+/// without escaping, so no redaction of that text can find where record
+/// content ends. This function never reads it.
+fn describe_json_error(e: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let class = match e.classify() {
+        Category::Syntax => "invalid JSON",
+        Category::Eof => "truncated JSON",
+        Category::Data => "wrong JSON shape",
+        Category::Io => "read error",
+    };
+    format!("{class} at line {} column {}", e.line(), e.column())
+}
+
+/// What a stream diagnostic says when no module-authored text is left.
+const NO_DETAIL: &str = "no detail";
+
+/// Keep only the module-authored start of a `SmartModule` hint.
+///
+/// fluvio builds a `SmartModule` hint from the module's eyre report. The
+/// filimon modules write a fixed message prefix, such as
+/// `Failed to parse RawPage: `, followed by `serde_json`'s error text, and
+/// eyre adds a location block after a newline. serde puts every
+/// record-controlled piece of its text after a double quote (string values)
+/// or a backtick (variant names, field names, numbers), and a `look_back`
+/// error's record value follows a newline. So the
+/// text before the first double quote, backtick or control character holds
+/// only module-authored text. It is cut to `MAX_DETAIL` characters, and
+/// `NO_DETAIL` stands in when nothing is left.
+fn hint_summary(text: &str) -> String {
+    let end = text
+        .find(|c: char| c == '"' || c == '`' || c.is_control())
+        .unwrap_or(text.len());
+    let kept = truncate_detail(text[..end].trim_end());
+    if kept.is_empty() {
+        NO_DETAIL.to_string()
+    } else {
+        kept
     }
-    out
 }
 
 /// Decode one value from the news chain.
 ///
 /// A value that is not an `ExtractedArticle` becomes a diagnostic naming the
-/// topic and offset. The diagnostic never includes the value itself.
+/// topic and offset. The diagnostic carries only the JSON error class and
+/// position, never the value itself.
 pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
     match serde_json::from_slice::<ExtractedArticle>(value) {
         Ok(article) => Incoming::Record(OutputRecord::from_article(article)),
         Err(e) => Incoming::Diagnostic(format!(
             "{topic} offset {offset}: not an extracted article: {}",
-            truncate_detail(&redact_quoted(&e.to_string()))
+            describe_json_error(&e)
         )),
     }
 }
@@ -107,14 +131,15 @@ pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
 /// Every record read here is labelled social (topic of origin), whatever
 /// `source_type` it claims; a claimed `news` adds a diagnostic. A `published`
 /// that is not RFC 3339 becomes null with a diagnostic. A value that is not a
-/// `SourceItem` becomes one diagnostic. No diagnostic includes the value.
+/// `SourceItem` becomes one diagnostic, which carries only the JSON error
+/// class and position. No diagnostic includes the value.
 pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
     let mut item = match serde_json::from_slice::<SourceItem>(value) {
         Ok(item) => item,
         Err(e) => {
             return vec![Incoming::Diagnostic(format!(
                 "{topic} offset {offset}: not a social item: {}",
-                truncate_detail(&redact_quoted(&e.to_string()))
+                describe_json_error(&e)
             ))];
         }
     };
@@ -137,16 +162,19 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
 
 /// Describe a stream error without the record value.
 ///
-/// A chain runtime error carries the whole failing record (page HTML),
-/// so only its offset and the start of its hint are reported.
+/// A chain runtime error carries the whole failing record (page HTML), and
+/// its hint quotes parts of it. The diagnostic keeps the offset and only the
+/// module-authored start of the hint (see `hint_summary`); other errors keep
+/// only the same kind of start of their text. Neither reads the stored record
+/// key or value.
 pub fn describe_stream_error(topic: &str, code: &ErrorCode) -> String {
     match code {
         ErrorCode::SmartModuleRuntimeError(e) => format!(
             "{topic} offset {}: SmartModule error: {}",
             e.offset,
-            truncate_detail(&e.hint)
+            hint_summary(&e.hint)
         ),
-        other => format!("{topic}: stream error: {}", truncate_detail(&other.to_string())),
+        other => format!("{topic}: stream error: {}", hint_summary(&other.to_string())),
     }
 }
 
@@ -456,11 +484,11 @@ async fn consume_batch(
     } = collect_from_topics(stream, topics, offset, limit, source).await?;
 
     for message in &diagnostics {
-        eprintln!("  ✗ {message}");
+        print_diagnostic(message);
     }
 
     for message in enrich(&mut records, ner.map(|engine| engine as &dyn EntityDetector)) {
-        eprintln!("  ✗ {message}");
+        print_diagnostic(&message);
     }
 
     for record in &records {
@@ -471,6 +499,16 @@ async fn consume_batch(
         .map_err(|e| miette::miette!("Failed to write {}: {e}", path.display()))?;
     output::print_run_summary(records.len(), &path.display().to_string());
     Ok(())
+}
+
+/// One stderr diagnostic line, with control characters removed.
+fn diagnostic_line(message: &str) -> String {
+    format!("  ✗ {}", output::sanitize_for_terminal(message))
+}
+
+/// The single place consume writes a diagnostic to stderr.
+fn print_diagnostic(message: &str) {
+    eprintln!("{}", diagnostic_line(message));
 }
 
 /// Consume records in streaming mode (unlimited). Print only: no NER, no file.
@@ -486,7 +524,7 @@ async fn consume_stream(
     while let Some(item) = incoming.next().await {
         match item {
             Incoming::Record(record) => output::print_summary(&record),
-            Incoming::Diagnostic(message) => eprintln!("  ✗ {message}"),
+            Incoming::Diagnostic(message) => print_diagnostic(&message),
         }
     }
     Ok(())
@@ -597,6 +635,203 @@ mod tests {
         assert!(message.contains('7'), "{message}");
         assert!(message.contains("bad"), "{message}");
         assert!(!message.contains("PAGE-BODY"), "{message}");
+    }
+
+    /// Reddit-shaped social value with the given `source_type`.
+    fn poison_social(source_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source_type": source_type,
+            "platform": "reddit",
+            "id": "t3_poison",
+            "url": "https://www.reddit.com/r/test/comments/poison",
+            "text": "PAGE-BODY text"
+        })
+    }
+
+    #[test]
+    fn decode_social_withholds_variant_value() {
+        let esc = poison_social("\u{1b}[2JPAGE-BODY");
+        let ticks = poison_social(r"a`b`PAGE-BODY");
+        for value in [esc, ticks] {
+            let (records, diagnostics) =
+                split(decode_social("filimon-social-items", 9, &json(&value)));
+            assert!(records.is_empty(), "{value}");
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            let message = &diagnostics[0];
+            assert!(message.contains("filimon-social-items"), "{message:?}");
+            assert!(message.contains('9'), "{message:?}");
+            assert!(message.contains("line 1 column"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+            assert!(!message.contains('`'), "{message:?}");
+        }
+    }
+
+    /// The 02-VERIFICATION.md reproduction: a JSON string with one escaped
+    /// inner quote before the secret.
+    const ESCAPED_QUOTE_VALUE: &[u8] = br#""a\"PAGE-BODY-SECRET""#;
+
+    fn assert_content_free(message: &str) {
+        assert!(!message.contains("PAGE-BODY"), "{message:?}");
+        assert!(!message.contains('"'), "{message:?}");
+        assert!(!message.contains('`'), "{message:?}");
+    }
+
+    #[test]
+    fn decode_news_withholds_escaped_quote_content() {
+        let three_quotes: &[u8] = br#""a\"b\"c\"PAGE-BODY-SECRET""#;
+        let decoded: String = serde_json::from_slice(ESCAPED_QUOTE_VALUE).expect("JSON string");
+        let article_shaped = json(&serde_json::json!({
+            "url": "https://example.com/poison",
+            "title": "Title",
+            "body_preview": "body",
+            "word_count": 1,
+            "relevance_score": decoded,
+            "top_keywords": [],
+            "named_entities": [],
+            "inferred_category": "General"
+        }));
+        for value in [ESCAPED_QUOTE_VALUE, three_quotes, article_shaped.as_slice()] {
+            let Incoming::Diagnostic(message) = decode_news("filimon-raw-pages", 42, value) else {
+                panic!("expected a diagnostic");
+            };
+            assert!(message.contains("filimon-raw-pages"), "{message:?}");
+            assert!(message.contains("42"), "{message:?}");
+            assert!(message.contains("line 1 column"), "{message:?}");
+            assert_content_free(&message);
+        }
+    }
+
+    #[test]
+    fn empty_and_malformed_values_are_reported() {
+        let Incoming::Diagnostic(message) = decode_news("filimon-raw-pages", 3, b"") else {
+            panic!("expected a diagnostic");
+        };
+        assert!(message.contains("filimon-raw-pages offset 3"), "{message:?}");
+        assert!(message.contains("truncated JSON at line 1 column 0"), "{message:?}");
+
+        let (records, diagnostics) = split(decode_social("filimon-social-items", 4, b""));
+        assert!(records.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("filimon-social-items offset 4"),
+            "{:?}",
+            diagnostics[0]
+        );
+        assert!(
+            diagnostics[0].contains("truncated JSON at line 1 column 0"),
+            "{:?}",
+            diagnostics[0]
+        );
+
+        // Bytes that are not valid UTF-8 inside a JSON string.
+        let Incoming::Diagnostic(message) =
+            decode_news("filimon-raw-pages", 5, b"\"\xFFPAGE-BODY\"")
+        else {
+            panic!("expected a diagnostic");
+        };
+        assert!(message.contains("filimon-raw-pages offset 5"), "{message:?}");
+        assert!(!message.contains("PAGE-BODY"), "{message:?}");
+
+        let (records, diagnostics) = split(decode_social(
+            "filimon-social-items",
+            6,
+            &json(&poison_social("")),
+        ));
+        assert!(records.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("filimon-social-items offset 6"),
+            "{:?}",
+            diagnostics[0]
+        );
+        assert!(!diagnostics[0].contains('`'), "{:?}", diagnostics[0]);
+    }
+
+    fn runtime_error(hint: String) -> ErrorCode {
+        ErrorCode::SmartModuleRuntimeError(Box::new(SmartModuleTransformRuntimeError {
+            hint,
+            offset: 11,
+            record_value: "PAGE-BODY-SECRET".into(),
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn stream_error_hint_withholds_quoted_value() {
+        /// Mirror of map-preprocess's `RawPage`.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct SmRawPage {
+            url: String,
+            html: String,
+        }
+
+        let number_url = json(&serde_json::json!({ "url": 424242, "html": "x" }));
+        for payload in [ESCAPED_QUOTE_VALUE, number_url.as_slice()] {
+            let Err(e) = serde_json::from_slice::<SmRawPage>(payload) else {
+                panic!("payload must not parse");
+            };
+            // map-preprocess: eyre!("Failed to parse RawPage: {}", e); fluvio
+            // then formats the eyre report with Debug, which adds Location.
+            let hint = format!("Failed to parse RawPage: {e}\n\nLocation:\n    src/lib.rs:172:10");
+            let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
+            assert!(message.contains("offset 11"), "{message:?}");
+            assert!(message.contains("SmartModule error"), "{message:?}");
+            assert!(message.contains("Failed to parse RawPage"), "{message:?}");
+            assert!(!message.contains("424242"), "{message:?}");
+            assert!(!message.contains("Location"), "{message:?}");
+            assert_content_free(&message);
+        }
+
+        let message =
+            describe_stream_error("filimon-raw-pages", &runtime_error("bad\u{1b}[2J tail".into()));
+        assert!(message.contains("bad"), "{message:?}");
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(!message.contains("tail"), "{message:?}");
+
+        for hint in [String::new(), "\"PAGE-BODY\" first".to_string()] {
+            let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
+            assert!(message.contains("no detail"), "{message:?}");
+            assert!(message.contains("offset 11"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn hint_detail_truncates_by_chars() {
+        for c in ['東', '🦀'] {
+            let hint: String = std::iter::repeat_n(c, 300).collect();
+            let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
+            assert_eq!(message.chars().filter(|&m| m == c).count(), 200, "{c}");
+        }
+    }
+
+    #[test]
+    fn other_stream_errors_withhold_record_value() {
+        let look_back = ErrorCode::SmartModuleLookBackError(
+            "Failed to parse RawPage: invalid type: string \"PAGE-BODY\"\n\nSmartModule Lookback Error:\nOffset: 3\nKey: NULL\nValue: PAGE-BODY".into(),
+        );
+        let other = ErrorCode::Other("\u{1b}[2J\"PAGE-BODY\"".into());
+        for code in [look_back, other] {
+            let message = describe_stream_error("filimon-raw-pages", &code);
+            assert!(message.contains("filimon-raw-pages"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+        }
+
+        let not_found = ErrorCode::SmartModuleNotFound {
+            name: "filimon/missing@0.1.0".into(),
+        };
+        let message = describe_stream_error("filimon-raw-pages", &not_found);
+        assert!(message.contains("filimon/missing@0.1.0"), "{message:?}");
+    }
+
+    #[test]
+    fn diagnostic_line_strips_control_chars() {
+        let line = diagnostic_line("t offset 1: \u{1b}[2J bad\rworse\nworst");
+        assert!(line.starts_with("  ✗"), "{line:?}");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
     #[tokio::test]
@@ -1183,5 +1418,75 @@ mod tests {
         assert!(message.contains(&topic), "{message}");
         assert!(message.contains("fluvio topic create"), "{message}");
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with the filimon SmartModules loaded"]
+    async fn poison_social_record_is_reported_without_value() -> miette::Result<()> {
+        with_scratch_topics(|raw, social| async move {
+            let stream = FluvioStream::connect().await?;
+
+            let producer = ready_producer(&stream, &social).await?;
+            producer
+                .send("t3_poison", &poison_social("\u{1b}[2JPAGE-BODY"))
+                .await?;
+            producer.flush().await?;
+
+            let topics = ConsumeTopics {
+                raw_pages: &raw,
+                social: &social,
+            };
+            // Diagnostics do not count toward the limit, so this run ends on
+            // the idle timeout.
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 1, SourceFilter::Social)
+                    .await?;
+            assert!(collected.records.is_empty(), "{:?}", collected.records);
+            assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+            let message = &collected.diagnostics[0];
+            assert!(message.contains(social.as_str()), "{message:?}");
+            assert!(message.contains("offset 0"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            let line = diagnostic_line(message);
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with the filimon SmartModules loaded"]
+    async fn poison_news_record_is_reported_without_value() -> miette::Result<()> {
+        with_scratch_topics(|raw, social| async move {
+            let stream = FluvioStream::connect().await?;
+
+            // map-preprocess rejects a JSON string with `invalid type: string`,
+            // so the real hint quotes this value.
+            let poison = serde_json::Value::String("a\"PAGE-BODY-SECRET".to_string());
+            let producer = ready_producer(&stream, &raw).await?;
+            producer.send("poison", &poison).await?;
+            producer.flush().await?;
+            // The social topic stays empty, but must be provisioned to open.
+            ready_producer(&stream, &social).await?;
+
+            let topics = ConsumeTopics {
+                raw_pages: &raw,
+                social: &social,
+            };
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 1, SourceFilter::News)
+                    .await?;
+            assert!(collected.records.is_empty(), "{:?}", collected.records);
+            assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+            let message = &collected.diagnostics[0];
+            assert!(message.contains(raw.as_str()), "{message:?}");
+            assert!(message.contains("offset 0"), "{message:?}");
+            assert!(message.contains("SmartModule error"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY-SECRET"), "{message:?}");
+            let line = diagnostic_line(message);
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            Ok(())
+        })
+        .await
     }
 }
