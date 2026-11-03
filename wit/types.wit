@@ -1,0 +1,84 @@
+package filimon:plugin@0.1.0;
+
+/// Shared data types for every filimon plugin world.
+interface types {
+    /// One item returned by a source plugin. Mirrors the host `SourceItem` (Phase 2).
+    record item {
+        /// Platform-stable identifier for the item.
+        id: string,
+        /// Canonical URL of the item.
+        url: string,
+        title: option<string>,
+        text: string,
+        author: option<string>,
+        /// Unix epoch milliseconds (D-03).
+        published: option<u64>,
+        /// Short platform name, for example `reddit` or `youtube`.
+        platform: string,
+        /// Platform metadata as a JSON document (D-02).
+        raw: option<string>,
+    }
+
+    /// Result of one successful poll.
+    record poll-response {
+        /// Items found by this poll. The list may be empty. The host produces
+        /// items in list order.
+        items: list<item>,
+        /// Opaque cursor (D-01). The host stores it verbatim and passes it back
+        /// as `cursor` on the next poll, so `none` makes the next poll a first
+        /// poll.
+        next-cursor: option<list<u8>>,
+    }
+
+    /// Why `init` or `poll` failed (D-04). The host backs off per case.
+    variant poll-error {
+        /// Retry-after in seconds, when known.
+        rate-limited(option<u32>),
+        /// The plugin needs a valid access token before it can poll.
+        auth-required,
+        /// The plugin's settings or secrets are invalid.
+        config(string),
+        /// A temporary failure; the host retries with backoff.
+        transient(string),
+        /// A permanent failure; the host stops polling this instance.
+        fatal(string),
+    }
+
+    /// HTTP request method.
+    variant method { get, head, post, put, patch, delete, options, other(string) }
+
+    /// HTTP header name and value pairs, in order.
+    type headers = list<tuple<string, string>>;
+
+    /// An outbound HTTP request. The host enforces the source's allowlist and
+    /// timeout, so the record carries no timeout.
+    record request {
+        method: method,
+        url: string,
+        headers: headers,
+        body: option<list<u8>>,
+    }
+
+    /// An HTTP response.
+    record response {
+        status: u16,
+        headers: headers,
+        body: list<u8>,
+    }
+
+    /// Why a fetch failed (D-04).
+    variant fetch-error {
+        /// Blocked by host policy (allowlist), FETCH-02.
+        denied(string),
+        /// The request exceeded the host timeout.
+        timeout,
+        /// Connection, DNS, or TLS failure.
+        transport(string),
+        /// Retry-after in seconds, when known.
+        rate-limited(option<u32>),
+        /// No fetcher is assigned to this source (Phase 3 interim).
+        not-configured,
+        /// The request itself is malformed, for example an unparsable URL.
+        invalid-request(string),
+    }
+}

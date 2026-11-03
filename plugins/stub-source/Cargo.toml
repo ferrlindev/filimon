@@ -1,0 +1,25 @@
+[package]
+name = "stub-source"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Stub filimon source plugin: exercises the source world contract and doubles as a host test fixture."
+authors = ["filimon"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[package.metadata.component]
+package = "filimon:stub-source"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "source"
+
+# Own workspace, so the root filimon workspace does not capture this crate.
+[workspace]
