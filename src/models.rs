@@ -111,7 +111,8 @@ pub enum SourceType {
 /// Its fields line up with the WIT `item` record in `wit/types.wit`, plus
 /// `source_type` and the news-only `html`. News items travel on the
 /// `filimon-raw-pages` Fluvio topic, where the chain modules read them as
-/// `RawPage { url, html }` and ignores the other fields.
+/// `RawPage { url, html }` and ignores the other fields. Social items travel
+/// on `filimon-social-items`, which has no chain modules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceItem {
     pub source_type: SourceType,
@@ -196,6 +197,11 @@ pub fn epoch_ms_to_rfc3339(ms: u64) -> Option<String> {
     let ms = i64::try_from(ms).ok()?;
     DateTime::<Utc>::from_timestamp_millis(ms)
         .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+/// Whether `s` is a valid RFC 3339 timestamp.
+pub fn is_rfc3339(s: &str) -> bool {
+    DateTime::parse_from_rfc3339(s).is_ok()
 }
 
 /// Best-effort parse of a news date string to RFC 3339 UTC.
@@ -291,6 +297,26 @@ impl OutputRecord {
                 word_count: a.word_count,
                 published_raw: a.published_date,
             }),
+        }
+    }
+
+    /// Map a social item to an output record.
+    ///
+    /// The record is always labelled social, whatever the item claims, and
+    /// the item's html is dropped.
+    pub fn from_social(item: SourceItem) -> Self {
+        Self {
+            source_type: SourceType::Social,
+            platform: item.platform,
+            id: item.id,
+            url: item.url,
+            title: item.title,
+            text: item.text,
+            author: item.author,
+            published: item.published,
+            raw: item.raw,
+            entities: Vec::new(),
+            article: None,
         }
     }
 }
@@ -589,5 +615,40 @@ mod tests {
         );
 
         assert_eq!(minimal_social().raw, None);
+    }
+
+    #[test]
+    fn from_social_drops_html_and_labels_social() {
+        let mut item = rich_social();
+        item.source_type = SourceType::News;
+        item.html = Some("<p>PAGE-BODY</p>".to_string());
+
+        let record = OutputRecord::from_social(item);
+        assert_eq!(record.source_type, SourceType::Social);
+        assert_eq!(record.platform, "reddit");
+        assert_eq!(record.id, "t3_abc");
+        assert_eq!(record.url, "https://www.reddit.com/r/rust/comments/abc");
+        assert_eq!(record.title.as_deref(), Some("Zürich 東京 🦀"));
+        assert_eq!(record.text, "lol cat 🦀");
+        assert_eq!(record.author.as_deref(), Some("u1"));
+        assert_eq!(record.published.as_deref(), Some("2024-10-27T03:33:20.123Z"));
+        assert_eq!(record.raw, Some(serde_json::json!({"score": 3})));
+        assert!(record.entities.is_empty());
+        assert!(record.article.is_none());
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("\"html\""), "{json}");
+        assert!(!json.contains("PAGE-BODY"), "{json}");
+        assert!(json.contains("\"article\":null"), "{json}");
+        assert!(json.contains("\"source_type\":\"social\""), "{json}");
+    }
+
+    #[test]
+    fn is_rfc3339_accepts_only_rfc3339() {
+        assert!(is_rfc3339("2024-10-27T03:33:20.123Z"));
+        assert!(is_rfc3339("2024-05-01T10:00:00+01:00"));
+        assert!(!is_rfc3339("yesterday"));
+        assert!(!is_rfc3339("2024-05-01"));
+        assert!(!is_rfc3339(""));
     }
 }
