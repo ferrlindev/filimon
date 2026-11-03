@@ -66,6 +66,24 @@ fn truncate_detail(s: &str) -> String {
     s.chars().take(MAX_DETAIL).collect()
 }
 
+/// Describe a JSON decode error by its class and position only.
+///
+/// The result holds a fixed phrase and two numbers. serde's Display text
+/// quotes string values (escaped, inside double quotes) and prints variant
+/// names, unknown field names, numbers and characters inside backticks
+/// without escaping, so no redaction of that text can find where record
+/// content ends. This function never reads it.
+fn describe_json_error(e: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let class = match e.classify() {
+        Category::Syntax => "invalid JSON",
+        Category::Eof => "truncated JSON",
+        Category::Data => "wrong JSON shape",
+        Category::Io => "read error",
+    };
+    format!("{class} at line {} column {}", e.line(), e.column())
+}
+
 /// Replace every double-quoted span of a serde error with `"…"`.
 ///
 /// `serde_json` quotes the offending string value in `invalid type` errors, and
@@ -107,14 +125,15 @@ pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
 /// Every record read here is labelled social (topic of origin), whatever
 /// `source_type` it claims; a claimed `news` adds a diagnostic. A `published`
 /// that is not RFC 3339 becomes null with a diagnostic. A value that is not a
-/// `SourceItem` becomes one diagnostic. No diagnostic includes the value.
+/// `SourceItem` becomes one diagnostic, which carries only the JSON error
+/// class and position. No diagnostic includes the value.
 pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
     let mut item = match serde_json::from_slice::<SourceItem>(value) {
         Ok(item) => item,
         Err(e) => {
             return vec![Incoming::Diagnostic(format!(
                 "{topic} offset {offset}: not a social item: {}",
-                truncate_detail(&redact_quoted(&e.to_string()))
+                describe_json_error(&e)
             ))];
         }
     };
@@ -456,11 +475,11 @@ async fn consume_batch(
     } = collect_from_topics(stream, topics, offset, limit, source).await?;
 
     for message in &diagnostics {
-        eprintln!("  ✗ {message}");
+        print_diagnostic(message);
     }
 
     for message in enrich(&mut records, ner.map(|engine| engine as &dyn EntityDetector)) {
-        eprintln!("  ✗ {message}");
+        print_diagnostic(&message);
     }
 
     for record in &records {
@@ -473,9 +492,14 @@ async fn consume_batch(
     Ok(())
 }
 
-/// One stderr diagnostic line (RED stub: today's unsanitized format).
+/// One stderr diagnostic line, with control characters removed.
 fn diagnostic_line(message: &str) -> String {
-    format!("  ✗ {message}")
+    format!("  ✗ {}", output::sanitize_for_terminal(message))
+}
+
+/// The single place consume writes a diagnostic to stderr.
+fn print_diagnostic(message: &str) {
+    eprintln!("{}", diagnostic_line(message));
 }
 
 /// Consume records in streaming mode (unlimited). Print only: no NER, no file.
@@ -491,7 +515,7 @@ async fn consume_stream(
     while let Some(item) = incoming.next().await {
         match item {
             Incoming::Record(record) => output::print_summary(&record),
-            Incoming::Diagnostic(message) => eprintln!("  ✗ {message}"),
+            Incoming::Diagnostic(message) => print_diagnostic(&message),
         }
     }
     Ok(())
