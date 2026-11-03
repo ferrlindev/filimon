@@ -473,6 +473,11 @@ async fn consume_batch(
     Ok(())
 }
 
+/// One stderr diagnostic line (RED stub: today's unsanitized format).
+fn diagnostic_line(message: &str) -> String {
+    format!("  ✗ {message}")
+}
+
 /// Consume records in streaming mode (unlimited). Print only: no NER, no file.
 async fn consume_stream(
     stream: &FluvioStream,
@@ -597,6 +602,43 @@ mod tests {
         assert!(message.contains('7'), "{message}");
         assert!(message.contains("bad"), "{message}");
         assert!(!message.contains("PAGE-BODY"), "{message}");
+    }
+
+    /// Reddit-shaped social value with the given `source_type`.
+    fn poison_social(source_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source_type": source_type,
+            "platform": "reddit",
+            "id": "t3_poison",
+            "url": "https://www.reddit.com/r/test/comments/poison",
+            "text": "PAGE-BODY text"
+        })
+    }
+
+    #[test]
+    fn decode_social_withholds_variant_value() {
+        let esc = poison_social("\u{1b}[2JPAGE-BODY");
+        let ticks = poison_social(r"a`b`PAGE-BODY");
+        for value in [esc, ticks] {
+            let (records, diagnostics) =
+                split(decode_social("filimon-social-items", 9, &json(&value)));
+            assert!(records.is_empty(), "{value}");
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            let message = &diagnostics[0];
+            assert!(message.contains("filimon-social-items"), "{message:?}");
+            assert!(message.contains('9'), "{message:?}");
+            assert!(message.contains("line 1 column"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+            assert!(!message.contains('`'), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_line_strips_control_chars() {
+        let line = diagnostic_line("t offset 1: \u{1b}[2J bad\rworse\nworst");
+        assert!(line.starts_with("  ✗"), "{line:?}");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
     #[tokio::test]
@@ -1183,5 +1225,39 @@ mod tests {
         assert!(message.contains(&topic), "{message}");
         assert!(message.contains("fluvio topic create"), "{message}");
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with the filimon SmartModules loaded"]
+    async fn poison_social_record_is_reported_without_value() -> miette::Result<()> {
+        with_scratch_topics(|raw, social| async move {
+            let stream = FluvioStream::connect().await?;
+
+            let producer = ready_producer(&stream, &social).await?;
+            producer
+                .send("t3_poison", &poison_social("\u{1b}[2JPAGE-BODY"))
+                .await?;
+            producer.flush().await?;
+
+            let topics = ConsumeTopics {
+                raw_pages: &raw,
+                social: &social,
+            };
+            // Diagnostics do not count toward the limit, so this run ends on
+            // the idle timeout.
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 1, SourceFilter::Social)
+                    .await?;
+            assert!(collected.records.is_empty(), "{:?}", collected.records);
+            assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+            let message = &collected.diagnostics[0];
+            assert!(message.contains(social.as_str()), "{message:?}");
+            assert!(message.contains("offset 0"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            let line = diagnostic_line(message);
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            Ok(())
+        })
+        .await
     }
 }
