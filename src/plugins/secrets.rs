@@ -306,6 +306,7 @@ pub fn resolve_secrets(
 mod tests {
     use super::*;
     use crate::plugins::config::{BackoffConfig, HostConfig, PluginConfig};
+    use miette::Diagnostic;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -526,6 +527,71 @@ lower_case=v
             resolved.keys().map(String::as_str).collect::<Vec<_>>(),
             ["alpha", "mid", "zeta"]
         );
+    }
+
+    const TOKEN_ALIAS: &str = "token = \"ALPHA_TOKEN\"\n";
+    const DOTENV_PATH: &str = "/srv/fili/.env";
+
+    /// Resolves the single alias `token = "ALPHA_TOKEN"` and returns its one problem.
+    fn single_problem(
+        dotenv: &HashMap<String, String>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> ConfigError {
+        let aliases: BTreeMap<String, toml::Spanned<String>> =
+            toml::from_str(TOKEN_ALIAS).expect("alias table parses");
+        let mut problems = resolve_secrets(
+            "alpha",
+            Path::new("alpha.toml"),
+            TOKEN_ALIAS,
+            &aliases,
+            Some(dotenv),
+            Path::new(DOTENV_PATH),
+            env,
+        )
+        .expect_err("an empty secret is an error");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        problems.remove(0)
+    }
+
+    fn help_of(problem: &ConfigError) -> String {
+        problem.help().map(|h| h.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn empty_process_var_names_process_env() {
+        let dotenv = HashMap::from([("ALPHA_TOKEN".to_string(), "good".to_string())]);
+        let env = |key: &str| (key == "ALPHA_TOKEN").then(String::new);
+
+        // D-12: the set-but-empty process value wins over the `.env` value.
+        let problem = single_problem(&dotenv, &env);
+
+        assert!(
+            matches!(problem, ConfigError::EmptySecret { .. }),
+            "{problem:?}"
+        );
+        let display = problem.to_string();
+        assert!(display.contains("the process environment"), "{display}");
+        let help = help_of(&problem);
+        assert!(help.contains("unset `ALPHA_TOKEN`"), "{help}");
+        assert!(help.contains(DOTENV_PATH), "{help}");
+    }
+
+    #[test]
+    fn empty_dotenv_value_names_dotenv_file() {
+        let dotenv = HashMap::from([("ALPHA_TOKEN".to_string(), String::new())]);
+
+        let problem = single_problem(&dotenv, &|_| None);
+
+        assert!(
+            matches!(problem, ConfigError::EmptySecret { .. }),
+            "{problem:?}"
+        );
+        let display = problem.to_string();
+        assert!(display.contains(DOTENV_PATH), "{display}");
+        let help = help_of(&problem);
+        assert!(help.contains("non-empty value in"), "{help}");
+        assert!(help.contains(DOTENV_PATH), "{help}");
+        assert!(!help.contains("unset"), "{help}");
     }
 
     #[test]
