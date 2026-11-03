@@ -17,40 +17,38 @@ filimon is a Fluvio-based streaming pipeline for semantic news extraction. It im
 │              Dispatch to command handlers via clap              │
 ├────────────────┬──────────────────┬──────────────┬─────────────┤
 │   Produce      │    Consume       │    Watch     │    File     │
-│  (crawler)     │  (subscriber)    │ (filesystem) │  (local)    │
+│  (crawler)     │ (merged streams) │ (filesystem) │  (local)    │
 └────────────────┴──────────────────┴──────────────┴─────────────┘
          │                │                 │             │
          ▼                ▼                 ▼             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              Streaming Layer (streaming.rs)                      │
-│   PipelineCoordinator → TypedProducer/TypedConsumer             │
-│          Fluvio Topics: raw-pages, articles                     │
+│              Streaming Layer (streaming.rs)                     │
+│   PipelineCoordinator → TypedProducer (SourceItem::news)        │
+│   FluvioStream::preflight / topic_stream (consumer_with_config) │
+│   Topics: filimon-raw-pages (news), filimon-social-items        │
 └─────────────────────────────────────────────────────────────────┘
          │                                                │
          ▼                                                ▼
+┌──────────────────────────────────────┐   ┌──────────────────────┐
+│ filimon-raw-pages stream, with the   │   │ filimon-social-items │
+│ news chain attached by fili consume  │   │ stream, no           │
+│ (SmartModules run in the cluster):   │   │ SmartModules         │
+│  map-preprocess → map-extract →      │   │ (social SourceItem)  │
+│  filter-relevance (threshold 0.05)   │   │                      │
+│  → ExtractedArticle                  │   │                      │
+└──────────────────────────────────────┘   └──────────────────────┘
+         │                                                │
+         └──────────────────┬─────────────────────────────┘
+                            ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│          Fluvio Streaming Pipeline (SmartModules)               │
+│         Consumer & Enrichment (commands/consume.rs)              │
 │                                                                  │
-│  raw-pages ──[map-preprocess]──→ preprocessed ──[map-extract]  │
-│                (tokenize)                      (extract & score)│
-│                                                      │           │
-│                                                      ▼           │
-│                              extracted ──[filter-relevance]──→  │
-│                                          (threshold: 0.05)       │
-│                                                      │           │
-│                                                      ▼           │
-│                                               articles topic     │
-└──────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌──────────────────────────────────────────────────────────────────┐
-│         Consumer & Enrichment (commands/consume.rs)             │
-│                                                                  │
-│  TypedConsumer ──→ batch/stream processing ──→ NER (GLiNER)    │
-│  (models.rs)       (commands/consume.rs)        (scorer.rs)     │
-│                                                  │              │
-│                                                  ▼              │
-│                                            output.rs (JSON)     │
+│  stream::select merge ──→ limit / idle stop ──→ NER (GLiNER)     │
+│  (OutputRecord, models.rs)                      (scorer.rs)      │
+│                                                  │               │
+│                                                  ▼               │
+│                          output::save_json → one JSON array      │
+│                          (default output/wise_output.json)       │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -104,7 +102,7 @@ filimon is a Fluvio-based streaming pipeline for semantic news extraction. It im
 **Data Model Layer:**
 - Purpose: Define shapes for each pipeline stage
 - Location: `src/models.rs`
-- Contains: RawPage, TokenizedContent, PreprocessedBundle, ExtractedArticle, NamedEntity, PipelineStats
+- Contains: SourceItem, RawPage, TokenizedContent, PreprocessedBundle, ExtractedArticle, OutputRecord, ArticleMeta, NamedEntity, PipelineStats
 - Depends on: serde
 - Used by: All layers (ubiquitous)
 
@@ -129,21 +127,21 @@ filimon is a Fluvio-based streaming pipeline for semantic news extraction. It im
 1. **CLI entry** (`src/main.rs:51`) parses Command::Produce
 2. **Produce handler** (`src/commands/produce.rs:20`) creates PipelineCoordinator
 3. **Crawler** (`src/crawler.rs:70`) fetches page → RawPage
-4. **Producer sends** (`src/streaming.rs:111`) RawPage to `filimon-raw-pages` topic
-5. **SmartModule 1** (map-preprocess) tokenizes → TokenizedContent
-6. **SmartModule 2** (map-extract) extracts metadata, scores relevance → ExtractedArticle
-7. **SmartModule 3** (filter-relevance) filters by threshold → `filimon-articles` topic
-8. **Consumer handler** (`src/commands/consume.rs:20`) creates TypedConsumer
-9. **Batch consume** (`src/streaming.rs:185`) fetches articles with timeout
-10. **Optional NER** (`src/scorer.rs:83`) enriches entities if `--enrich_ner` flag set
-11. **Output** (`src/output.rs:23`) prints formatted summaries to stdout
+4. **Producer sends** (`src/commands/produce.rs:71`, `src/streaming.rs:216`) a news `SourceItem` (`src/models.rs:117`, built by `SourceItem::news`) to the `filimon-raw-pages` topic. Social `SourceItem`s go to `filimon-social-items`, which operators create by hand; source plugins (Phase 3) will produce them
+5. **Consumer handler** (`src/commands/consume.rs` `run`) connects and, through `collect_from_topics` / `open_incoming`, runs `FluvioStream::preflight` (`src/streaming.rs:155`) on the selected topics and SmartModules. A missing one stops the run with an error naming it (for example `fluvio topic create filimon-social-items`)
+6. **News stream** — `FluvioStream::topic_stream` (`src/streaming.rs:129`) opens a `consumer_with_config` stream on `filimon-raw-pages` with the `news_chain()` invocations attached (`NEWS_CHAIN`: map-preprocess → map-extract → filter-relevance, `RetryMode::Disabled`). The SmartModules run in the cluster on that stream; filter-relevance drops articles below 0.05, and each kept `ExtractedArticle` becomes an `OutputRecord` (`OutputRecord::from_article`)
+7. **Social stream** — `topic_stream` also opens a plain stream on `filimon-social-items` with no SmartModules; `decode_social` turns each `SourceItem` into an `OutputRecord` with `article: null`
+8. **Merge** — `merge_incoming` (`futures_util::stream::select`) interleaves the two streams; `--source news|social` replaces the unselected branch with an empty stream
+9. **Limit** — `collect_records` stops at `--limit` records across both kinds, or after 5 s with no new record (`IDLE_TIMEOUT`)
+10. **Optional NER** (`enrich` in `src/commands/consume.rs`, `src/scorer.rs`) fills `entities` for news and social records when `--enrich-ner` is set (batch mode)
+11. **Output** — `output::save_json` (`src/output.rs:15`) writes one JSON array to `--output` (default `output/wise_output.json`); `OutputRecord` has no html field. With `--limit 0` the merged stream is printed instead (`output::print_summary`)
 
 ### File Mode Path
 
 1. **CLI entry** (`src/main.rs:51`) parses Command::File { paths }
 2. **run_file** (`src/main.rs:320`) creates PipelineCoordinator
 3. **Iterate paths** — read each HTML file from disk
-4. **Create RawPage** with `file://` URL — send to producer (same as produce path step 4)
+4. **Create a news SourceItem** with a `file://` URL — send to producer (same as produce path step 4)
 5. **Rest follows produce path** (steps 5-11)
 
 ### Watch Mode Path
@@ -166,10 +164,20 @@ filimon is a Fluvio-based streaming pipeline for semantic news extraction. It im
 - Examples: `src/models.rs:24`, `smartmodules/map-preprocess/src/lib.rs:24`
 - Pattern: Simple struct carrying URL + HTML; passed through producer
 
+**SourceItem:**
+- Purpose: Unified input envelope for news pages and social posts (`source_type`, `platform`, `id`, `url`, `title`, `text`, `author`, `published`, `raw`, news-only `html`); mirrors the WIT `item` record
+- Examples: `src/models.rs:117`
+- Pattern: News items on `filimon-raw-pages` (the chain reads only `url` and `html`); social items on `filimon-social-items`
+
 **ExtractedArticle:**
-- Purpose: Final structured output carrying title, body, metadata, relevance score, keywords
-- Examples: `src/models.rs:59`
-- Pattern: Serde-serialized JSON; consumed by final topic subscriber
+- Purpose: Output of the news chain carrying title, body, metadata, relevance score, keywords
+- Examples: `src/models.rs:62`
+- Pattern: Serde-serialized JSON; delivered to `fili consume` on its `filimon-raw-pages` stream and mapped to `OutputRecord`
+
+**OutputRecord:**
+- Purpose: One record of `fili consume`'s JSON output, for news and social alike; `article` (ArticleMeta) is set for news and null for social; no html field
+- Examples: `src/models.rs:263`
+- Pattern: Written as one JSON array by `output::save_json`
 
 **PipelineCoordinator:**
 - Purpose: Factory/singleton for producers and consumers; ensures topics exist
@@ -199,9 +207,9 @@ filimon is a Fluvio-based streaming pipeline for semantic news extraction. It im
 - Responsibilities: Crawl seed URLs, discover links, rank by priority, send raw pages to Fluvio
 
 **Command::Consume:**
-- Location: `src/commands/consume.rs:20`
-- Triggers: `fili consume [--from-beginning] [--limit N] [--enrich-ner]`
-- Responsibilities: Subscribe to articles topic, optionally batch or stream, optionally enrich with NER
+- Location: `src/commands/consume.rs` (`run`)
+- Triggers: `fili consume [--from-beginning] [--limit N] [--source both|news|social] [--output PATH] [--enrich-ner]`
+- Responsibilities: Preflight the selected topics and SmartModules, read `filimon-raw-pages` through the news chain (attached via `consumer_with_config`) and `filimon-social-items` with no SmartModules, merge both streams, optionally enrich with NER, and write one JSON array (batch mode) or print records (streaming mode)
 
 **Command::Watch:**
 - Location: `src/main.rs:74` (dispatches to stubbed `run_watch`)

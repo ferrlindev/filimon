@@ -16,11 +16,11 @@ filimon/
 │   ├── args.rs                   # Additional argument types
 │   ├── commands/                 # Command handlers (produce, consume, watch)
 │   │   ├── mod.rs                # Re-exports for command module
-│   │   ├── produce.rs            # Crawl and produce raw pages
-│   │   ├── consume.rs            # Subscribe to articles and format output
+│   │   ├── produce.rs            # Crawl and produce news SourceItems
+│   │   ├── consume.rs            # Merge news (chain) and social streams, NER, JSON output
 │   │   └── watch.rs              # Watch directories for HTML files
-│   ├── streaming.rs              # Fluvio abstraction layer
-│   ├── models.rs                 # Data structures (RawPage, ExtractedArticle, etc.)
+│   ├── streaming.rs              # Fluvio layer: topics, news chain, preflight, topic_stream
+│   ├── models.rs                 # Data structures (SourceItem, ExtractedArticle, OutputRecord, etc.)
 │   ├── crawler.rs                # Web crawling and link extraction
 │   ├── scorer.rs                 # GLiNER-based NER
 │   ├── output.rs                 # Formatting and JSON output
@@ -117,14 +117,14 @@ filimon/
 - `transforms.yaml`: Fluvio pipeline; maps topics to SmartModules
 
 **Core Logic:**
-- `src/streaming.rs`: Fluvio client wrapper; producers/consumers; topic management
-- `src/models.rs`: RawPage → TokenizedContent → PreprocessedBundle → ExtractedArticle → NamedEntity
+- `src/streaming.rs`: Fluvio client wrapper; topic names (`TOPIC_RAW_PAGES`, `TOPIC_SOCIAL_ITEMS`); `NEWS_CHAIN` / `news_chain()`; `preflight`; `topic_stream` (`consumer_with_config`); producers; topic management
+- `src/models.rs`: `SourceItem` input envelope (news and social); chain shapes RawPage → TokenizedContent → PreprocessedBundle → ExtractedArticle → NamedEntity; `OutputRecord` / `ArticleMeta` output
 - `src/crawler.rs`: URL crawling, link extraction, priority scoring
 - `src/scorer.rs`: GLiNER NER engine initialization and inference
 
 **Commands:**
-- `src/commands/produce.rs`: Crawl, discover links, send RawPage to topic
-- `src/commands/consume.rs`: Subscribe to articles topic, batch/stream processing, optional NER enrichment
+- `src/commands/produce.rs`: Crawl, discover links, send news `SourceItem`s to `filimon-raw-pages`
+- `src/commands/consume.rs`: Merge the `filimon-raw-pages` news stream (through the SmartModule chain) and the `filimon-social-items` social stream (no SmartModules), honour `--source` / `--limit`, optional NER enrichment for both kinds, and write one JSON array (`--output`, default `output/wise_output.json`)
 - `src/commands/watch.rs`: Stubbed; should watch directories for HTML changes
 
 **Testing & Configuration:**

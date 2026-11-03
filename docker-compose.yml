@@ -129,7 +129,8 @@ services:
 
   # ── Stream Processor Service (optional) ──────────────────────────────────────
   # Runs the unified stream processor continuously.
-  # Listens on filimon-raw-pages and outputs to filimon-articles.
+  # Listens on filimon-raw-pages. The SmartModule chain output is read
+  # directly by `fili consume` rather than written to a topic.
   filimon-stream-processor:
     build:
       context: .
