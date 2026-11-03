@@ -658,6 +658,166 @@ mod tests {
         }
     }
 
+    /// The 02-VERIFICATION.md reproduction: a JSON string with one escaped
+    /// inner quote before the secret.
+    const ESCAPED_QUOTE_VALUE: &[u8] = br#""a\"PAGE-BODY-SECRET""#;
+
+    fn assert_content_free(message: &str) {
+        assert!(!message.contains("PAGE-BODY"), "{message:?}");
+        assert!(!message.contains('"'), "{message:?}");
+        assert!(!message.contains('`'), "{message:?}");
+    }
+
+    #[test]
+    fn decode_news_withholds_escaped_quote_content() {
+        let three_quotes: &[u8] = br#""a\"b\"c\"PAGE-BODY-SECRET""#;
+        let decoded: String = serde_json::from_slice(ESCAPED_QUOTE_VALUE).expect("JSON string");
+        let article_shaped = json(&serde_json::json!({
+            "url": "https://example.com/poison",
+            "title": "Title",
+            "body_preview": "body",
+            "word_count": 1,
+            "relevance_score": decoded,
+            "top_keywords": [],
+            "named_entities": [],
+            "inferred_category": "General"
+        }));
+        for value in [ESCAPED_QUOTE_VALUE, three_quotes, article_shaped.as_slice()] {
+            let Incoming::Diagnostic(message) = decode_news("filimon-raw-pages", 42, value) else {
+                panic!("expected a diagnostic");
+            };
+            assert!(message.contains("filimon-raw-pages"), "{message:?}");
+            assert!(message.contains("42"), "{message:?}");
+            assert!(message.contains("line 1 column"), "{message:?}");
+            assert_content_free(&message);
+        }
+    }
+
+    #[test]
+    fn empty_and_malformed_values_are_reported() {
+        let Incoming::Diagnostic(message) = decode_news("filimon-raw-pages", 3, b"") else {
+            panic!("expected a diagnostic");
+        };
+        assert!(message.contains("filimon-raw-pages offset 3"), "{message:?}");
+        assert!(message.contains("truncated JSON at line 1 column 0"), "{message:?}");
+
+        let (records, diagnostics) = split(decode_social("filimon-social-items", 4, b""));
+        assert!(records.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("filimon-social-items offset 4"),
+            "{:?}",
+            diagnostics[0]
+        );
+        assert!(
+            diagnostics[0].contains("truncated JSON at line 1 column 0"),
+            "{:?}",
+            diagnostics[0]
+        );
+
+        // Bytes that are not valid UTF-8 inside a JSON string.
+        let Incoming::Diagnostic(message) =
+            decode_news("filimon-raw-pages", 5, b"\"\xFFPAGE-BODY\"")
+        else {
+            panic!("expected a diagnostic");
+        };
+        assert!(message.contains("filimon-raw-pages offset 5"), "{message:?}");
+        assert!(!message.contains("PAGE-BODY"), "{message:?}");
+
+        let (records, diagnostics) = split(decode_social(
+            "filimon-social-items",
+            6,
+            &json(&poison_social("")),
+        ));
+        assert!(records.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("filimon-social-items offset 6"),
+            "{:?}",
+            diagnostics[0]
+        );
+        assert!(!diagnostics[0].contains('`'), "{:?}", diagnostics[0]);
+    }
+
+    fn runtime_error(hint: String) -> ErrorCode {
+        ErrorCode::SmartModuleRuntimeError(Box::new(SmartModuleTransformRuntimeError {
+            hint,
+            offset: 11,
+            record_value: "PAGE-BODY-SECRET".into(),
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn stream_error_hint_withholds_quoted_value() {
+        /// Mirror of map-preprocess's `RawPage`.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct SmRawPage {
+            url: String,
+            html: String,
+        }
+
+        let number_url = json(&serde_json::json!({ "url": 424242, "html": "x" }));
+        for payload in [ESCAPED_QUOTE_VALUE, number_url.as_slice()] {
+            let Err(e) = serde_json::from_slice::<SmRawPage>(payload) else {
+                panic!("payload must not parse");
+            };
+            // map-preprocess: eyre!("Failed to parse RawPage: {}", e); fluvio
+            // then formats the eyre report with Debug, which adds Location.
+            let hint = format!("Failed to parse RawPage: {e}\n\nLocation:\n    src/lib.rs:172:10");
+            let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
+            assert!(message.contains("offset 11"), "{message:?}");
+            assert!(message.contains("SmartModule error"), "{message:?}");
+            assert!(message.contains("Failed to parse RawPage"), "{message:?}");
+            assert!(!message.contains("424242"), "{message:?}");
+            assert!(!message.contains("Location"), "{message:?}");
+            assert_content_free(&message);
+        }
+
+        let message =
+            describe_stream_error("filimon-raw-pages", &runtime_error("bad\u{1b}[2J tail".into()));
+        assert!(message.contains("bad"), "{message:?}");
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(!message.contains("tail"), "{message:?}");
+
+        for hint in [String::new(), "\"PAGE-BODY\" first".to_string()] {
+            let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
+            assert!(message.contains("no detail"), "{message:?}");
+            assert!(message.contains("offset 11"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn hint_detail_truncates_by_chars() {
+        for c in ['東', '🦀'] {
+            let hint: String = std::iter::repeat_n(c, 300).collect();
+            let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
+            assert_eq!(message.chars().filter(|&m| m == c).count(), 200, "{c}");
+        }
+    }
+
+    #[test]
+    fn other_stream_errors_withhold_record_value() {
+        let look_back = ErrorCode::SmartModuleLookBackError(
+            "Failed to parse RawPage: invalid type: string \"PAGE-BODY\"\n\nSmartModule Lookback Error:\nOffset: 3\nKey: NULL\nValue: PAGE-BODY".into(),
+        );
+        let other = ErrorCode::Other("\u{1b}[2J\"PAGE-BODY\"".into());
+        for code in [look_back, other] {
+            let message = describe_stream_error("filimon-raw-pages", &code);
+            assert!(message.contains("filimon-raw-pages"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+        }
+
+        let not_found = ErrorCode::SmartModuleNotFound {
+            name: "filimon/missing@0.1.0".into(),
+        };
+        let message = describe_stream_error("filimon-raw-pages", &not_found);
+        assert!(message.contains("filimon/missing@0.1.0"), "{message:?}");
+    }
+
     #[test]
     fn diagnostic_line_strips_control_chars() {
         let line = diagnostic_line("t offset 1: \u{1b}[2J bad\rworse\nworst");
@@ -1278,6 +1438,42 @@ mod tests {
             assert!(message.contains(social.as_str()), "{message:?}");
             assert!(message.contains("offset 0"), "{message:?}");
             assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            let line = diagnostic_line(message);
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with the filimon SmartModules loaded"]
+    async fn poison_news_record_is_reported_without_value() -> miette::Result<()> {
+        with_scratch_topics(|raw, social| async move {
+            let stream = FluvioStream::connect().await?;
+
+            // map-preprocess rejects a JSON string with `invalid type: string`,
+            // so the real hint quotes this value.
+            let poison = serde_json::Value::String("a\"PAGE-BODY-SECRET".to_string());
+            let producer = ready_producer(&stream, &raw).await?;
+            producer.send("poison", &poison).await?;
+            producer.flush().await?;
+            // The social topic stays empty, but must be provisioned to open.
+            ready_producer(&stream, &social).await?;
+
+            let topics = ConsumeTopics {
+                raw_pages: &raw,
+                social: &social,
+            };
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 1, SourceFilter::News)
+                    .await?;
+            assert!(collected.records.is_empty(), "{:?}", collected.records);
+            assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+            let message = &collected.diagnostics[0];
+            assert!(message.contains(raw.as_str()), "{message:?}");
+            assert!(message.contains("offset 0"), "{message:?}");
+            assert!(message.contains("SmartModule error"), "{message:?}");
+            assert!(!message.contains("PAGE-BODY-SECRET"), "{message:?}");
             let line = diagnostic_line(message);
             assert!(!line.chars().any(char::is_control), "{line:?}");
             Ok(())
