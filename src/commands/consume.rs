@@ -84,38 +84,44 @@ fn describe_json_error(e: &serde_json::Error) -> String {
     format!("{class} at line {} column {}", e.line(), e.column())
 }
 
-/// Replace every double-quoted span of a serde error with `"…"`.
+/// What a stream diagnostic says when no module-authored text is left.
+const NO_DETAIL: &str = "no detail";
+
+/// Keep only the module-authored start of a `SmartModule` hint.
 ///
-/// `serde_json` quotes the offending string value in `invalid type` errors, and
-/// that value can be page content. Field names use backticks and stay.
-fn redact_quoted(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_quotes = false;
-    for c in s.chars() {
-        if c == '"' {
-            if in_quotes {
-                out.push_str("…\"");
-            } else {
-                out.push('"');
-            }
-            in_quotes = !in_quotes;
-        } else if !in_quotes {
-            out.push(c);
-        }
+/// fluvio builds a `SmartModule` hint from the module's eyre report. The
+/// filimon modules write a fixed message prefix, such as
+/// `Failed to parse RawPage: `, followed by `serde_json`'s error text, and
+/// eyre adds a location block after a newline. serde puts every
+/// record-controlled piece of its text after a double quote (string values)
+/// or a backtick (variant names, field names, numbers), and a `look_back`
+/// error's record value follows a newline. So the
+/// text before the first double quote, backtick or control character holds
+/// only module-authored text. It is cut to `MAX_DETAIL` characters, and
+/// `NO_DETAIL` stands in when nothing is left.
+fn hint_summary(text: &str) -> String {
+    let end = text
+        .find(|c: char| c == '"' || c == '`' || c.is_control())
+        .unwrap_or(text.len());
+    let kept = truncate_detail(text[..end].trim_end());
+    if kept.is_empty() {
+        NO_DETAIL.to_string()
+    } else {
+        kept
     }
-    out
 }
 
 /// Decode one value from the news chain.
 ///
 /// A value that is not an `ExtractedArticle` becomes a diagnostic naming the
-/// topic and offset. The diagnostic never includes the value itself.
+/// topic and offset. The diagnostic carries only the JSON error class and
+/// position, never the value itself.
 pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
     match serde_json::from_slice::<ExtractedArticle>(value) {
         Ok(article) => Incoming::Record(OutputRecord::from_article(article)),
         Err(e) => Incoming::Diagnostic(format!(
             "{topic} offset {offset}: not an extracted article: {}",
-            truncate_detail(&redact_quoted(&e.to_string()))
+            describe_json_error(&e)
         )),
     }
 }
@@ -156,16 +162,19 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
 
 /// Describe a stream error without the record value.
 ///
-/// A chain runtime error carries the whole failing record (page HTML),
-/// so only its offset and the start of its hint are reported.
+/// A chain runtime error carries the whole failing record (page HTML), and
+/// its hint quotes parts of it. The diagnostic keeps the offset and only the
+/// module-authored start of the hint (see `hint_summary`); other errors keep
+/// only the same kind of start of their text. Neither reads the stored record
+/// key or value.
 pub fn describe_stream_error(topic: &str, code: &ErrorCode) -> String {
     match code {
         ErrorCode::SmartModuleRuntimeError(e) => format!(
             "{topic} offset {}: SmartModule error: {}",
             e.offset,
-            truncate_detail(&e.hint)
+            hint_summary(&e.hint)
         ),
-        other => format!("{topic}: stream error: {}", truncate_detail(&other.to_string())),
+        other => format!("{topic}: stream error: {}", hint_summary(&other.to_string())),
     }
 }
 
