@@ -132,7 +132,9 @@ pub enum ConfigError {
     InvalidName { plugin: String, table: String },
 
     /// The same name appears under both `[sources]` and `[fetchers]`.
-    #[error("`{plugin}` is defined under both [sources] and [fetchers]; plugin names must be unique")]
+    #[error(
+        "`{plugin}` is defined under both [sources] and [fetchers]; plugin names must be unique"
+    )]
     #[diagnostic(code(fili::config::duplicate_name))]
     DuplicateName { plugin: String },
 

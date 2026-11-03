@@ -229,25 +229,30 @@ pub fn load_registry_with_env(
 
     // `Path::new("filimon.toml").parent()` is `Some("")`, which joins correctly.
     let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-    let mut problems = Vec::new();
+    let registry_src = RegistrySource {
+        name: &registry_name,
+        text: &registry_text,
+    };
 
-    // Pass 1: read and type-check each enabled source's plugin file.
+    // Problems are reported in a fixed order: registry-level problems first,
+    // then each enabled, validly named source's problems in name order.
+    let mut registry_problems = registry_level_problems(&registry);
+    let mut source_problems: BTreeMap<&str, Vec<ConfigError>> = BTreeMap::new();
+
+    // Pass 1: check each enabled source's fetcher reference, then read and
+    // type-check its plugin file.
     let mut parsed: BTreeMap<&str, ParsedPlugin> = BTreeMap::new();
-    for (name, entry) in &registry.sources {
-        if !entry.enabled {
-            continue;
-        }
-        if let Some(problem) =
-            fetcher_problem(name, entry, &registry.fetchers, &registry_name, &registry_text)
-        {
-            problems.push(problem);
+    for (name, entry) in loadable(&registry.sources).filter(|(_, entry)| entry.enabled) {
+        let bucket = source_problems.entry(name).or_default();
+        if let Some(problem) = fetcher_problem(name, entry, &registry.fetchers, registry_src) {
+            bucket.push(problem);
         }
         let config_path = base_dir.join(entry.config.get_ref());
-        match read_plugin(name, entry, &config_path, &registry_name, &registry_text) {
+        match read_plugin(name, entry, &config_path, registry_src) {
             Ok(plugin) => {
                 parsed.insert(name, plugin);
             }
-            Err(problem) => problems.push(problem),
+            Err(problem) => bucket.push(problem),
         }
     }
 
@@ -256,7 +261,7 @@ pub fn load_registry_with_env(
     let dotenv_path = base_dir.join(".env");
     let dotenv = if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
         secrets::read_dotenv(&dotenv_path).unwrap_or_else(|problem| {
-            problems.push(problem);
+            registry_problems.push(problem);
             HashMap::new()
         })
     } else {
@@ -265,37 +270,19 @@ pub fn load_registry_with_env(
 
     // Pass 3: resolve secrets per enabled source and assemble the output.
     let mut sources = BTreeMap::new();
-    for (name, entry) in &registry.sources {
+    for (name, entry) in loadable(&registry.sources) {
         let plugin = if entry.enabled {
             // A missing entry means its plugin file problem is already recorded.
-            let Some(parsed) = parsed.remove(name.as_str()) else {
+            let Some(parsed) = parsed.remove(name) else {
                 continue;
             };
-            match secrets::resolve_secrets(
-                name,
-                &parsed.path,
-                &parsed.text,
-                &parsed.aliases,
-                &dotenv,
-                &dotenv_path,
-                env,
-            ) {
-                Ok(secrets) => {
-                    // Names only, never values: makes alias mappings auditable.
-                    let env_vars: Vec<&str> = parsed
-                        .aliases
-                        .values()
-                        .map(|v| v.get_ref().as_str())
-                        .collect();
-                    tracing::info!(plugin = %name, ?env_vars, "resolved plugin secrets");
-                    Some(PluginConfig {
-                        host: parsed.host,
-                        settings_toml: parsed.settings_toml,
-                        secrets,
-                    })
-                }
+            match finish_plugin(name, parsed, &dotenv, &dotenv_path, env) {
+                Ok(plugin) => Some(plugin),
                 Err(mut missing) => {
-                    problems.append(&mut missing);
+                    source_problems
+                        .entry(name)
+                        .or_default()
+                        .append(&mut missing);
                     continue;
                 }
             }
@@ -303,9 +290,9 @@ pub fn load_registry_with_env(
             None
         };
         sources.insert(
-            name.clone(),
+            name.to_string(),
             LoadedSource {
-                name: name.clone(),
+                name: name.to_string(),
                 component: base_dir.join(entry.component.get_ref()),
                 config_path: base_dir.join(entry.config.get_ref()),
                 enabled: entry.enabled,
@@ -317,6 +304,10 @@ pub fn load_registry_with_env(
 
     let fetchers = load_fetchers(&registry.fetchers, &base_dir);
 
+    let problems: Vec<ConfigError> = registry_problems
+        .into_iter()
+        .chain(source_problems.into_values().flatten())
+        .collect();
     if !problems.is_empty() {
         return Err(ConfigErrors { problems });
     }
@@ -325,6 +316,37 @@ pub fn load_registry_with_env(
         base_dir,
         sources,
         fetchers,
+    })
+}
+
+/// Resolves a parsed plugin's secrets and builds its `PluginConfig`.
+fn finish_plugin(
+    name: &str,
+    parsed: ParsedPlugin,
+    dotenv: &HashMap<String, String>,
+    dotenv_path: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PluginConfig, Vec<ConfigError>> {
+    let secrets = secrets::resolve_secrets(
+        name,
+        &parsed.path,
+        &parsed.text,
+        &parsed.aliases,
+        dotenv,
+        dotenv_path,
+        env,
+    )?;
+    // Names only, never values: makes alias mappings auditable.
+    let env_vars: Vec<&str> = parsed
+        .aliases
+        .values()
+        .map(|v| v.get_ref().as_str())
+        .collect();
+    tracing::info!(plugin = %name, ?env_vars, "resolved plugin secrets");
+    Ok(PluginConfig {
+        host: parsed.host,
+        settings_toml: parsed.settings_toml,
+        secrets,
     })
 }
 
@@ -345,30 +367,100 @@ fn load_fetchers(
         .collect()
 }
 
-/// Checks an enabled source's `fetcher` reference against `[fetchers]`.
+/// The registry file's display name and text, for diagnostic snippets.
+#[derive(Clone, Copy)]
+struct RegistrySource<'a> {
+    name: &'a str,
+    text: &'a str,
+}
+
+impl RegistrySource<'_> {
+    fn named(self) -> NamedSource<String> {
+        NamedSource::new(self.name, self.text.to_string())
+    }
+}
+
+/// `true` when `name` is non-empty and uses only `[a-z0-9_-]`. Names become
+/// CLI arguments and per-plugin state keys, so nothing else is accepted.
+fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Sources whose names pass the name rule, in name order. A source with an
+/// invalid name is reported once at registry level and not loaded further.
+fn loadable(sources: &BTreeMap<String, SourceEntry>) -> impl Iterator<Item = (&str, &SourceEntry)> {
+    sources
+        .iter()
+        .filter(|(name, _)| is_valid_name(name))
+        .map(|(name, entry)| (name.as_str(), entry))
+}
+
+/// Name-rule problems across the whole registry: invalid names (sources, then
+/// fetchers, each in name order), then names used under both tables.
+fn registry_level_problems(registry: &Registry) -> Vec<ConfigError> {
+    let invalid = |table: &str, names: Vec<&String>| {
+        names
+            .into_iter()
+            .filter(|name| !is_valid_name(name))
+            .map(|name| ConfigError::InvalidName {
+                plugin: name.clone(),
+                table: table.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut problems = invalid("sources", registry.sources.keys().collect());
+    problems.extend(invalid("fetchers", registry.fetchers.keys().collect()));
+    problems.extend(
+        registry
+            .sources
+            .keys()
+            .filter(|name| registry.fetchers.contains_key(*name))
+            .map(|name| ConfigError::DuplicateName {
+                plugin: name.clone(),
+            }),
+    );
+    problems
+}
+
+/// Checks an enabled source's `fetcher` reference: it must name a fetcher
+/// defined under `[fetchers]`, and that fetcher must be enabled.
 fn fetcher_problem(
     name: &str,
     entry: &SourceEntry,
     fetchers: &BTreeMap<String, FetcherEntry>,
-    registry_name: &str,
-    registry_text: &str,
+    registry: RegistrySource<'_>,
 ) -> Option<ConfigError> {
     let fetcher = entry.fetcher.as_ref()?;
-    if fetchers.contains_key(fetcher.get_ref()) {
-        return None;
+    match fetchers.get(fetcher.get_ref()) {
+        Some(defined) if defined.enabled => None,
+        Some(_) => Some(ConfigError::DisabledFetcher {
+            plugin: name.to_string(),
+            fetcher: fetcher.get_ref().clone(),
+            src: registry.named(),
+            span: fetcher.span().into(),
+        }),
+        None => {
+            let defined = if fetchers.is_empty() {
+                "none".to_string()
+            } else {
+                fetchers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Some(ConfigError::UnknownFetcher {
+                plugin: name.to_string(),
+                fetcher: fetcher.get_ref().clone(),
+                defined,
+                src: registry.named(),
+                span: fetcher.span().into(),
+            })
+        }
     }
-    let defined = if fetchers.is_empty() {
-        "none".to_string()
-    } else {
-        fetchers.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
-    };
-    Some(ConfigError::UnknownFetcher {
-        plugin: name.to_string(),
-        fetcher: fetcher.get_ref().clone(),
-        defined,
-        src: NamedSource::new(registry_name, registry_text.to_string()),
-        span: fetcher.span().into(),
-    })
 }
 
 fn single(problem: ConfigError) -> ConfigErrors {
@@ -396,8 +488,7 @@ fn read_plugin(
     name: &str,
     entry: &SourceEntry,
     config_path: &Path,
-    registry_name: &str,
-    registry_text: &str,
+    registry: RegistrySource<'_>,
 ) -> Result<ParsedPlugin, ConfigError> {
     let display = config_path.display().to_string();
     let text =
@@ -405,7 +496,7 @@ fn read_plugin(
             plugin: name.to_string(),
             path: display.clone(),
             reason: e.to_string(),
-            src: NamedSource::new(registry_name, registry_text.to_string()),
+            src: registry.named(),
             span: entry.config.span().into(),
         })?;
 
@@ -842,7 +933,11 @@ component = "http.wasm"
     #[test]
     fn registry_malformed() {
         let dir = TempDir::new().expect("tempdir");
-        write(&dir, "filimon.toml", "[sources.alpha\ncomponent = \"a.wasm\"\n");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.alpha\ncomponent = \"a.wasm\"\n",
+        );
 
         let errors = load(&dir).expect_err("malformed registry TOML is an error");
 
