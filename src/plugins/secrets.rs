@@ -154,3 +154,87 @@ pub fn resolve_secrets(
         Err(problems)
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::config::{BackoffConfig, HostConfig, PluginConfig};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[test]
+    fn missing_dotenv_file_is_empty() {
+        let dir = TempDir::new().expect("tempdir");
+
+        let values = read_dotenv(&dir.path().join(".env")).expect("a missing .env is not an error");
+
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn dotenv_values_parsed_by_dotenvy() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "export ALPHA_TOKEN=\"a b\"\n").expect("write fixture");
+
+        let values = read_dotenv(&path).expect(".env parses");
+
+        assert_eq!(values.get("ALPHA_TOKEN").map(String::as_str), Some("a b"));
+    }
+
+    #[test]
+    fn secrets_iterate_in_alias_order() {
+        let plugin_text = "zeta = \"Z_VAR\"\nalpha = \"A_VAR\"\nmid = \"M_VAR\"\n";
+        let aliases: BTreeMap<String, toml::Spanned<String>> =
+            toml::from_str(plugin_text).expect("alias table parses");
+        let dotenv: HashMap<String, String> = [("Z_VAR", "z"), ("A_VAR", "a"), ("M_VAR", "m")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        let resolved = resolve_secrets(
+            "alpha",
+            Path::new("alpha.toml"),
+            plugin_text,
+            &aliases,
+            &dotenv,
+            Path::new(".env"),
+            &|_| None,
+        )
+        .expect("all aliases resolve");
+
+        assert_eq!(
+            resolved.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha", "mid", "zeta"]
+        );
+    }
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        assert_eq!(format!("{:?}", Secret("pa55word".to_string())), "Secret(***)");
+
+        let plugin = PluginConfig {
+            host: HostConfig {
+                poll_interval: Duration::from_secs(60),
+                timeout: Duration::from_secs(30),
+                allowlist: Vec::new(),
+                backoff: BackoffConfig {
+                    initial: Duration::from_secs(60),
+                    max: Duration::from_secs(3600),
+                    multiplier: 2.0,
+                },
+            },
+            settings_toml: String::new(),
+            secrets: ResolvedSecrets::from([(
+                "token".to_string(),
+                Secret("pa55word".to_string()),
+            )]),
+        };
+
+        let debug = format!("{plugin:?}");
+        assert!(!debug.contains("pa55word"), "{debug}");
+        assert!(debug.contains("Secret(***)"), "{debug}");
+    }
+}

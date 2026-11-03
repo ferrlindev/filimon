@@ -79,6 +79,22 @@ pub enum ConfigError {
         span: SourceSpan,
     },
 
+    /// A `[host.secrets]` alias names an env var whose effective value is empty.
+    #[error("plugin `{plugin}`: `host.secrets.{alias}`: env var `{env_var}` is set but empty")]
+    #[diagnostic(
+        code(fili::config::empty_secret),
+        help("give `{env_var}` a value in the process environment or the .env file")
+    )]
+    EmptySecret {
+        plugin: String,
+        alias: String,
+        env_var: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared here")]
+        span: SourceSpan,
+    },
+
     /// The `.env` file exists but cannot be used. Never carries line content.
     #[error(
         "cannot use `{path}`{}: {reason}",

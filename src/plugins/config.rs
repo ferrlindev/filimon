@@ -544,4 +544,166 @@ greeting = "hi"
         assert!(off.plugin.is_none());
         assert_eq!(off.config_path, dir.path().join("does-not-exist.toml"));
     }
+
+    // ── Secret isolation (CONF-02) ────────────────────────────────────────────
+
+    /// Writes a registry with one enabled source `alpha` whose only secret is
+    /// `token = "<env_var>"`, plus the given `.env` text.
+    fn alpha_with_secret(dir: &TempDir, env_var: &str, dotenv: &str) {
+        write(
+            dir,
+            "filimon.toml",
+            "[sources.alpha]\ncomponent = \"alpha.wasm\"\nconfig = \"alpha.toml\"\n",
+        );
+        write(
+            dir,
+            "alpha.toml",
+            &format!("[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"{env_var}\"\n"),
+        );
+        write(dir, ".env", dotenv);
+    }
+
+    fn secrets_of<'a>(registry: &'a LoadedRegistry, name: &str) -> &'a ResolvedSecrets {
+        &registry.sources[name]
+            .plugin
+            .as_ref()
+            .expect("enabled source is loaded")
+            .secrets
+    }
+
+    #[test]
+    fn only_aliased_secrets_resolved() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+
+[sources.beta]
+component = "beta.wasm"
+config = "beta.toml"
+"#,
+        );
+        write(
+            &dir,
+            "alpha.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\n",
+        );
+        write(
+            &dir,
+            "beta.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\nkey = \"BETA_KEY\"\n",
+        );
+        write(
+            &dir,
+            ".env",
+            "ALPHA_TOKEN=alpha-value\nBETA_KEY=beta-value\nUNRELATED_TOKEN=unrelated-value\n",
+        );
+
+        let registry = load(&dir).expect("registry loads");
+        let alpha = secrets_of(&registry, "alpha");
+        let beta = secrets_of(&registry, "beta");
+
+        assert_eq!(alpha.keys().map(String::as_str).collect::<Vec<_>>(), ["token"]);
+        assert_eq!(beta.keys().map(String::as_str).collect::<Vec<_>>(), ["key"]);
+        assert_eq!(alpha["token"].expose(), "alpha-value");
+        assert_eq!(beta["key"].expose(), "beta-value");
+
+        for secrets in [alpha, beta] {
+            for env_var in ["UNRELATED_TOKEN", "ALPHA_TOKEN", "BETA_KEY"] {
+                assert!(!secrets.contains_key(env_var), "env var name {env_var} used as a key");
+            }
+            assert!(secrets.values().all(|s| s.expose() != "unrelated-value"));
+        }
+        assert!(alpha.values().all(|s| s.expose() != "beta-value"));
+        assert!(beta.values().all(|s| s.expose() != "alpha-value"));
+    }
+
+    #[test]
+    fn process_env_overrides_dotenv() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "ALPHA_TOKEN=from-dotenv\n");
+        let env = |key: &str| (key == "ALPHA_TOKEN").then(|| "from-env".to_string());
+
+        let registry =
+            load_registry_with_env(&dir.path().join("filimon.toml"), &env).expect("registry loads");
+
+        assert_eq!(secrets_of(&registry, "alpha")["token"].expose(), "from-env");
+    }
+
+    #[test]
+    fn empty_secret_value_is_error() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "ALPHA_TOKEN=\n");
+
+        let errors = load(&dir).expect_err("an empty secret is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::EmptySecret {
+            plugin,
+            alias,
+            env_var,
+            ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected EmptySecret, got {:?}", errors.problems[0]);
+        };
+        assert_eq!(plugin, "alpha");
+        assert_eq!(alias, "token");
+        assert_eq!(env_var, "ALPHA_TOKEN");
+    }
+
+    #[test]
+    fn env_lookup_is_case_sensitive() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "alpha_token=x\n");
+
+        let errors = load(&dir).expect_err("a case-mismatched key does not satisfy the alias");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::MissingSecret { alias, env_var, .. }
+                    if alias == "token" && env_var == "ALPHA_TOKEN"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_dotenv_reports_line_not_content() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "OK_KEY=1\nALPHA_TOKEN=s3cr3t value\n");
+
+        let errors = load(&dir).expect_err("a malformed .env is an error");
+
+        assert!(
+            errors.problems.iter().any(|problem| matches!(
+                problem,
+                ConfigError::DotenvInvalid { line: Some(2), .. }
+            )),
+            "{errors:?}"
+        );
+        for problem in &errors.problems {
+            assert!(!problem.to_string().contains("s3cr3t"), "leaked in: {problem}");
+        }
+        assert!(!errors.to_string().contains("s3cr3t"));
+        assert!(!format!("{errors:?}").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn loading_does_not_mutate_process_env() {
+        const KEY: &str = "FILI_TEST_DOTENV_ONLY_7F3A";
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, KEY, &format!("{KEY}=x\n"));
+
+        let registry = load(&dir).expect("registry loads");
+
+        assert_eq!(secrets_of(&registry, "alpha")["token"].expose(), "x");
+        assert!(std::env::var(KEY).is_err(), "{KEY} leaked into the process env");
+    }
 }
