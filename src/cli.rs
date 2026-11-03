@@ -7,6 +7,20 @@ const DEFAULT_TOKENIZER: &str = "models/gliner_small-v2.1/tokenizer.json";
 const DEFAULT_MODEL: &str = "models/gliner_small-v2.1/onnx/model.onnx";
 const DEFAULT_REGISTRY: &str = "filimon.toml";
 
+/// Where `fili consume` writes its JSON output in batch mode.
+pub const DEFAULT_OUTPUT: &str = "output/wise_output.json";
+
+/// Which sources `fili consume` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SourceFilter {
+    /// News (through the chain modules) and social items, merged.
+    Both,
+    /// Only news from `filimon-raw-pages`, through the chain modules.
+    News,
+    /// Only social items from `filimon-social-items`, with no chain modules.
+    Social,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "fili",
@@ -79,6 +93,14 @@ pub enum Command {
         /// Apply NER enrichment to consumed articles
         #[arg(long)]
         enrich_ner: bool,
+
+        /// Which sources to read.
+        #[arg(long, value_enum)]
+        source: SourceFilter,
+
+        /// JSON output file (batch mode).
+        #[arg(long)]
+        output: PathBuf,
     },
 
     /// Watch directories and produce HTML files to Fluvio.
@@ -121,6 +143,66 @@ mod tests {
             .expect("registry argument exists");
         assert_eq!(registry.get_env(), Some(OsStr::new("FILI_REGISTRY")));
         assert!(registry.is_global_set());
+    }
+
+    /// Default values of a `fili consume` argument, from argument metadata.
+    fn consume_arg_defaults(id: &str) -> Vec<String> {
+        let command = Cli::command();
+        let consume = command
+            .find_subcommand("consume")
+            .expect("consume subcommand exists");
+        let arg = consume
+            .get_arguments()
+            .find(|arg| arg.get_id() == id)
+            .unwrap_or_else(|| panic!("{id} argument exists"));
+        arg.get_default_values()
+            .iter()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn parse_consume(args: &[&str]) -> (SourceFilter, PathBuf, usize) {
+        let cli = Cli::try_parse_from(args).expect("parses");
+        let Command::Consume {
+            source,
+            output,
+            limit,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the consume subcommand");
+        };
+        (source, output, limit)
+    }
+
+    #[test]
+    fn consume_flags_default() {
+        assert_eq!(consume_arg_defaults("source"), ["both"]);
+        assert_eq!(consume_arg_defaults("output"), [DEFAULT_OUTPUT]);
+        assert_eq!(DEFAULT_OUTPUT, "output/wise_output.json");
+
+        let (source, output, limit) = parse_consume(&["fili", "consume", "--limit", "3"]);
+        assert_eq!(source, SourceFilter::Both);
+        assert_eq!(output, PathBuf::from("output/wise_output.json"));
+        assert_eq!(limit, 3);
+    }
+
+    #[test]
+    fn consume_source_and_output_parse() {
+        let (source, output, limit) = parse_consume(&[
+            "fili", "consume", "--source", "social", "--output", "/tmp/x.json", "--limit", "2",
+        ]);
+        assert_eq!(source, SourceFilter::Social);
+        assert_eq!(output, PathBuf::from("/tmp/x.json"));
+        assert_eq!(limit, 2);
+
+        let (source, _, _) = parse_consume(&["fili", "consume", "--source", "news"]);
+        assert_eq!(source, SourceFilter::News);
+    }
+
+    #[test]
+    fn consume_rejects_unknown_source() {
+        assert!(Cli::try_parse_from(["fili", "consume", "--source", "video"]).is_err());
     }
 
     #[test]

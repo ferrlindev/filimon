@@ -20,6 +20,7 @@ use futures_util::{Stream, StreamExt, future};
 use crate::models::{
     ExtractedArticle, NamedEntity, OutputRecord, SourceItem, SourceType, is_rfc3339,
 };
+use crate::cli::SourceFilter;
 use crate::output;
 use crate::scorer::NerEngine;
 use crate::streaming::{
@@ -305,6 +306,14 @@ pub fn enrich(records: &mut [OutputRecord], detector: Option<&dyn EntityDetector
         }
     }
     diagnostics
+}
+
+/// The topics and chain modules a `--source` selection needs. RED stub.
+pub fn required_inputs<'a>(
+    _source: SourceFilter,
+    _topics: &ConsumeTopics<'a>,
+) -> (Vec<&'a str>, &'static [&'static str]) {
+    (Vec::new(), &[])
 }
 
 /// Check the topics and chain, then open the merged news and social stream.
@@ -714,6 +723,23 @@ mod tests {
         let collected = collect_records(merged, 5, IDLE_TIMEOUT).await;
         assert!(collected.records.is_empty());
         assert!(collected.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn required_inputs_follow_source_filter() {
+        let topics = ConsumeTopics::default();
+
+        let (needed, chain) = required_inputs(SourceFilter::Both, &topics);
+        assert_eq!(needed, ["filimon-raw-pages", "filimon-social-items"]);
+        assert_eq!(chain, NEWS_CHAIN);
+
+        let (needed, chain) = required_inputs(SourceFilter::News, &topics);
+        assert_eq!(needed, ["filimon-raw-pages"]);
+        assert_eq!(chain, NEWS_CHAIN);
+
+        let (needed, chain) = required_inputs(SourceFilter::Social, &topics);
+        assert_eq!(needed, ["filimon-social-items"]);
+        assert!(chain.is_empty(), "{chain:?}");
     }
 
     // ── NER enrichment ───────────────────────────────────────────────────────

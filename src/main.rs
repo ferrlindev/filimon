@@ -66,6 +66,7 @@ async fn main() -> miette::Result<()> {
             from_beginning,
             limit,
             enrich_ner,
+            ..
         } => {
             let ner = if enrich_ner {
                 load_ner_engine(&cli.tokenizer, &cli.model)
