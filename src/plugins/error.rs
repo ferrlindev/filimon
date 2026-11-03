@@ -94,15 +94,21 @@ pub enum ConfigError {
     },
 
     /// A `[host.secrets]` alias names an env var whose effective value is empty.
-    #[error("plugin `{plugin}`: `host.secrets.{alias}`: env var `{env_var}` is set but empty")]
-    #[diagnostic(
-        code(fili::config::empty_secret),
-        help("give `{env_var}` a value in the process environment or the .env file")
+    ///
+    /// `origin` is the source that supplied the empty value: `the process
+    /// environment` (which wins over `.env` even when empty, D-12) or the
+    /// `.env` path. `fix` is the help text that works for that source.
+    #[error(
+        "plugin `{plugin}`: `host.secrets.{alias}`: env var `{env_var}` is set but empty in {origin}"
     )]
+    #[diagnostic(code(fili::config::empty_secret))]
     EmptySecret {
         plugin: String,
         alias: String,
         env_var: String,
+        origin: String,
+        #[help]
+        fix: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("declared here")]

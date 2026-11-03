@@ -4,6 +4,8 @@
 // Reads the `.env` next to the registry into a private map and resolves each
 // plugin's `[host.secrets]` aliases against the process environment first and
 // that map second. Each plugin receives only its own aliases, keyed by alias.
+// `.env` values are read literally and never expanded; the format is
+// documented in plugins/README.md under "Plugin secrets".
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::collections::{BTreeMap, HashMap};
@@ -268,15 +270,24 @@ pub fn resolve_secrets(
 
     for (alias, env_var) in aliases {
         let name = env_var.get_ref();
-        let from_dotenv = || dotenv.and_then(|map| map.get(name).cloned());
-        match env(name).or_else(from_dotenv) {
-            Some(value) if value.is_empty() => problems.push(ConfigError::EmptySecret {
-                plugin: plugin.to_string(),
-                alias: alias.clone(),
-                env_var: name.clone(),
-                src: plugin_src(),
-                span: env_var.span().into(),
-            }),
+        // D-12: a set process variable wins even when empty; empty is not unset.
+        let (value, from_process) = match env(name) {
+            Some(value) => (Some(value), true),
+            None => (dotenv.and_then(|map| map.get(name).cloned()), false),
+        };
+        match value {
+            Some(value) if value.is_empty() => {
+                let (origin, fix) = empty_secret_source(name, from_process, dotenv_path);
+                problems.push(ConfigError::EmptySecret {
+                    plugin: plugin.to_string(),
+                    alias: alias.clone(),
+                    env_var: name.clone(),
+                    origin,
+                    fix,
+                    src: plugin_src(),
+                    span: env_var.span().into(),
+                });
+            }
             Some(value) => {
                 resolved.insert(alias.clone(), Secret(value));
             }
@@ -297,6 +308,25 @@ pub fn resolve_secrets(
         Ok(resolved)
     } else {
         Err(problems)
+    }
+}
+
+/// The `EmptySecret` origin and fix for an empty value. Neither fix suggests
+/// editing `.env` while a process variable shadows it.
+fn empty_secret_source(env_var: &str, from_process: bool, dotenv_path: &Path) -> (String, String) {
+    let dotenv = dotenv_path.display();
+    if from_process {
+        (
+            "the process environment".to_string(),
+            format!(
+                "unset `{env_var}` in the process environment or give it a non-empty value there; the process environment overrides {dotenv}"
+            ),
+        )
+    } else {
+        (
+            dotenv.to_string(),
+            format!("give `{env_var}` a non-empty value in {dotenv}"),
+        )
     }
 }
 
@@ -374,7 +404,7 @@ mod tests {
 
     /// Every accepted example from the `.env` format (F1-F7), plus comment
     /// and blank lines that must yield no keys.
-    const ACCEPTED_FORMS: &str = r##"# comment with $HOME, 'single' and "double" quotes
+    const ACCEPTED_FORMS: &str = r#"# comment with $HOME, 'single' and "double" quotes
 
 PLAIN=abc123
 export EXPORTED=v
@@ -392,7 +422,7 @@ QUOTED_TRAILING='abc' # c
 UNICODE=bücher
 DOTTED.KEY=v
 lower_case=v
-"##;
+"#;
 
     #[test]
     fn dotenv_accepts_documented_forms() {
@@ -566,7 +596,10 @@ lower_case=v
         let problem = single_problem(&dotenv, &env);
 
         assert!(
-            matches!(problem, ConfigError::EmptySecret { .. }),
+            matches!(
+                &problem,
+                ConfigError::EmptySecret { origin, .. } if origin == "the process environment"
+            ),
             "{problem:?}"
         );
         let display = problem.to_string();
@@ -583,7 +616,7 @@ lower_case=v
         let problem = single_problem(&dotenv, &|_| None);
 
         assert!(
-            matches!(problem, ConfigError::EmptySecret { .. }),
+            matches!(&problem, ConfigError::EmptySecret { origin, .. } if origin == DOTENV_PATH),
             "{problem:?}"
         );
         let display = problem.to_string();
