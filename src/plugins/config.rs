@@ -10,15 +10,16 @@
 // one `ConfigErrors`, and a partial `LoadedRegistry` is never returned.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use miette::{NamedSource, SourceSpan};
 use serde::Deserialize;
 
-use super::error::ConfigErrors;
-use super::secrets::ResolvedSecrets;
+use super::error::{ConfigError, ConfigErrors};
+use super::secrets::{self, ResolvedSecrets};
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -204,11 +205,206 @@ pub fn load_registry(path: &Path) -> Result<LoadedRegistry, ConfigErrors> {
 /// # Errors
 /// Returns every problem found in the registry, plugin files and secrets.
 pub fn load_registry_with_env(
-    _path: &Path,
-    _env: &dyn Fn(&str) -> Option<String>,
+    path: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<LoadedRegistry, ConfigErrors> {
-    Err(ConfigErrors {
-        problems: Vec::new(),
+    let registry_name = path.display().to_string();
+
+    // The registry is read once; its parse result and its diagnostic source
+    // both come from this one String. Only registry-level failures stop early.
+    let registry_text = std::fs::read_to_string(path).map_err(|e| {
+        single(ConfigError::RegistryUnreadable {
+            path: registry_name.clone(),
+            reason: e.to_string(),
+        })
+    })?;
+    let registry: Registry = toml::from_str(&registry_text).map_err(|e| {
+        single(ConfigError::RegistryMalformed {
+            path: registry_name.clone(),
+            message: e.message().to_string(),
+            src: NamedSource::new(&registry_name, registry_text.clone()),
+            span: e.span().map(Into::into),
+        })
+    })?;
+
+    // `Path::new("filimon.toml").parent()` is `Some("")`, which joins correctly.
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let mut problems = Vec::new();
+
+    // Pass 1: read and type-check each enabled source's plugin file.
+    let mut parsed: BTreeMap<&str, ParsedPlugin> = BTreeMap::new();
+    for (name, entry) in &registry.sources {
+        if !entry.enabled {
+            continue;
+        }
+        let config_path = base_dir.join(entry.config.get_ref());
+        match read_plugin(name, entry, &config_path, &registry_name, &registry_text) {
+            Ok(plugin) => {
+                parsed.insert(name, plugin);
+            }
+            Err(problem) => problems.push(problem),
+        }
+    }
+
+    // Pass 2: `.env` is read only when some enabled source declares secrets,
+    // so a `.env` shared with other tools cannot break plugin-free registries.
+    let dotenv_path = base_dir.join(".env");
+    let dotenv = if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
+        secrets::read_dotenv(&dotenv_path).unwrap_or_else(|problem| {
+            problems.push(problem);
+            HashMap::new()
+        })
+    } else {
+        HashMap::new()
+    };
+
+    // Pass 3: resolve secrets per enabled source and assemble the output.
+    let mut sources = BTreeMap::new();
+    for (name, entry) in &registry.sources {
+        let plugin = if entry.enabled {
+            // A missing entry means its plugin file problem is already recorded.
+            let Some(parsed) = parsed.remove(name.as_str()) else {
+                continue;
+            };
+            match secrets::resolve_secrets(
+                name,
+                &parsed.path,
+                &parsed.text,
+                &parsed.aliases,
+                &dotenv,
+                &dotenv_path,
+                env,
+            ) {
+                Ok(secrets) => Some(PluginConfig {
+                    host: parsed.host,
+                    settings_toml: parsed.settings_toml,
+                    secrets,
+                }),
+                Err(mut missing) => {
+                    problems.append(&mut missing);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        sources.insert(
+            name.clone(),
+            LoadedSource {
+                name: name.clone(),
+                component: base_dir.join(entry.component.get_ref()),
+                config_path: base_dir.join(entry.config.get_ref()),
+                enabled: entry.enabled,
+                fetcher: entry.fetcher.as_ref().map(|f| f.get_ref().clone()),
+                plugin,
+            },
+        );
+    }
+
+    let fetchers = registry
+        .fetchers
+        .iter()
+        .map(|(name, entry)| {
+            let fetcher = LoadedFetcher {
+                name: name.clone(),
+                component: base_dir.join(entry.component.get_ref()),
+                enabled: entry.enabled,
+            };
+            (name.clone(), fetcher)
+        })
+        .collect();
+
+    if !problems.is_empty() {
+        return Err(ConfigErrors { problems });
+    }
+    Ok(LoadedRegistry {
+        path: path.to_path_buf(),
+        base_dir,
+        sources,
+        fetchers,
+    })
+}
+
+fn single(problem: ConfigError) -> ConfigErrors {
+    ConfigErrors {
+        problems: vec![problem],
+    }
+}
+
+/// An enabled source's plugin file, parsed but with secrets not yet resolved.
+struct ParsedPlugin {
+    path: PathBuf,
+    text: String,
+    host: HostConfig,
+    settings_toml: String,
+    aliases: BTreeMap<String, toml::Spanned<String>>,
+}
+
+/// Reads one plugin file once and builds its typed values and its diagnostic
+/// source from that single read.
+#[allow(
+    clippy::result_large_err,
+    reason = "cold one-shot config load; ConfigError carries its diagnostic source"
+)]
+fn read_plugin(
+    name: &str,
+    entry: &SourceEntry,
+    config_path: &Path,
+    registry_name: &str,
+    registry_text: &str,
+) -> Result<ParsedPlugin, ConfigError> {
+    let display = config_path.display().to_string();
+    let text =
+        std::fs::read_to_string(config_path).map_err(|e| ConfigError::PluginFileMissing {
+            plugin: name.to_string(),
+            path: display.clone(),
+            reason: e.to_string(),
+            src: NamedSource::new(registry_name, registry_text.to_string()),
+            span: entry.config.span().into(),
+        })?;
+
+    let malformed = |message: String, span: Option<SourceSpan>| ConfigError::PluginFileMalformed {
+        plugin: name.to_string(),
+        path: display.clone(),
+        message,
+        src: NamedSource::new(&display, text.clone()),
+        span,
+    };
+
+    let file: PluginFile = toml::from_str(&text)
+        .map_err(|e| malformed(e.message().to_string(), e.span().map(Into::into)))?;
+
+    let settings_toml = if file.settings.is_empty() {
+        String::new()
+    } else {
+        toml::to_string(&file.settings)
+            .map_err(|e| malformed(format!("cannot re-serialise [settings]: {e}"), None))?
+    };
+
+    let HostSection {
+        poll_interval_secs,
+        timeout_secs,
+        allowlist,
+        backoff,
+        secrets,
+    } = file.host;
+    let host = HostConfig {
+        poll_interval: Duration::from_secs(poll_interval_secs.get()),
+        timeout: Duration::from_secs(timeout_secs.get()),
+        allowlist: allowlist.into_iter().map(toml::Spanned::into_inner).collect(),
+        backoff: BackoffConfig {
+            initial: Duration::from_secs(backoff.initial_secs.get()),
+            max: Duration::from_secs(backoff.max_secs.get()),
+            multiplier: backoff.multiplier,
+        },
+    };
+
+    Ok(ParsedPlugin {
+        path: config_path.to_path_buf(),
+        text,
+        host,
+        settings_toml,
+        aliases: secrets,
     })
 }
 
@@ -265,6 +461,9 @@ greeting = "hi"
         write(&dir, ".env", "ALPHA_TOKEN=a1\nOTHER_KEY=x\n");
 
         let registry = load(&dir).expect("registry loads");
+
+        assert_eq!(registry.path, dir.path().join("filimon.toml"));
+        assert_eq!(registry.base_dir, dir.path());
 
         let alpha = &registry.sources["alpha"];
         assert_eq!(alpha.name, "alpha");
