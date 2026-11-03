@@ -42,48 +42,53 @@ pub type ResolvedSecrets = BTreeMap<String, Secret>;
 
 /// Reads a `.env` file into a private map. A missing file is an empty map.
 ///
-/// The file is read once and parsed by dotenvy from that in-memory text. The
-/// process environment is never modified: values stay in the returned map.
+/// Values are literal: `fili` never expands `$NAME` or `${NAME}` and never
+/// processes backslash escapes. Each line is blank, a comment, or
+/// `[export ]KEY=VALUE`, where VALUE is one of:
+/// - empty (end of line, or whitespace then a `#` comment);
+/// - single-quoted: anything except `'`, kept verbatim;
+/// - double-quoted: kept verbatim, but must not contain `$` or a backslash;
+/// - unquoted: no whitespace, `$`, backslash or quotes, and no leading `#`.
+///
+/// Comments are whole lines whose first non-whitespace character is `#`, or
+/// text after whitespace that follows a value. LF and CRLF line endings and
+/// one leading byte-order mark are accepted.
+///
+/// The file is read once and parsed from that in-memory text. Parsing takes
+/// only the line text: the process environment is never read or modified.
 ///
 /// # Errors
-/// Returns `ConfigError::DotenvInvalid` when the file cannot be read or a line
-/// cannot be parsed. The error carries the line number, never the line text,
-/// because the text can be or contain a secret value.
-#[allow(
-    clippy::result_large_err,
-    reason = "cold one-shot config load; ConfigError carries its diagnostic source"
-)]
-pub fn read_dotenv(path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+/// Returns every rejected line, in line order, as a `ConfigError::DotenvInvalid`
+/// carrying its line number and a fixed reason, never the line text, because
+/// the text can be or contain a secret value. A read failure other than a
+/// missing file is one `DotenvInvalid` without a line number.
+pub fn read_dotenv(path: &Path) -> Result<HashMap<String, String>, Vec<ConfigError>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(e) => return Err(dotenv_invalid(path, None, e.to_string())),
+        Err(e) => return Err(vec![dotenv_invalid(path, None, e.to_string())]),
     };
+    let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
 
     let mut values = HashMap::new();
-    for item in dotenvy::from_read_iter(text.as_bytes()) {
-        match item {
-            Ok((key, value)) => {
+    let mut problems = Vec::new();
+    // Line numbers are counted, never found by searching the text.
+    for (index, line) in body.lines().enumerate() {
+        let number = index + 1;
+        match parse_line(line) {
+            Ok(None) => {}
+            Ok(Some((key, value))) => {
                 values.insert(key, value);
             }
-            // dotenvy's own Display and Debug echo the offending text, so the
-            // error is never formatted; only a line number is derived from it.
-            Err(dotenvy::Error::LineParse(offending, _)) => {
-                return Err(dotenv_invalid(
-                    path,
-                    line_containing(&text, &offending),
-                    "malformed line".to_string(),
-                ));
-            }
-            Err(dotenvy::Error::Io(e)) => {
-                return Err(dotenv_invalid(path, None, e.to_string()));
-            }
-            Err(_) => {
-                return Err(dotenv_invalid(path, None, "unreadable .env".to_string()));
-            }
+            Err(reason) => problems.push(dotenv_invalid(path, Some(number), reason.to_string())),
         }
     }
-    Ok(values)
+
+    if problems.is_empty() {
+        Ok(values)
+    } else {
+        Err(problems)
+    }
 }
 
 fn dotenv_invalid(path: &Path, line: Option<usize>, reason: String) -> ConfigError {
@@ -94,17 +99,129 @@ fn dotenv_invalid(path: &Path, line: Option<usize>, reason: String) -> ConfigErr
     }
 }
 
-/// The 1-based number of the first line of `text` that contains the first
-/// line of `offending`. dotenvy reports either the whole line or only its
-/// value part, and a multi-line value spans several lines.
-fn line_containing(text: &str, offending: &str) -> Option<usize> {
-    let needle = offending.lines().next().unwrap_or_default().trim();
-    if needle.is_empty() {
+// ── .env Line Parsing ─────────────────────────────────────────────────────────
+//
+// Each rejection reason is a fixed phrase. None may ever include line text.
+
+const DOLLAR: &str =
+    "`$` outside single quotes; fili never expands variables, so single-quote the value";
+const BACKSLASH: &str =
+    "backslash outside single quotes; escapes are not supported, so single-quote the value";
+const QUOTE_IN_UNQUOTED: &str = "quote inside an unquoted value; quote the whole value";
+const LEADING_HASH: &str =
+    "value starts with `#`; single-quote it, or put a space before a comment";
+const TRAILING_TEXT: &str = "unexpected text after the value; quote the whole value";
+const UNTERMINATED: &str = "unterminated quote; multi-line values are not supported";
+const NOT_ASSIGNMENT: &str = "expected KEY=VALUE";
+
+/// Parses one `.env` line. `Ok(None)` is a blank or comment line.
+///
+/// When a line breaks several rules, the first one met scanning left to right
+/// is reported.
+fn parse_line(line: &str) -> Result<Option<(String, String)>, &'static str> {
+    let rest = line.trim_start();
+    if rest.is_empty() || rest.starts_with('#') {
+        return Ok(None);
+    }
+    let (key, rest) = split_key(strip_export(rest)).ok_or(NOT_ASSIGNMENT)?;
+    let rest = rest
+        .trim_start()
+        .strip_prefix('=')
+        .ok_or(NOT_ASSIGNMENT)?;
+    let (value, trailer) = split_value(rest)?;
+    check_trailer(trailer)?;
+    Ok(Some((key.to_string(), value.to_string())))
+}
+
+/// Drops a leading `export` plus whitespace when a key follows it, so a key
+/// literally named `export` still parses.
+fn strip_export(rest: &str) -> &str {
+    let Some(after) = rest.strip_prefix("export") else {
+        return rest;
+    };
+    let trimmed = after.trim_start();
+    let had_space = trimmed.len() < after.len();
+    if had_space && trimmed.starts_with(is_key_start) {
+        trimmed
+    } else {
+        rest
+    }
+}
+
+fn is_key_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.'
+}
+
+/// Splits a leading KEY off `rest`. `None` when `rest` does not start with one.
+fn split_key(rest: &str) -> Option<(&str, &str)> {
+    if !rest.starts_with(is_key_start) {
         return None;
     }
-    text.lines()
-        .position(|line| line.contains(needle))
-        .map(|index| index + 1)
+    let end = rest.find(|c: char| !is_key_char(c)).unwrap_or(rest.len());
+    Some(rest.split_at(end))
+}
+
+/// Splits the text after `=` into the literal value and what follows it.
+fn split_value(rest: &str) -> Result<(&str, &str), &'static str> {
+    let start = rest.trim_start();
+    let had_space = start.len() < rest.len();
+    if start.is_empty() {
+        return Ok(("", ""));
+    }
+    if let Some(quoted) = start.strip_prefix('\'') {
+        return quoted.split_once('\'').ok_or(UNTERMINATED);
+    }
+    if let Some(quoted) = start.strip_prefix('"') {
+        return split_double_quoted(quoted);
+    }
+    if start.starts_with('#') {
+        return if had_space {
+            Ok(("", ""))
+        } else {
+            Err(LEADING_HASH)
+        };
+    }
+    split_unquoted(start)
+}
+
+/// `quoted` is the text after the opening `"`.
+fn split_double_quoted(quoted: &str) -> Result<(&str, &str), &'static str> {
+    match quoted.chars().find(|c| matches!(c, '$' | '\\' | '"')) {
+        Some('$') => Err(DOLLAR),
+        Some('\\') => Err(BACKSLASH),
+        Some(_) => quoted.split_once('"').ok_or(UNTERMINATED),
+        None => Err(UNTERMINATED),
+    }
+}
+
+/// An unquoted value is the maximal run of non-whitespace characters.
+fn split_unquoted(start: &str) -> Result<(&str, &str), &'static str> {
+    let end = start.find(char::is_whitespace).unwrap_or(start.len());
+    let (value, trailer) = start.split_at(end);
+    for c in value.chars() {
+        match c {
+            '$' => return Err(DOLLAR),
+            '\\' => return Err(BACKSLASH),
+            '\'' | '"' => return Err(QUOTE_IN_UNQUOTED),
+            _ => {}
+        }
+    }
+    Ok((value, trailer))
+}
+
+/// After a value only whitespace, optionally followed by a `#` comment, may follow.
+fn check_trailer(trailer: &str) -> Result<(), &'static str> {
+    let rest = trailer.trim_start();
+    let had_space = rest.len() < trailer.len();
+    if trailer.is_empty() || (had_space && (rest.is_empty() || rest.starts_with('#'))) {
+        Ok(())
+    } else {
+        Err(TRAILING_TEXT)
+    }
 }
 
 // ── Alias Resolution ──────────────────────────────────────────────────────────
@@ -189,7 +306,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join(".env");
         std::fs::write(&path, text).expect("write fixture");
-        read_dotenv(&path).map_err(|problem| vec![problem])
+        read_dotenv(&path)
     }
 
     /// The 1-based line of a `DotenvInvalid`, or a panic for any other problem.

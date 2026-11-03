@@ -257,8 +257,8 @@ pub fn load_registry_with_env(
     // so a `.env` shared with other tools cannot break plugin-free registries.
     let dotenv_path = base_dir.join(".env");
     let dotenv = if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
-        secrets::read_dotenv(&dotenv_path).unwrap_or_else(|problem| {
-            registry_problems.push(problem);
+        secrets::read_dotenv(&dotenv_path).unwrap_or_else(|mut problems| {
+            registry_problems.append(&mut problems);
             HashMap::new()
         })
     } else {
