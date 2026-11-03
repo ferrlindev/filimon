@@ -1,0 +1,28 @@
+package filimon:plugin@0.1.0;
+
+/// Structured logging into the host's tracing output.
+interface log {
+    /// Log severity.
+    enum level { trace, debug, info, warn, error }
+
+    /// Write one log line at the given level.
+    log: func(level: level, message: string);
+}
+
+/// High-level fetch: imported by sources, exported by fetchers.
+interface fetch {
+    use types.{request, response, fetch-error};
+
+    /// Perform one HTTP request on behalf of the plugin. The host routes the
+    /// request to the source's assigned fetcher and enforces its allowlist and
+    /// timeout.
+    fetch: func(request: request) -> result<response, fetch-error>;
+}
+
+/// Low-level outbound HTTP capability provided by the host to fetchers.
+interface outbound-http {
+    use types.{request, response, fetch-error};
+
+    /// Send one HTTP request over the host's network stack.
+    send: func(request: request) -> result<response, fetch-error>;
+}

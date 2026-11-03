@@ -1,0 +1,39 @@
+package filimon:plugin@0.1.0;
+
+/// A source plugin: polls one platform and returns items.
+///
+/// Calling contract: the host calls `init` once per instance, before any
+/// `poll`. The host never calls `poll` concurrently on one instance.
+world source {
+    use types.{poll-response, poll-error};
+
+    import log;
+    import fetch;
+
+    /// Configure the instance. Called once per instance, before any `poll`.
+    ///
+    /// `settings` is the plugin's raw `[settings]` TOML text (D-05); the
+    /// plugin parses and validates it. `secrets` holds alias and value pairs
+    /// for only the aliases the plugin's own TOML declares (D-06).
+    export init: func(settings: string, secrets: list<tuple<string, string>>) -> result<_, poll-error>;
+
+    /// Fetch new items.
+    ///
+    /// `cursor` is `none` on the first poll. Otherwise it is the
+    /// `next-cursor` from the previous successful poll, which the host stores
+    /// verbatim and passes back (D-01). `access-token` is the current OAuth
+    /// access token, or `none` (D-07). The host never calls `poll`
+    /// concurrently on one instance.
+    export poll: func(cursor: option<list<u8>>, access-token: option<string>) -> result<poll-response, poll-error>;
+}
+
+/// A fetcher plugin: performs HTTP requests for sources.
+///
+/// A fetcher has no `init` and no settings (D-08). It must hold no state
+/// between `fetch` calls.
+world fetcher {
+    import log;
+    import outbound-http;
+
+    export fetch;
+}

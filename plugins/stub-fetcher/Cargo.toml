@@ -1,0 +1,23 @@
+[package]
+name = "stub-fetcher"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Stub filimon fetcher plugin: returns a canned response and doubles as a host test fixture."
+authors = ["filimon"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "filimon:stub-fetcher"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "fetcher"
+
+# Own workspace, so the root filimon workspace does not capture this crate.
+[workspace]
