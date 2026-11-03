@@ -2,12 +2,72 @@
 # filimon – docker-compose.yaml
 #
 # Services:
+#   fluvio-sc        – Fluvio Streaming Controller
+#   fluvio-spu       – Fluvio Streaming Processing Unit
 #   filimon          – the WISE crawler (default)
 #   model-downloader – one-shot helper to pull a GLiNER model from Hugging Face
 #                      run with: docker compose --profile setup up model-downloader
+#
+# Fluvio Streaming Mode:
+#   docker compose up -d fluvio-sc fluvio-spu
+#   docker compose run --rm filimon produce https://techcrunch.com
+#   docker compose run --rm filimon consume --from-beginning
 # ═══════════════════════════════════════════════════════════════════════════════
 
 services:
+  # ── Fluvio Streaming Controller (SC) ──────────────────────────────────────────
+  fluvio-sc:
+    image: infinyon/fluvio:latest
+    container_name: fluvio-sc
+    entrypoint: ["/fluvio-run", "sc"]
+    ports:
+      - "9003:9003"   # SC API (internal)
+      - "9005:9005"   # SC public endpoint
+    environment:
+      RUST_LOG: "info"
+    volumes:
+      - fluvio-data:/var/lib/fluvio
+    command: ["--local", "/var/lib/fluvio/metadata", "--bind-public", "0.0.0.0:9005", "--bind-private", "0.0.0.0:9003"]
+    healthcheck:
+      test: ["CMD-SHELL", "cat /proc/net/tcp | grep -q ':232B' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Fluvio Streaming Processing Unit (SPU) ───────────────────────────────────
+  fluvio-spu:
+    image: infinyon/fluvio:latest
+    container_name: fluvio-spu
+    entrypoint: ["/fluvio-run", "spu"]
+    depends_on:
+      fluvio-sc:
+        condition: service_healthy
+    ports:
+      - "9010:9010"   # SPU public endpoint
+      - "9011:9011"   # SPU private endpoint
+    environment:
+      RUST_LOG: "info"
+    volumes:
+      - fluvio-spu-data:/var/lib/fluvio
+    command:
+      - "--id"
+      - "0"
+      - "--sc-addr"
+      - "fluvio-sc:9003"
+      - "--public-server"
+      - "0.0.0.0:9010"
+      - "--private-server"
+      - "0.0.0.0:9011"
+    healthcheck:
+      test: ["CMD-SHELL", "cat /proc/net/tcp | grep -q ':2332' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
   # ── Main crawler service ────────────────────────────────────────────────────
   filimon:
     build:
@@ -18,14 +78,22 @@ services:
     image: filimon:latest
     container_name: filimon
 
+    depends_on:
+      fluvio-sc:
+        condition: service_healthy
+      fluvio-spu:
+        condition: service_healthy
+
     volumes:
       # GLiNER model files – read-only; the container never writes model weights.
       - ./models:/app/models:ro
       # Extraction results – wise_output.json is written here by Stage 4.
       - ./output:/app/output
+      # Fluvio profile for cluster connection
+      - fluvio-profile:/root/.fluvio
 
     environment:
-      RUST_LOG: "info"
+      RUST_LOG: "info,filimon=debug"
 
       # Paths consumed by NerEngine::new() in scorer.rs.
       # Change the model variant here without rebuilding the image.
@@ -36,8 +104,15 @@ services:
       # ONNX Runtime CPU thread cap – tune to your host core count.
       ORT_NUM_THREADS: "4"
 
+      # Fluvio cluster endpoint (for container-to-container communication)
+      FLUVIO_CLUSTER_ADDR: "fluvio-sc:9003"
+
     # Default command – override at runtime:
     #   docker compose run --rm filimon crawl https://techcrunch.com
+    #   docker compose run --rm filimon crawl --stream https://techcrunch.com
+    #   docker compose run --rm filimon produce https://techcrunch.com
+    #   docker compose run --rm filimon consume --from-beginning
+    #   docker compose run --rm filimon stream --stage all
     #   docker compose run --rm filimon file /app/models/sample.html
     #   docker compose run --rm filimon --ls /watch
     command: ["--help"]
@@ -51,6 +126,37 @@ services:
     #     limits:
     #       cpus: "4"
     #       memory: 6g
+
+  # ── Stream Processor Service (optional) ──────────────────────────────────────
+  # Runs the unified stream processor continuously.
+  # Listens on filimon-raw-pages and outputs to filimon-articles.
+  filimon-stream-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: filimon:latest
+    container_name: filimon-stream-processor
+    profiles: ["streaming"]
+
+    depends_on:
+      fluvio-sc:
+        condition: service_healthy
+      fluvio-spu:
+        condition: service_healthy
+
+    volumes:
+      - ./models:/app/models:ro
+      - fluvio-profile:/root/.fluvio
+
+    environment:
+      RUST_LOG: "info,filimon=debug"
+      TOKENIZER_PATH: "/app/models/gliner_small-v2.1/tokenizer.json"
+      MODEL_PATH: "/app/models/gliner_small-v2.1/onnx/model.onnx"
+      FLUVIO_CLUSTER_ADDR: "fluvio-sc:9003"
+
+    command: ["stream", "--stage", "all", "--from-beginning"]
+    restart: unless-stopped
 
   # ── One-shot model downloader ───────────────────────────────────────────────
   # Downloads a GLiNER model from Hugging Face into ./models.
@@ -89,3 +195,11 @@ services:
         )
         print('Model ready at', os.environ['LOCAL_DIR'])
         PYEOF
+
+volumes:
+  fluvio-data:
+    driver: local
+  fluvio-spu-data:
+    driver: local
+  fluvio-profile:
+    driver: local

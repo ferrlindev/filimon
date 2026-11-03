@@ -1,0 +1,11 @@
+[package]
+name = "filter-relevance"
+group = "filimon"
+version = "0.1.0"
+apiVersion = "0.1.0"
+description = "Filters extracted articles based on relevance score threshold. Part of the filimon WISE pipeline."
+license = "Apache-2.0"
+
+[[params]]
+name = "threshold"
+description = "Minimum relevance score (0.0-1.0) for an article to pass the filter. Default: 0.05"

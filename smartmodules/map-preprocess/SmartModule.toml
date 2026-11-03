@@ -1,0 +1,12 @@
+[package]
+name = "map-preprocess"
+group = "filimon"
+version = "0.1.0"
+apiVersion = "0.1.0"
+description = "Preprocesses raw HTML pages into tokenized content. Stage 2 of the filimon WISE pipeline."
+license = "Apache-2.0"
+visibility = "private"
+
+[[params]]
+name = "unused"
+description = "No parameters required"

@@ -1,0 +1,12 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# transforms-filter-only.yaml - Filter already-extracted articles
+#
+# Use this when consuming from the filimon-extracted topic
+# to apply custom relevance thresholds.
+# ─────────────────────────────────────────────────────────────────────────────
+
+transforms:
+  # Filter out low-relevance articles
+  - uses: filimon/filter-relevance@0.1.0
+    with:
+      threshold: "0.10"  # Higher threshold for stricter filtering

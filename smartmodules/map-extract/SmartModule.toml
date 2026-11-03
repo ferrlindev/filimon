@@ -1,0 +1,12 @@
+[package]
+name = "map-extract"
+group = "filimon"
+version = "0.1.0"
+apiVersion = "0.1.0"
+description = "Extracts structured article data (title, author, date, body) and computes relevance scores. Stage 3 of the filimon WISE pipeline."
+license = "Apache-2.0"
+visibility = "private"
+
+[[params]]
+name = "unused"
+description = "No parameters required"

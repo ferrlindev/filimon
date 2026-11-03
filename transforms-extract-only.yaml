@@ -1,0 +1,15 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# transforms-extract-only.yaml - Extract articles from preprocessed bundles
+#
+# Use this when consuming from the filimon-preprocessed topic
+# (already preprocessed records).
+# ─────────────────────────────────────────────────────────────────────────────
+
+transforms:
+  # Stage 3: Extract article structure and compute relevance
+  - uses: filimon/map-extract@0.1.0
+  
+  # Stage 4: Filter out low-relevance articles
+  - uses: filimon/filter-relevance@0.1.0
+    with:
+      threshold: "0.05"

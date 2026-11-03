@@ -1,0 +1,12 @@
+# Fluvio SmartModule transformation chain for filimon WISE pipeline
+#
+# Usage:
+#   fluvio consume filimon-raw-pages -B --transforms-file transforms.yaml
+#
+# Pipeline:
+#   RawPage -> map-preprocess -> map-extract -> filter-relevance -> ExtractedArticle
+
+transforms:
+  - uses: filimon/map-preprocess@0.1.0
+  - uses: filimon/map-extract@0.1.0
+  - uses: filimon/filter-relevance@0.1.0
