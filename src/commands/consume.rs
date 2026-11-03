@@ -17,7 +17,9 @@ use fluvio::consumer::Record;
 use fluvio::dataplane::link::ErrorCode;
 use futures_util::{Stream, StreamExt, future};
 
-use crate::models::{ExtractedArticle, OutputRecord, SourceItem, SourceType, is_rfc3339};
+use crate::models::{
+    ExtractedArticle, NamedEntity, OutputRecord, SourceItem, SourceType, is_rfc3339,
+};
 use crate::output;
 use crate::scorer::NerEngine;
 use crate::streaming::{
@@ -230,6 +232,37 @@ pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
         }
     }
     collected
+}
+
+// ── NER enrichment ───────────────────────────────────────────────────────────
+
+/// Something that finds named entities in text. `NerEngine` in production,
+/// a fake in tests.
+pub trait EntityDetector {
+    /// Find the named entities in `text`.
+    fn detect(&self, text: &str) -> miette::Result<Vec<NamedEntity>>;
+}
+
+impl EntityDetector for NerEngine {
+    fn detect(&self, text: &str) -> miette::Result<Vec<NamedEntity>> {
+        NerEngine::detect(self, text)
+    }
+}
+
+/// Longest social NER input, in characters.
+pub const NER_INPUT_CHARS: usize = 500;
+
+/// The text handed to the NER detector for one record. RED stub.
+pub fn ner_input(_record: &OutputRecord) -> String {
+    String::new()
+}
+
+/// Run the detector over every record. RED stub.
+pub fn enrich(
+    _records: &mut [OutputRecord],
+    _detector: Option<&dyn EntityDetector>,
+) -> Vec<String> {
+    Vec::new()
 }
 
 /// Check the topics and chain, then open the merged news and social stream.
@@ -640,6 +673,168 @@ mod tests {
         let collected = collect_records(merged, 5, IDLE_TIMEOUT).await;
         assert!(collected.records.is_empty());
         assert!(collected.diagnostics.is_empty());
+    }
+
+    // ── NER enrichment ───────────────────────────────────────────────────────
+
+    /// Records every input and returns one entity per call.
+    #[derive(Default)]
+    struct RecordingDetector {
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl EntityDetector for RecordingDetector {
+        fn detect(&self, text: &str) -> miette::Result<Vec<NamedEntity>> {
+            self.calls.borrow_mut().push(text.to_string());
+            Ok(vec![NamedEntity {
+                text: "Ferris".to_string(),
+                kind: "PERSON".to_string(),
+            }])
+        }
+    }
+
+    /// Always fails.
+    struct FailingDetector;
+
+    impl EntityDetector for FailingDetector {
+        fn detect(&self, _text: &str) -> miette::Result<Vec<NamedEntity>> {
+            Err(miette::miette!("model exploded"))
+        }
+    }
+
+    fn news_record(text: &str) -> OutputRecord {
+        let mut a = article("https://example.com/news");
+        a.body_preview = text.to_string();
+        OutputRecord::from_article(a)
+    }
+
+    fn social_record(id: &str, title: Option<&str>, text: &str) -> OutputRecord {
+        let mut item = social_item(id, &format!("https://www.reddit.com/r/test/comments/{id}"), text);
+        item.title = title.map(str::to_string);
+        OutputRecord::from_social(item)
+    }
+
+    #[test]
+    fn ner_runs_on_social_text() {
+        let mut records = vec![
+            news_record("Markets rallied"),
+            social_record("t3_f", Some("Ferris"), "lol cat"),
+        ];
+        let detector = RecordingDetector::default();
+        let diagnostics = enrich(&mut records, Some(&detector));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(*detector.calls.borrow(), ["Markets rallied", "Ferris\nlol cat"]);
+        for record in &records {
+            let texts: Vec<&str> = record.entities.iter().map(|e| e.text.as_str()).collect();
+            assert_eq!(texts, ["Ferris"], "{}", record.id);
+            assert_eq!(record.entities[0].kind, "PERSON");
+        }
+    }
+
+    #[test]
+    fn ner_input_keeps_news_text() {
+        let text = "x".repeat(600) + " Zürich 🦀";
+        let record = news_record(&text);
+        assert!(record.title.is_some());
+        assert_eq!(ner_input(&record).as_bytes(), text.as_bytes());
+    }
+
+    #[test]
+    fn ner_input_truncates_by_chars() {
+        let input = ner_input(&social_record("a", None, &"é".repeat(600)));
+        assert_eq!(input.chars().count(), 500);
+        assert_eq!(input.len(), 1000);
+        assert_eq!(input, "é".repeat(500));
+
+        let input = ner_input(&social_record("b", None, &"🦀".repeat(501)));
+        assert_eq!(input, "🦀".repeat(500));
+
+        // The cap applies to title + newline + text together.
+        let title = "t".repeat(499);
+        let input = ner_input(&social_record("c", Some(&title), "body"));
+        assert_eq!(input.chars().count(), 500);
+        assert_eq!(input, format!("{title}\n"));
+
+        let title = "t".repeat(498);
+        let input = ner_input(&social_record("d", Some(&title), "body"));
+        assert_eq!(input.chars().count(), 500);
+        assert_eq!(input, format!("{title}\nb"));
+    }
+
+    #[test]
+    fn empty_ner_input_skips_detector() {
+        let mut records = vec![
+            social_record("e1", None, ""),
+            social_record("e2", None, "  \n\t "),
+            social_record("e3", Some(""), ""),
+        ];
+        let detector = RecordingDetector::default();
+        let diagnostics = enrich(&mut records, Some(&detector));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(detector.calls.borrow().is_empty(), "{:?}", detector.calls.borrow());
+        assert!(records.iter().all(|r| r.entities.is_empty()));
+    }
+
+    #[test]
+    fn detector_error_keeps_record() {
+        let mut records = vec![social_record("t3_fail", None, "hello")];
+        let diagnostics = enrich(&mut records, Some(&FailingDetector));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].entities.is_empty());
+        assert_eq!(records[0].text, "hello");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("t3_fail"), "{}", diagnostics[0]);
+        assert!(diagnostics[0].contains("NER failed"), "{}", diagnostics[0]);
+    }
+
+    #[test]
+    fn no_detector_leaves_entities_empty() {
+        let mut records = vec![
+            news_record("Markets rallied"),
+            social_record("t3_n", Some("Ferris"), "lol cat"),
+        ];
+        let diagnostics = enrich(&mut records, None);
+        assert!(diagnostics.is_empty());
+        assert!(records.iter().all(|r| r.entities.is_empty()));
+
+        let mut none: Vec<OutputRecord> = Vec::new();
+        assert!(enrich(&mut none, Some(&RecordingDetector::default())).is_empty());
+        assert_eq!(serde_json::to_string(&none).unwrap(), "[]");
+    }
+
+    #[test]
+    fn enriched_output_labels_and_omits_html() {
+        let mut records = vec![
+            news_record("Markets rallied"),
+            social_record("t3_o", Some("Ferris"), "lol cat"),
+        ];
+        enrich(&mut records, Some(&RecordingDetector::default()));
+        let value = serde_json::to_value(&records).unwrap();
+        let array = value.as_array().expect("array");
+        assert_eq!(array.len(), 2);
+        let kinds: Vec<&str> = array
+            .iter()
+            .map(|o| {
+                assert!(o["platform"].is_string(), "{o}");
+                o["source_type"].as_str().expect("source_type string")
+            })
+            .collect();
+        assert_eq!(kinds, ["news", "social"]);
+        let text = serde_json::to_string(&records).unwrap();
+        assert!(!text.contains("\"html\""), "{text}");
+    }
+
+    #[test]
+    fn social_text_is_not_truncated_in_output() {
+        let text = "é".repeat(600);
+        let title = "T".repeat(600);
+        let mut records = vec![social_record("t3_long", Some(&title), &text)];
+        let detector = RecordingDetector::default();
+        enrich(&mut records, Some(&detector));
+        assert_eq!(records[0].text, text);
+        assert_eq!(records[0].text.chars().count(), 600);
+        assert_eq!(records[0].title.as_deref(), Some(title.as_str()));
+        assert_eq!(detector.calls.borrow()[0].chars().count(), 500);
     }
 
     // ── Cluster tests (local Fluvio, scratch topics) ─────────────────────────
