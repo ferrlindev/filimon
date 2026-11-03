@@ -4,7 +4,9 @@
 // This module provides the streaming infrastructure for the WISE pipeline,
 // using Fluvio as the message broker.
 //
-//   filimon-raw-pages → news `SourceItem`s (from `fili file` and `fili produce`)
+//   filimon-raw-pages    → news `SourceItem`s (from `fili file` and `fili produce`)
+//   filimon-social-items → social `SourceItem`s (from source plugins); no
+//                          SmartModules, created by hand by the operator
 //
 // `fili consume` attaches the three-SmartModule chain to its own
 // `filimon-raw-pages` stream, so the cluster runs, in order:
@@ -34,6 +36,13 @@ use tracing::{error, info, warn};
 // ── Topic Names ───────────────────────────────────────────────────────────────
 
 pub const TOPIC_RAW_PAGES: &str = "filimon-raw-pages";
+
+/// Social `SourceItem`s from source plugins.
+///
+/// The topic carries no chain modules: `fili consume` reads it as a plain
+/// stream. `ensure_topics()` does not create it, so operators create it by
+/// hand with `fluvio topic create filimon-social-items`.
+pub const TOPIC_SOCIAL_ITEMS: &str = "filimon-social-items";
 
 // ── News SmartModule Chain ────────────────────────────────────────────────────
 

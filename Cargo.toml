@@ -41,6 +41,10 @@ futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+# test-util enables paused time (`#[tokio::test(start_paused = true)]`).
+tokio = { version = "1", features = ["test-util"] }
+
 [workspace]
 members = [
     ".",
