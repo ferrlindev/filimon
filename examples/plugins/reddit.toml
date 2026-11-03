@@ -1,0 +1,19 @@
+# Reddit source plugin config: polls the listed subreddits through the http fetcher.
+
+[host]
+poll_interval_secs = 300
+timeout_secs = 30
+allowlist = ["oauth.reddit.com", "www.reddit.com"]
+
+[host.backoff]
+initial_secs = 60
+max_secs = 3600
+multiplier = 2.0
+
+[host.secrets]
+client_id = "REDDIT_CLIENT_ID"
+client_secret = "REDDIT_CLIENT_SECRET"
+
+[settings]
+subreddits = ["rust", "programming"]
+listing = "new"

@@ -1,0 +1,25 @@
+# Sample plugin registry: component and config paths resolve relative to this file's directory.
+
+[sources.stub]
+component = "../../plugins/stub-source/target/wasm32-unknown-unknown/release/stub_source.wasm"
+config = "stub.toml"
+enabled = true
+fetcher = "stub-fetcher"
+
+[sources.reddit]
+component = "components/reddit.wasm"
+config = "reddit.toml"
+enabled = true
+fetcher = "http"
+
+[sources.youtube]
+component = "components/youtube.wasm"
+config = "youtube.toml"
+enabled = true
+fetcher = "http"
+
+[fetchers.stub-fetcher]
+component = "../../plugins/stub-fetcher/target/wasm32-unknown-unknown/release/stub_fetcher.wasm"
+
+[fetchers.http]
+component = "components/http-fetcher.wasm"

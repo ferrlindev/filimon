@@ -1,0 +1,11 @@
+# YouTube source plugin config: polls the listed channels through the http fetcher.
+
+[host]
+poll_interval_secs = 900
+allowlist = ["www.googleapis.com"]
+
+[host.secrets]
+api_key = "YOUTUBE_API_KEY"
+
+[settings]
+channels = ["UC_x5XG1OV2P6uZZ5FSM9Ttw"]

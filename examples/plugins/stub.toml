@@ -1,0 +1,8 @@
+# Stub source plugin config: exercises the plugin contract with no network and no secrets.
+
+[host]
+poll_interval_secs = 60
+allowlist = ["example.invalid"]
+
+[settings]
+greeting = "hello from the stub source"
