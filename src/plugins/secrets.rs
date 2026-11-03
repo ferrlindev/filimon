@@ -184,8 +184,32 @@ mod tests {
         assert!(values.is_empty());
     }
 
+    /// Writes `text` to a fresh `.env` and reads it back.
+    fn read_text(text: &str) -> Result<HashMap<String, String>, Vec<ConfigError>> {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join(".env");
+        std::fs::write(&path, text).expect("write fixture");
+        read_dotenv(&path).map_err(|problem| vec![problem])
+    }
+
+    /// The 1-based line of a `DotenvInvalid`, or a panic for any other problem.
+    fn dotenv_line(problem: &ConfigError) -> Option<usize> {
+        match problem {
+            ConfigError::DotenvInvalid { line, .. } => *line,
+            other => panic!("expected DotenvInvalid, got {other:?}"),
+        }
+    }
+
+    /// Asserts that neither Display nor Debug of `problem` carries `value`.
+    fn assert_omits(problem: &ConfigError, value: &str) {
+        let display = problem.to_string();
+        let debug = format!("{problem:?}");
+        assert!(!display.contains(value), "leaked {value:?} in: {display}");
+        assert!(!debug.contains(value), "leaked {value:?} in: {debug}");
+    }
+
     #[test]
-    fn dotenv_values_parsed_by_dotenvy() {
+    fn dotenv_export_prefix_and_double_quotes() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join(".env");
         std::fs::write(&path, "export ALPHA_TOKEN=\"a b\"\n").expect("write fixture");
@@ -193,6 +217,24 @@ mod tests {
         let values = read_dotenv(&path).expect(".env parses");
 
         assert_eq!(values.get("ALPHA_TOKEN").map(String::as_str), Some("a b"));
+    }
+
+    #[test]
+    fn dotenv_dollar_outside_single_quotes_is_rejected() {
+        for (text, value) in [
+            ("PW=pa$$word\n", "pa$$word"),
+            ("Q=\"x$HOME/y\"\n", "x$HOME/y"),
+            ("S=abc$NOPE_UNSET_XYZ\n", "abc$NOPE_UNSET_XYZ"),
+        ] {
+            let problems = read_text(text).expect_err(text);
+
+            assert_eq!(problems.len(), 1, "{text}: {problems:?}");
+            assert_eq!(dotenv_line(&problems[0]), Some(1), "{text}");
+            assert_omits(&problems[0], value);
+        }
+
+        let values = read_text("R='pa$$word'\n").expect("a single-quoted `$` is literal");
+        assert_eq!(values.get("R").map(String::as_str), Some("pa$$word"));
     }
 
     #[test]

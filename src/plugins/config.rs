@@ -905,6 +905,61 @@ config = "beta.toml"
     }
 
     #[test]
+    fn dotenv_single_quoted_dollar_round_trips() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "ALPHA_TOKEN='pa$$word'\n");
+
+        let registry = load(&dir).expect("a single-quoted `$` value loads");
+
+        assert_eq!(secrets_of(&registry, "alpha")["token"].expose(), "pa$$word");
+    }
+
+    #[test]
+    fn dotenv_unquoted_dollar_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "ALPHA_TOKEN=pa$$word\n");
+
+        let errors = load(&dir).expect_err("an unquoted `$` is rejected");
+
+        assert!(
+            errors.problems.iter().any(|problem| matches!(
+                problem,
+                ConfigError::DotenvInvalid { line: Some(1), reason, .. }
+                    if reason.contains("single-quote")
+            )),
+            "{errors:?}"
+        );
+        let report = render(&errors);
+        let debug = format!("{errors:?}");
+        for leaked in ["pa$$word", "$$word"] {
+            assert!(!report.contains(leaked), "leaked {leaked:?} in:\n{report}");
+            assert!(!debug.contains(leaked), "leaked {leaked:?} in: {debug}");
+        }
+    }
+
+    #[test]
+    fn dotenv_never_expands_process_env() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\nbraced = \"ALPHA_BRACED\"\n",
+        );
+        // Plain literals: `${PATH}` inside a format macro would be a placeholder.
+        write(&dir, ".env", "ALPHA_TOKEN='$PATH'\nALPHA_BRACED='${PATH}'\n");
+        let env = |key: &str| -> Option<String> {
+            assert!(key != "PATH", "loader looked up PATH");
+            None
+        };
+
+        let registry = load_registry_with_env(&dir.path().join("filimon.toml"), &env)
+            .expect("literal `$` values load");
+
+        let secrets = secrets_of(&registry, "alpha");
+        assert_eq!(secrets["token"].expose(), "$PATH");
+        assert_eq!(secrets["braced"].expose(), "${PATH}");
+    }
+
+    #[test]
     fn loading_does_not_mutate_process_env() {
         const KEY: &str = "FILI_TEST_DOTENV_ONLY_7F3A";
         let dir = TempDir::new().expect("tempdir");
