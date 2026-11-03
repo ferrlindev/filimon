@@ -237,6 +237,11 @@ pub fn load_registry_with_env(
         if !entry.enabled {
             continue;
         }
+        if let Some(problem) =
+            fetcher_problem(name, entry, &registry.fetchers, &registry_name, &registry_text)
+        {
+            problems.push(problem);
+        }
         let config_path = base_dir.join(entry.config.get_ref());
         match read_plugin(name, entry, &config_path, &registry_name, &registry_text) {
             Ok(plugin) => {
@@ -338,6 +343,32 @@ fn load_fetchers(
             (name.clone(), fetcher)
         })
         .collect()
+}
+
+/// Checks an enabled source's `fetcher` reference against `[fetchers]`.
+fn fetcher_problem(
+    name: &str,
+    entry: &SourceEntry,
+    fetchers: &BTreeMap<String, FetcherEntry>,
+    registry_name: &str,
+    registry_text: &str,
+) -> Option<ConfigError> {
+    let fetcher = entry.fetcher.as_ref()?;
+    if fetchers.contains_key(fetcher.get_ref()) {
+        return None;
+    }
+    let defined = if fetchers.is_empty() {
+        "none".to_string()
+    } else {
+        fetchers.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+    };
+    Some(ConfigError::UnknownFetcher {
+        plugin: name.to_string(),
+        fetcher: fetcher.get_ref().clone(),
+        defined,
+        src: NamedSource::new(registry_name, registry_text.to_string()),
+        span: fetcher.span().into(),
+    })
 }
 
 fn single(problem: ConfigError) -> ConfigErrors {
