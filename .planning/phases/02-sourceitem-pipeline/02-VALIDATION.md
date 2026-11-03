@@ -4,7 +4,7 @@ slug: "sourceitem-pipeline"
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: true) (#2117)
 status: validated
-nyquist_compliant: false
+nyquist_compliant: true
 wave_0_complete: true
 created: "2026-11-04"
 ---
@@ -40,7 +40,7 @@ created: "2026-11-04"
 
 ## Per-Task Verification Map
 
-Task IDs are bound to the PLAN.md files (02-01, 02-02, 02-03). Every task's full `<automated>` gate and its `<fails_when>` statement live in its plan; the commands below are the primary test filter for each row.
+Task IDs are bound to the PLAN.md files (02-01, 02-02, 02-03, 02-04). Every task's full `<automated>` gate and its `<fails_when>` statement live in its plan; the commands below are the primary test filter for each row.
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
@@ -58,6 +58,13 @@ Task IDs are bound to the PLAN.md files (02-01, 02-02, 02-03). Every task's full
 | 02-02-T3 | 02-02 | 2 | PIPE-04 | — | N/A | unit + CLI help | `cargo test -p filimon cli::tests::` | ✅ | ✅ green |
 | 02-03-T1 | 02-03 | 3 | PIPE-02/03/04, D-05 | T-02-12 | README commands proven by execution | live CLI (cluster) | README operator-path run in 02-03-PLAN.md Task 1 | n/a (live) | ✅ green |
 | 02-03-T2 | 02-03 | 3 | D-03 | — | N/A | doc grep | grep gates in 02-03-PLAN.md Task 2 | n/a (docs) | ✅ green |
+| 02-04-T1 | 02-04 | 3 | PIPE-03 | T-02-02 | social decode diagnostics carry no record value, ESC or backtick | unit | `cargo test -p filimon commands::consume::tests::decode_social_withholds_variant_value` | ✅ | ✅ green |
+| 02-04-T1 | 02-04 | 3 | PIPE-02/03 | T-02-02, T-02-04 | every diagnostic printed via `print_diagnostic` → `sanitize_for_terminal` | unit + structural grep | `cargo test -p filimon commands::consume::tests::diagnostic_line_strips_control_chars` (+ eprintln grep gate in 02-04-PLAN.md) | ✅ | ✅ green |
+| 02-04-T1 | 02-04 | 3 | PIPE-03 | T-02-02 | live social poison record → one content-free diagnostic | integration (cluster) | `cargo test -p filimon -- --ignored poison_social_record_is_reported_without_value` | ✅ | ✅ green |
+| 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | news decode diagnostics built from serde class/line/column only | unit | `cargo test -p filimon commands::consume::tests::decode_news_withholds_escaped_quote_content` | ✅ | ✅ green |
+| 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | SmartModule hint cut before first quote/backtick/control char | unit | `cargo test -p filimon commands::consume::tests::stream_error_hint_withholds_quoted_value` + `other_stream_errors_withhold_record_value` | ✅ | ✅ green |
+| 02-04-T2 | 02-04 | 3 | PIPE-01/02/03 | — | edge: 200-char cut by scalar values; empty/malformed values reported | unit | `cargo test -p filimon commands::consume::tests::hint_detail_truncates_by_chars` + `empty_and_malformed_values_are_reported` | ✅ | ✅ green |
+| 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | live news poison record through real map-preprocess hint | integration (cluster) | `cargo test -p filimon -- --ignored poison_news_record_is_reported_without_value` | ✅ | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -91,7 +98,7 @@ The `fili file` news smoke (SC2) and the README operator path (SC2/SC3/D-05) are
 - [x] Feedback latency < 60s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** validated 2026-11-03 (post-execution audit: 102 unit + 3 cluster tests green on d61974e+; 2 live checks remain manual-only)
+**Approval:** validated 2026-11-04 (re-audit after gap closure 02-04: 109 unit + 5 cluster tests green on 02351bc; 2 live checks remain manual-only)
 
 ## Validation Audit 2026-11-03
 
