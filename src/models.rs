@@ -52,9 +52,11 @@ pub struct NamedEntity {
     pub kind: String, // "DATE", "PERSON", "ORGANIZATION", etc.
 }
 
-/// Final structured output produced by Stage 3/4.
+/// Final structured output of the news chain.
 ///
-/// Streamed to the `filimon-extracted` and `filimon-articles` Fluvio topics.
+/// The `map-extract` module produces it, `filter-relevance` keeps it or drops
+/// it, and the chain delivers it to `fili consume` from the `filimon-raw-pages`
+/// stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedArticle {
     pub url: String,
@@ -90,5 +92,175 @@ impl PipelineStats {
         } else {
             self.articles_accepted as f64 / self.articles_extracted as f64
         }
+    }
+}
+
+// ── Unified Envelope ──────────────────────────────────────────────────────────
+
+/// Which kind of source produced an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceType {
+    News,
+    Social,
+}
+
+/// The unified envelope for every item that enters the pipeline.
+///
+/// Its fields line up with the WIT `item` record in `wit/types.wit`, plus
+/// `source_type` and the news-only `html`. News items travel on the
+/// `filimon-raw-pages` Fluvio topic, where the chain modules read them as
+/// `RawPage { url, html }` and ignores the other fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceItem {
+    pub source_type: SourceType,
+    pub platform: String,
+    pub id: String,
+    pub url: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Publication time as RFC 3339 (UTC).
+    #[serde(default)]
+    pub published: Option<String>,
+    /// Platform metadata as a JSON document.
+    #[serde(default)]
+    pub raw: Option<serde_json::Value>,
+    /// Page HTML, news only. It is skipped when None, because a null html
+    /// halts map-preprocess: its `RawPage.html` is a `String`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+}
+
+impl SourceItem {
+    /// Build a news item from a fetched page. `html` is always set.
+    pub fn news(url: String, html: String) -> Self {
+        Self {
+            source_type: SourceType::News,
+            platform: platform_from_url(&url),
+            id: url.clone(),
+            url,
+            title: None,
+            text: String::new(),
+            author: None,
+            published: None,
+            raw: None,
+            html: Some(html),
+        }
+    }
+}
+
+/// Short platform name for a URL: the host without one leading `www.`.
+///
+/// File URLs, hostless URLs and unparsable URLs give `local`.
+pub fn platform_from_url(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return "local".to_string();
+    };
+    if parsed.scheme() == "file" {
+        return "local".to_string();
+    }
+    match parsed.host_str() {
+        Some(host) => host.strip_prefix("www.").unwrap_or(host).to_string(),
+        None => "local".to_string(),
+    }
+}
+
+// ── Output Record ─────────────────────────────────────────────────────────────
+
+/// News-only metadata from the `map-extract` module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArticleMeta {
+    pub relevance_score: f64,
+    pub top_keywords: Vec<String>,
+    pub inferred_category: String,
+    pub word_count: usize,
+    /// The date string exactly as map-extract found it.
+    pub published_raw: Option<String>,
+}
+
+/// One record of the consumer's JSON output.
+///
+/// It deliberately has no html field, so page HTML cannot reach the output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputRecord {
+    pub source_type: SourceType,
+    pub platform: String,
+    pub id: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub text: String,
+    pub author: Option<String>,
+    /// Publication time as RFC 3339 (UTC), or null.
+    pub published: Option<String>,
+    pub raw: Option<serde_json::Value>,
+    pub entities: Vec<NamedEntity>,
+    /// Some for news, None for social.
+    pub article: Option<ArticleMeta>,
+}
+
+impl OutputRecord {
+    /// Map an article from the news chain to an output record.
+    pub fn from_article(a: ExtractedArticle) -> Self {
+        Self {
+            source_type: SourceType::News,
+            platform: platform_from_url(&a.url),
+            id: a.url.clone(),
+            url: a.url,
+            title: Some(a.title),
+            text: a.body_preview,
+            author: a.author,
+            published: None,
+            raw: None,
+            entities: a.named_entities,
+            article: Some(ArticleMeta {
+                relevance_score: a.relevance_score,
+                top_keywords: a.top_keywords,
+                inferred_category: a.inferred_category,
+                word_count: a.word_count,
+                published_raw: a.published_date,
+            }),
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors the `RawPage` struct the chain modules deserialize.
+    #[derive(Debug, Deserialize)]
+    struct SmRawPage {
+        url: String,
+        html: String,
+    }
+
+    #[test]
+    fn news_item_is_rawpage_compatible() {
+        let item = SourceItem::news(
+            "https://example.com/news".to_string(),
+            "<p>hello</p>".to_string(),
+        );
+        let json = serde_json::to_string(&item).unwrap();
+        let page: SmRawPage = serde_json::from_str(&json).unwrap();
+        assert_eq!(page.url, "https://example.com/news");
+        assert_eq!(page.html, "<p>hello</p>");
+
+        // An empty file still gives a string html, never null.
+        let empty = SourceItem::news("file://a.html".to_string(), String::new());
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(json.contains(r#""html":"""#), "{json}");
+        assert!(!json.contains(r#""html":null"#), "{json}");
+
+        // An item without html has no html key at all.
+        let mut no_html = item;
+        no_html.html = None;
+        let value = serde_json::to_value(&no_html).unwrap();
+        assert!(value.as_object().unwrap().get("html").is_none(), "{value}");
     }
 }
