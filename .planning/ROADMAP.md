@@ -32,12 +32,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. A stub source crate and a stub fetcher crate each generate bindings from the WIT package alone (via `cargo component`) and compile to a valid component for their world.
   3. A sample `filimon.toml` registry that points to per-plugin TOML files (subreddits or channels, interval, allowlist) loads into typed config. Each plugin's resolved secrets contain only the `.env` keys its own TOML names.
   4. A missing plugin TOML file, malformed TOML, or missing `.env` secret produces an error that names both the plugin and the field or key at fault.
-**Plans:** 4 plans
+**Plans:** 2/4 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 01-01-PLAN.md — WIT package `filimon:plugin@0.1.0` (source + fetcher worlds) and stub source/fetcher components built with `cargo component`, checked with `wasm-tools component targets` (WIT-01, WIT-02)
-- [ ] 01-02-PLAN.md — `src/plugins/` config loader: registry → plugin TOML → `.env` secrets into typed `LoadedRegistry`, with per-plugin secret isolation and redaction (CONF-01, CONF-02)
+- [x] 01-01-PLAN.md — WIT package `filimon:plugin@0.1.0` (source + fetcher worlds) and stub source/fetcher components built with `cargo component`, checked with `wasm-tools component targets` (WIT-01, WIT-02)
+- [x] 01-02-PLAN.md — `src/plugins/` config loader: registry → plugin TOML → `.env` secrets into typed `LoadedRegistry`, with per-plugin secret isolation and redaction (CONF-01, CONF-02)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 01-03-PLAN.md — Collect-all miette diagnostics naming plugin + field/key for every config problem (CONF-03)
@@ -129,7 +129,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Plugin Contract & Configuration | 0/4 | Planned | - |
+| 1. Plugin Contract & Configuration | 2/4 | In Progress | - |
 | 2. SourceItem Pipeline | 0/TBD | Not started | - |
 | 3. Component Host Runtime | 0/TBD | Not started | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
