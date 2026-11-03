@@ -5,6 +5,7 @@
 // topics as JSON-encoded messages.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -171,8 +172,6 @@ impl SourceItem {
         platform: String,
         raw: Option<String>,
     ) -> Self {
-        // RED stub: published and raw are not converted yet.
-        let _ = (published_ms, raw);
         Self {
             source_type: SourceType::Social,
             platform,
@@ -181,25 +180,45 @@ impl SourceItem {
             title,
             text,
             author,
-            published: None,
-            raw: None,
+            published: published_ms.and_then(epoch_ms_to_rfc3339),
+            raw: raw.map(|s| {
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+            }),
             html: None,
         }
     }
 }
 
 /// Convert WIT epoch milliseconds to RFC 3339 UTC with millisecond precision.
+///
+/// Values outside chrono's range give None.
 pub fn epoch_ms_to_rfc3339(ms: u64) -> Option<String> {
-    // RED stub.
-    let _ = ms;
-    None
+    let ms = i64::try_from(ms).ok()?;
+    DateTime::<Utc>::from_timestamp_millis(ms)
+        .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 /// Best-effort parse of a news date string to RFC 3339 UTC.
+///
+/// Accepts RFC 3339, RFC 2822, offset-less `YYYY-MM-DDTHH:MM:SS` (read as
+/// UTC) and date-only `YYYY-MM-DD` (midnight UTC). Anything else gives None.
 pub fn parse_news_published(raw: Option<&str>) -> Option<String> {
-    // RED stub.
-    let _ = raw;
-    None
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let utc = if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        d.with_timezone(&Utc)
+    } else if let Ok(d) = DateTime::parse_from_rfc2822(s) {
+        d.with_timezone(&Utc)
+    } else if let Ok(n) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        n.and_utc()
+    } else if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        d.and_hms_opt(0, 0, 0)?.and_utc()
+    } else {
+        return None;
+    };
+    Some(utc.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 /// Short platform name for a URL: the host without one leading `www.`.
@@ -262,7 +281,7 @@ impl OutputRecord {
             title: Some(a.title),
             text: a.body_preview,
             author: a.author,
-            published: None,
+            published: parse_news_published(a.published_date.as_deref()),
             raw: None,
             entities: a.named_entities,
             article: Some(ArticleMeta {

@@ -940,6 +940,7 @@ dependencies = [
 name = "filimon"
 version = "0.3.0"
 dependencies = [
+ "chrono",
  "clap",
  "fluvio",
  "futures-util",
