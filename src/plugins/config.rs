@@ -36,18 +36,6 @@ fn default_timeout_secs() -> NonZeroU64 {
     DEFAULT_TIMEOUT_SECS
 }
 
-fn default_backoff_initial_secs() -> NonZeroU64 {
-    DEFAULT_BACKOFF_INITIAL_SECS
-}
-
-fn default_backoff_max_secs() -> NonZeroU64 {
-    DEFAULT_BACKOFF_MAX_SECS
-}
-
-fn default_backoff_multiplier() -> f64 {
-    DEFAULT_BACKOFF_MULTIPLIER
-}
-
 // ── File Shapes (private) ─────────────────────────────────────────────────────
 
 /// `filimon.toml`: every plugin, by kind and name.
@@ -105,25 +93,33 @@ struct HostSection {
     secrets: BTreeMap<String, toml::Spanned<String>>,
 }
 
-/// The `[host.backoff]` table.
-#[derive(Debug, Deserialize)]
+/// The `[host.backoff]` table. Each value keeps its span when it is given, so
+/// a range diagnostic can label it; an absent value takes its default.
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackoffSection {
-    #[serde(default = "default_backoff_initial_secs")]
-    initial_secs: NonZeroU64,
-    #[serde(default = "default_backoff_max_secs")]
-    max_secs: NonZeroU64,
-    #[serde(default = "default_backoff_multiplier")]
-    multiplier: f64,
+    initial_secs: Option<toml::Spanned<NonZeroU64>>,
+    max_secs: Option<toml::Spanned<NonZeroU64>>,
+    multiplier: Option<toml::Spanned<f64>>,
 }
 
-impl Default for BackoffSection {
-    fn default() -> Self {
-        Self {
-            initial_secs: DEFAULT_BACKOFF_INITIAL_SECS,
-            max_secs: DEFAULT_BACKOFF_MAX_SECS,
-            multiplier: DEFAULT_BACKOFF_MULTIPLIER,
-        }
+impl BackoffSection {
+    fn initial(&self) -> NonZeroU64 {
+        self.initial_secs
+            .as_ref()
+            .map_or(DEFAULT_BACKOFF_INITIAL_SECS, |v| *v.get_ref())
+    }
+
+    fn max(&self) -> NonZeroU64 {
+        self.max_secs
+            .as_ref()
+            .map_or(DEFAULT_BACKOFF_MAX_SECS, |v| *v.get_ref())
+    }
+
+    fn multiplier(&self) -> f64 {
+        self.multiplier
+            .as_ref()
+            .map_or(DEFAULT_BACKOFF_MULTIPLIER, |v| *v.get_ref())
     }
 }
 
@@ -240,7 +236,7 @@ pub fn load_registry_with_env(
     let mut source_problems: BTreeMap<&str, Vec<ConfigError>> = BTreeMap::new();
 
     // Pass 1: check each enabled source's fetcher reference, then read and
-    // type-check its plugin file.
+    // type-check its plugin file and range-check its [host] values.
     let mut parsed: BTreeMap<&str, ParsedPlugin> = BTreeMap::new();
     for (name, entry) in loadable(&registry.sources).filter(|(_, entry)| entry.enabled) {
         let bucket = source_problems.entry(name).or_default();
@@ -249,7 +245,8 @@ pub fn load_registry_with_env(
         }
         let config_path = base_dir.join(entry.config.get_ref());
         match read_plugin(name, entry, &config_path, registry_src) {
-            Ok(plugin) => {
+            Ok(mut plugin) => {
+                bucket.append(&mut plugin.invalid);
                 parsed.insert(name, plugin);
             }
             Err(problem) => bucket.push(problem),
@@ -476,6 +473,8 @@ struct ParsedPlugin {
     host: HostConfig,
     settings_toml: String,
     aliases: BTreeMap<String, toml::Spanned<String>>,
+    /// `[host]` values that parsed but are out of range.
+    invalid: Vec<ConfigError>,
 }
 
 /// Reads one plugin file once and builds its typed values and its diagnostic
@@ -518,6 +517,8 @@ fn read_plugin(
             .map_err(|e| malformed(format!("cannot re-serialise [settings]: {e}"), None))?
     };
 
+    let invalid = host_problems(name, &display, &text, &file.host);
+
     let HostSection {
         poll_interval_secs,
         timeout_secs,
@@ -533,9 +534,9 @@ fn read_plugin(
             .map(toml::Spanned::into_inner)
             .collect(),
         backoff: BackoffConfig {
-            initial: Duration::from_secs(backoff.initial_secs.get()),
-            max: Duration::from_secs(backoff.max_secs.get()),
-            multiplier: backoff.multiplier,
+            initial: Duration::from_secs(backoff.initial().get()),
+            max: Duration::from_secs(backoff.max().get()),
+            multiplier: backoff.multiplier(),
         },
     };
 
@@ -545,7 +546,66 @@ fn read_plugin(
         host,
         settings_toml,
         aliases: secrets,
+        invalid,
     })
+}
+
+/// Range checks on a parsed `[host]` table, in a fixed order: allowlist
+/// entries by index, then the backoff multiplier, then `max_secs`.
+fn host_problems(plugin: &str, path: &str, text: &str, host: &HostSection) -> Vec<ConfigError> {
+    let invalid =
+        |field: String, message: String, span: Option<SourceSpan>| ConfigError::InvalidValue {
+            plugin: plugin.to_string(),
+            path: path.to_string(),
+            field,
+            message,
+            src: NamedSource::new(path, text.to_string()),
+            span,
+        };
+    let mut problems = Vec::new();
+
+    // Phase 5 matches request hosts against these entries, so anything with a
+    // scheme, port, path or other non-host text would never match as written.
+    for (index, entry) in host.allowlist.iter().enumerate() {
+        if url::Host::parse(entry.get_ref()).is_err() {
+            problems.push(invalid(
+                format!("host.allowlist[{index}]"),
+                format!(
+                    "`{}` is not a bare host name such as `api.example.com` (no scheme, port or path)",
+                    entry.get_ref()
+                ),
+                Some(entry.span().into()),
+            ));
+        }
+    }
+
+    let backoff = &host.backoff;
+    let multiplier = backoff.multiplier();
+    if !(multiplier.is_finite() && multiplier >= 1.0) {
+        problems.push(invalid(
+            "host.backoff.multiplier".to_string(),
+            "must be a finite number >= 1.0".to_string(),
+            backoff.multiplier.as_ref().map(|v| v.span().into()),
+        ));
+    }
+
+    let initial = backoff.initial();
+    if backoff.max() < initial {
+        // Label `max_secs` when given; otherwise the default max is exceeded
+        // by an explicit `initial_secs`, so label that instead.
+        let span = backoff
+            .max_secs
+            .as_ref()
+            .or(backoff.initial_secs.as_ref())
+            .map(|v| v.span().into());
+        problems.push(invalid(
+            "host.backoff.max_secs".to_string(),
+            format!("must be >= initial_secs ({initial})"),
+            span,
+        ));
+    }
+
+    problems
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1250,7 +1310,11 @@ fetcher = "nope"
         );
         assert_contains(
             &render(&errors),
-            &["host.allowlist[1]", "https://www.reddit.com/r", "alpha.toml"],
+            &[
+                "host.allowlist[1]",
+                "https://www.reddit.com/r",
+                "alpha.toml",
+            ],
         );
     }
 
