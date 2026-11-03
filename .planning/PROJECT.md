@@ -1,0 +1,99 @@
+# filimon (`fili`)
+
+## What This Is
+
+filimon is a Rust, streaming-first semantic news crawler: pages flow through Fluvio topics, get processed by WISE-framework SmartModules (preprocess → extract → relevance filter), and are enriched with zero-shot NER (GLiNER) into JSON output. This milestone adds a **WASM/WIT plugin system** so social platforms (Reddit and YouTube first; X and others later) can stream posts into the same pipeline as additional sources — producing the same enriched output as news articles.
+
+## Core Value
+
+A user-supplied WASM component, written only against filimon's published WIT contract and listed in the registry, can stream items from a social platform into Fluvio and come out the other end as enriched records alongside news articles.
+
+## Requirements
+
+### Validated
+
+<!-- Inferred from existing code (see .planning/codebase/). -->
+
+- ✓ CLI (`fili`) with clap-based subcommands dispatching to `src/commands/` — existing
+- ✓ HTTP crawler fetches pages, extracts and prioritises links, and produces `RawPage` records to Fluvio — existing
+- ✓ Local HTML files can be produced to Fluvio (`fili file <paths>`) — existing
+- ✓ Typed Fluvio producer/consumer layer over JSON records (`src/streaming.rs`) — existing
+- ✓ WISE pipeline as chained SmartModules: `map-preprocess` → `map-extract` → `filter-relevance` (threshold 0.05) — existing
+- ✓ Consumer reads `articles` topic, optionally enriches with GLiNER NER (batch/`--limit` mode), writes JSON — existing
+
+### Active
+
+- [ ] WIT package defining the source-plugin contract (plugin exports init/poll; host imports fetch, logging, config/secret access)
+- [ ] Plugin host in `fili` built on the WASM component model, loading `.wasm` components listed in an explicit registry (`filimon.toml`)
+- [ ] Host-provided HTTP fetch import with per-plugin domain allowlist, timeouts, and rate limiting
+- [ ] Host-driven polling: host calls `poll(cursor)` on a schedule, persists the returned cursor, produces items to Fluvio
+- [ ] Per-plugin TOML settings file (e.g. subreddits, channels, queries); API keys loaded from `.env` and passed to the plugin by the host
+- [ ] Generic host-managed OAuth (PKCE + local callback): `fili auth login <plugin>`, token storage and refresh on the host; plugin TOML declares endpoints/scopes; plugin receives only access tokens via WIT
+- [ ] Unified `SourceItem` envelope covering news pages and social posts; each source type routed to an appropriate SmartModule chain; all paths converge on the same NER-enriched JSON output
+- [ ] Reference Reddit plugin (official Reddit API) as a separately built `.wasm` component
+- [ ] Reference YouTube plugin (official YouTube Data API) as a separately built `.wasm` component
+- [ ] Fixture-based tests per plugin (recorded API responses; runs in CI without network or keys)
+- [ ] Live end-to-end run: `fili` loads Reddit + YouTube plugins, polls real APIs, records flow through Fluvio, enriched JSON is produced alongside news articles
+
+### Out of Scope
+
+- X (Twitter) plugin — deferred: X API read access is gated by the developer app's paid tier, and user login does not bypass it; revisit once access is sorted (user decision)
+- Scraping / unofficial endpoints / session-cookie access — official APIs only (user decision; ToS risk)
+- Fixing existing `fluvio-wise` gaps (watch mode not producing, silent record drops in streaming layer, NER only in batch mode, dead commented code in `main.rs`) — explicitly not this milestone (user decision)
+- Auto-discovering plugins from a directory — explicit registry only (user decision)
+- Native dynamic libraries / external-process plugins — WASM components with WIT only (user decision)
+- Plugin-driven push loops — host polls; plugins are stateless (user decision)
+
+## Context
+
+- Brownfield Rust 2024 crate (v0.3.0, rust-version 1.85) with a Cargo workspace including three SmartModule crates under `smartmodules/`. Codebase map in `.planning/codebase/` (ARCHITECTURE, STACK, CONCERNS, etc.).
+- Fluvio 0.50 SDK; SmartModules are WASM themselves (compiled with SMDK, Rust 1.85 pinned for SmartModule builds). Plugin components are a *different* WASM use: host-side components loaded by `fili`, not SmartModules running in the Fluvio cluster.
+- The Fluvio integration work lives on branch `fluvio-wise` and is currently uncommitted (`src/commands/`, `src/streaming.rs`, `src/config.rs`, `smartmodules/`). Plugin work builds on top of it.
+- Current input record is `RawPage { url, html }`; social posts are short, already-structured items, which is why a unified `SourceItem` envelope is needed rather than forcing posts into HTML.
+- GLiNER NER runs consumer-side (ONNX model too large for WASM).
+- `fluvio/` in the workspace root is a separate git checkout of the upstream Fluvio repo (reference only).
+- Known concerns relevant to this work (from CONCERNS.md): streaming layer silently drops deserialization errors; HTTP client in crawler is rebuilt per request; crawler disables TLS cert validation (sandbox-only) — the new host fetch must NOT inherit that.
+- Motivation: social posts are additional sources feeding the same output — not a separate analytics product.
+
+## Constraints
+
+- **Plugin technology**: WASM component model + WIT — user decision; plugins must be buildable outside the filimon repo from the published WIT alone.
+- **Network access**: plugins have no direct network; all HTTP goes through the host fetch import — enables allowlists, rate limits, timeouts.
+- **Secrets**: API keys live in `.env`; per-plugin settings in a per-plugin TOML file; OAuth refresh tokens never cross into the plugin.
+- **Data sources**: official platform APIs only.
+- **Tech stack**: Rust (existing crate), Fluvio 0.50, existing SmartModule toolchain (Rust 1.85 for SmartModules).
+- **Verification**: every plugin must be testable offline via recorded fixtures; milestone completion requires one live end-to-end run with real Reddit and YouTube APIs.
+
+## Key Decisions
+
+| Decision | Rationale | Outcome |
+|----------|-----------|---------|
+| WASM components with WIT for plugins | Sandboxed, language-agnostic, third parties can supply plugins without rebuilding `fili` | — Pending |
+| Host-provided fetch import (not WASI HTTP) | Host enforces domain allowlist, rate limits, timeouts; plugins stay simple | — Pending |
+| Host polls plugins; host owns cursor | Plugins stay stateless; scheduling, persistence and backpressure in one place | — Pending |
+| Explicit registry (`filimon.toml`) | Nothing runs unless listed; predictable and auditable | — Pending |
+| Keys in `.env`, settings in per-plugin TOML | Separates secrets from shareable config | — Pending |
+| Generic host-managed OAuth (PKCE) | Written once, reused by any plugin; refresh tokens stay on host | — Pending |
+| Unified `SourceItem` envelope, per-type SmartModule chains | Social posts aren't HTML; still converge on same enriched output | — Pending |
+| Ship Reddit + YouTube; defer X | X read access requires paid app tier regardless of user login | — Pending |
+| Leave existing `fluvio-wise` gaps alone | Keep milestone focused on plugin system | — Pending |
+
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd-complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
+
+---
+*Last updated: 2026-11-03 after initialization*
