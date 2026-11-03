@@ -100,13 +100,16 @@ mod tests {
 
     #[test]
     fn registry_flag_defaults_to_filimon_toml() {
-        // An operator's FILI_REGISTRY would legitimately override the default;
-        // read it only, never write it, so the process env is left untouched.
-        if std::env::var_os("FILI_REGISTRY").is_some() {
-            return;
-        }
-        let cli = Cli::try_parse_from(["fili", "watch"]).expect("parses");
-        assert_eq!(cli.registry, PathBuf::from("filimon.toml"));
+        // The default is asserted on argument metadata, so an operator's FILI_REGISTRY cannot skip the check.
+        let command = Cli::command();
+        let registry = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "registry")
+            .expect("registry argument exists");
+        let defaults = registry.get_default_values();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0], DEFAULT_REGISTRY);
+        assert_eq!(defaults[0], "filimon.toml");
     }
 
     #[test]
