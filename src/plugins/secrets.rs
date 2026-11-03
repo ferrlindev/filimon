@@ -354,6 +354,136 @@ mod tests {
         assert_eq!(values.get("R").map(String::as_str), Some("pa$$word"));
     }
 
+    /// Every accepted example from the `.env` format (F1-F7), plus comment
+    /// and blank lines that must yield no keys.
+    const ACCEPTED_FORMS: &str = r##"# comment with $HOME, 'single' and "double" quotes
+
+PLAIN=abc123
+export EXPORTED=v
+SPACED = v
+EMPTY=
+EMPTY_SQ=''
+EMPTY_DQ=""
+EMPTY_COMMENT= # note
+SQ='pa$$word \ "x" # y'
+DQ="a b # c"
+PADDED='  a  '
+HASH_INSIDE=a#b
+TRAILING=abc # c
+QUOTED_TRAILING='abc' # c
+UNICODE=bücher
+DOTTED.KEY=v
+lower_case=v
+"##;
+
+    #[test]
+    fn dotenv_accepts_documented_forms() {
+        // A decomposed `u` + combining diaeresis must survive unnormalised.
+        let text = format!("{ACCEPTED_FORMS}DECOMPOSED='bu\u{308}cher'\n");
+
+        let values = read_text(&text).expect("every documented form is accepted");
+
+        let expected: HashMap<String, String> = [
+            ("PLAIN", "abc123"),
+            ("EXPORTED", "v"),
+            ("SPACED", "v"),
+            ("EMPTY", ""),
+            ("EMPTY_SQ", ""),
+            ("EMPTY_DQ", ""),
+            ("EMPTY_COMMENT", ""),
+            ("SQ", r#"pa$$word \ "x" # y"#),
+            ("DQ", "a b # c"),
+            ("PADDED", "  a  "),
+            ("HASH_INSIDE", "a#b"),
+            ("TRAILING", "abc"),
+            ("QUOTED_TRAILING", "abc"),
+            ("UNICODE", "b\u{fc}cher"),
+            ("DOTTED.KEY", "v"),
+            ("lower_case", "v"),
+            ("DECOMPOSED", "bu\u{308}cher"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn dotenv_accepts_crlf_and_bom() {
+        let values = read_text("A=1\r\nB='x y'\r\n").expect("CRLF lines parse");
+        assert_eq!(values.len(), 2, "{values:?}");
+        assert_eq!(values.get("A").map(String::as_str), Some("1"));
+        assert_eq!(values.get("B").map(String::as_str), Some("x y"));
+
+        let values = read_text("\u{feff}A=1\n").expect("a leading BOM is skipped");
+        assert_eq!(values.keys().map(String::as_str).collect::<Vec<_>>(), ["A"]);
+    }
+
+    #[test]
+    fn dotenv_rejects_ambiguous_forms() {
+        let cases = [
+            ("K=SECRETx$y", DOLLAR),
+            ("K=\"SECRETx${Y}\"", DOLLAR),
+            ("K=SECRETx\\y", BACKSLASH),
+            ("K=\"SECRETx\\ny\"", BACKSLASH),
+            ("K=SECRETx'y'", QUOTE_IN_UNQUOTED),
+            ("K=#SECRETx", LEADING_HASH),
+            ("K=SECRETx y", TRAILING_TEXT),
+            ("K='SECRETx'y", TRAILING_TEXT),
+            ("K='SECRETx'#y", TRAILING_TEXT),
+            ("K='SECRETx", UNTERMINATED),
+            ("K=\"SECRETx", UNTERMINATED),
+            ("1K=SECRETx", NOT_ASSIGNMENT),
+            ("SECRETx", NOT_ASSIGNMENT),
+        ];
+        for (case, expected) in cases {
+            let problems = read_text(&format!("OK=1\n{case}\n")).expect_err(case);
+
+            assert_eq!(problems.len(), 1, "{case}: {problems:?}");
+            let ConfigError::DotenvInvalid { line, reason, .. } = &problems[0] else {
+                panic!("{case}: expected DotenvInvalid, got {:?}", problems[0]);
+            };
+            assert_eq!(*line, Some(2), "{case}");
+            assert_eq!(reason, expected, "{case}");
+            assert_omits(&problems[0], "SECRETx");
+        }
+    }
+
+    #[test]
+    fn dotenv_duplicate_key_is_rejected() {
+        let problems = read_text("A=first-SECRET\nB=2\nA=second-SECRET\n")
+            .expect_err("a repeated key is rejected");
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let ConfigError::DotenvInvalid { line, reason, .. } = &problems[0] else {
+            panic!("expected DotenvInvalid, got {:?}", problems[0]);
+        };
+        assert_eq!(*line, Some(3));
+        assert!(reason.contains("`A`"), "{reason}");
+        assert!(reason.contains("line 1"), "{reason}");
+        assert_omits(&problems[0], "first-SECRET");
+        assert_omits(&problems[0], "second-SECRET");
+    }
+
+    #[test]
+    fn dotenv_reports_every_bad_line_in_order() {
+        let problems =
+            read_text("A=1\nB=x y\nC=2\nD=$X\nE=3\n").expect_err("two lines are rejected");
+
+        assert_eq!(
+            problems.iter().map(dotenv_line).collect::<Vec<_>>(),
+            [Some(2), Some(4)]
+        );
+    }
+
+    #[test]
+    fn dotenv_line_number_is_counted() {
+        // The bad line's text also appears in the line-1 comment.
+        let problems = read_text("# x y\nGOOD=1\nBAD=x y\n").expect_err("line 3 is rejected");
+
+        assert_eq!(problems.iter().map(dotenv_line).collect::<Vec<_>>(), [Some(3)]);
+    }
+
     #[test]
     fn secrets_iterate_in_alias_order() {
         let plugin_text = "zeta = \"Z_VAR\"\nalpha = \"A_VAR\"\nmid = \"M_VAR\"\n";

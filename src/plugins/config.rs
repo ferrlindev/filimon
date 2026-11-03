@@ -887,11 +887,12 @@ config = "beta.toml"
 
         let errors = load(&dir).expect_err("a malformed .env is an error");
 
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
         assert!(
-            errors
-                .problems
-                .iter()
-                .any(|problem| matches!(problem, ConfigError::DotenvInvalid { line: Some(2), .. })),
+            matches!(
+                &errors.problems[0],
+                ConfigError::DotenvInvalid { line: Some(2), .. }
+            ),
             "{errors:?}"
         );
         for problem in &errors.problems {
@@ -921,6 +922,7 @@ config = "beta.toml"
 
         let errors = load(&dir).expect_err("an unquoted `$` is rejected");
 
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
         assert!(
             errors.problems.iter().any(|problem| matches!(
                 problem,
@@ -1512,5 +1514,80 @@ fetcher = "nope"
             assert!(!report.contains(value), "leaked {value:?} in:\n{report}");
             assert!(!format!("{errors:?}").contains(value), "leaked {value:?}");
         }
+    }
+
+    #[test]
+    fn unusable_dotenv_suppresses_missing_secret() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\nkey = \"ALPHA_KEY\"\nenvtok = \"ALPHA_ENV\"\n",
+        );
+        write(&dir, ".env", "ALPHA_TOKEN=ok\nALPHA_KEY=bad value\n");
+        let env = |key: &str| (key == "ALPHA_ENV").then(|| "from-env".to_string());
+
+        let errors = load_registry_with_env(&dir.path().join("filimon.toml"), &env)
+            .expect_err("an unusable .env is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DotenvInvalid { line: Some(2), .. }
+            ),
+            "{errors:?}"
+        );
+        assert!(
+            !errors
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, ConfigError::MissingSecret { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn dotenv_problems_keep_line_order() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources."Bad Name"]
+component = "bad.wasm"
+config = "bad.toml"
+
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+"#,
+        );
+        write(
+            &dir,
+            "alpha.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\n",
+        );
+        write(&dir, ".env", "ALPHA_TOKEN=x\nB=x y\nC=1\nD=\"$X\"\n");
+
+        let first = load(&dir).expect_err("a broken .env fails closed");
+        let second = load(&dir).expect_err("a broken .env fails closed");
+
+        let order = |errors: &ConfigErrors| format!("{:?}", errors.problems);
+        assert_eq!(order(&first), order(&second), "problem order is stable");
+
+        let problems = &first.problems;
+        assert_eq!(problems.len(), 3, "{first:?}");
+        assert!(
+            matches!(&problems[0], ConfigError::InvalidName { plugin, .. } if plugin == "Bad Name"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[1], ConfigError::DotenvInvalid { line: Some(2), .. }),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[2], ConfigError::DotenvInvalid { line: Some(4), .. }),
+            "{first:?}"
+        );
     }
 }
