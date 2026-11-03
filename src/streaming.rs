@@ -2,23 +2,31 @@
 // streaming.rs - Fluvio Streaming Integration
 //
 // This module provides the streaming infrastructure for the WISE pipeline,
-// using Fluvio as the message broker. Records flow through topics:
+// using Fluvio as the message broker.
 //
-//   raw-pages   → crawled HTML pages (producer output)
-//   articles    → final processed articles (SmartModule output)
+//   filimon-raw-pages → news `SourceItem`s (from `fili file` and `fili produce`)
 //
-// Processing is handled by SmartModules in the Fluvio cluster:
+// `fili consume` attaches the three-SmartModule chain to its own
+// `filimon-raw-pages` stream, so the cluster runs, in order:
 //   - map-preprocess: tokenization and text extraction
 //   - map-extract: article extraction and relevance scoring
 //   - filter-relevance: filter low-relevance articles
 // ─────────────────────────────────────────────────────────────────────────────
 
-use fluvio::{Fluvio, Offset, RecordKey, TopicProducerConfigBuilder};
+use fluvio::consumer::{ConsumerConfigExt, Record, RetryMode};
+use fluvio::dataplane::link::ErrorCode;
+use fluvio::metadata::smartmodule::SmartModuleSpec;
 use fluvio::metadata::topic::TopicSpec;
 use fluvio::spu::SpuSocketPool;
-use futures_util::StreamExt;
+use fluvio::{
+    Fluvio, Offset, RecordKey, SmartModuleContextData, SmartModuleExtraParams,
+    SmartModuleInvocation, SmartModuleInvocationWasm, SmartModuleKind,
+    TopicProducerConfigBuilder,
+};
+use futures_util::{Stream, StreamExt};
 use miette::Result;
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -26,7 +34,30 @@ use tracing::{error, info, warn};
 // ── Topic Names ───────────────────────────────────────────────────────────────
 
 pub const TOPIC_RAW_PAGES: &str = "filimon-raw-pages";
-pub const TOPIC_ARTICLES: &str = "filimon-articles";
+
+// ── News SmartModule Chain ────────────────────────────────────────────────────
+
+/// The news chain, in order. It must equal the `uses:` lines of
+/// `transforms.yaml`.
+pub const NEWS_CHAIN: [&str; 3] = [
+    "filimon/map-preprocess@0.1.0",
+    "filimon/map-extract@0.1.0",
+    "filimon/filter-relevance@0.1.0",
+];
+
+/// Build the `SmartModuleInvocation`s for the news chain.
+pub fn news_chain() -> Vec<SmartModuleInvocation> {
+    let name = NEWS_CHAIN.join(",");
+    NEWS_CHAIN
+        .iter()
+        .map(|uses| SmartModuleInvocation {
+            wasm: SmartModuleInvocationWasm::Predefined((*uses).to_string()),
+            kind: SmartModuleKind::Generic(SmartModuleContextData::default()),
+            params: SmartModuleExtraParams::new(BTreeMap::new(), None),
+            name: Some(name.clone()),
+        })
+        .collect()
+}
 
 // ── Fluvio Client Wrapper ─────────────────────────────────────────────────────
 
@@ -82,10 +113,75 @@ impl FluvioStream {
         })
     }
 
+    /// Open a stream on partition 0 of `topic` with `smartmodules` attached.
+    ///
+    /// Retries are disabled, so a failing record yields one error instead of
+    /// reconnecting at the same offset again and again.
+    pub async fn topic_stream(
+        &self,
+        topic: &str,
+        offset: Offset,
+        smartmodules: Vec<SmartModuleInvocation>,
+    ) -> Result<impl Stream<Item = std::result::Result<Record, ErrorCode>> + Unpin + use<>>
+    {
+        let config = ConsumerConfigExt::builder()
+            .topic(topic)
+            .partition(0)
+            .offset_start(offset)
+            .smartmodule(smartmodules)
+            .retry_mode(RetryMode::Disabled)
+            .build()
+            .map_err(|e| miette::miette!("Failed to build consumer config for {topic}: {e}"))?;
+
+        self.client
+            .consumer_with_config(config)
+            .await
+            .map_err(|e| miette::miette!("Failed to open {topic} stream: {e}"))
+    }
+
+    /// Check that every topic and chain module exists.
+    ///
+    /// Returns one error naming each missing item, so the operator knows
+    /// exactly what to create or load.
+    pub async fn preflight(&self, topics: &[&str], smartmodules: &[&str]) -> Result<()> {
+        let admin = self.client.admin().await;
+        let mut missing = Vec::new();
+
+        for topic in topics {
+            let found = admin
+                .list::<TopicSpec, String>(vec![(*topic).to_string()])
+                .await
+                .map_err(|e| miette::miette!("Failed to list topics: {e}"))?;
+            if !found.iter().any(|t| t.name == *topic) {
+                missing.push(format!(
+                    "Topic `{topic}` not found. Create it with: fluvio topic create {topic}"
+                ));
+            }
+        }
+
+        for fqdn in smartmodules {
+            let found = admin
+                .list::<SmartModuleSpec, String>(vec![(*fqdn).to_string()])
+                .await
+                .map_err(|e| miette::miette!("Failed to list SmartModules: {e}"))?;
+            if found.is_empty() {
+                missing.push(format!(
+                    "SmartModule `{fqdn}` is not loaded. Build and load it with smdk (see README)"
+                ));
+            }
+        }
+
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(miette::miette!("{}", missing.join("\n")))
+        }
+    }
+
     /// Ensure required topics exist.
     pub async fn ensure_topics(&self) -> Result<()> {
         let admin = self.client.admin().await;
-        let topics = [TOPIC_RAW_PAGES, TOPIC_ARTICLES];
+        let topics = [TOPIC_RAW_PAGES];
 
         for topic in topics {
             let topic_spec = TopicSpec::new_computed(1, 1, None);
@@ -250,5 +346,32 @@ impl PipelineCoordinator {
         offset: Offset,
     ) -> Result<TypedConsumer<T>> {
         self.stream.consumer(topic, offset).await
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn news_chain_matches_transforms_yaml() {
+        let yaml = include_str!("../transforms.yaml");
+        let uses: Vec<&str> = yaml
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- uses:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(uses, NEWS_CHAIN);
+
+        let chain = news_chain();
+        assert_eq!(chain.len(), 3);
+        for (invocation, expected) in chain.iter().zip(NEWS_CHAIN) {
+            match &invocation.wasm {
+                SmartModuleInvocationWasm::Predefined(name) => assert_eq!(name, expected),
+                other => panic!("expected a predefined SmartModule, got {other:?}"),
+            }
+        }
     }
 }

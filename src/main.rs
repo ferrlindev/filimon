@@ -4,15 +4,17 @@
 // Fluvio-based streaming pipeline for web content extraction.
 //
 // Modes:
-//   fili produce <URL>   Crawl URLs and produce raw pages to Fluvio
-//   fili consume         Consume processed articles from Fluvio
-//   fili stream          Run as Fluvio streaming pipeline processor
+//   fili produce <URL>   Crawl URLs and produce news SourceItems to Fluvio
+//   fili file <PATH>     Produce local HTML files as news SourceItems
+//   fili consume         Read news through the SmartModule chain and write JSON
 //   fili watch           Watch directories and produce HTML to Fluvio
 //
 // Pipeline Architecture (via SmartModules):
-//   raw-pages → [map-preprocess] → preprocessed → [map-extract] → extracted → [filter-relevance] → articles
+//   filimon-raw-pages → [map-preprocess] → [map-extract] → [filter-relevance] → fili consume
 //
-// NER is applied on the consumer side using GLiNER (too heavy for SmartModules).
+// `fili consume` attaches the chain to its own filimon-raw-pages stream and
+// writes the unified records to a JSON file. NER is applied on the consumer
+// side using GLiNER (too heavy for SmartModules).
 // ─────────────────────────────────────────────────────────────────────────────
 
 mod check;
@@ -29,7 +31,7 @@ mod streaming;
 use clap::Parser;
 use cli::{Cli, Command};
 use commands::{run_consume, run_produce, run_watch};
-use models::RawPage;
+use models::SourceItem;
 use scorer::NerEngine;
 use std::path::{Path, PathBuf};
 use streaming::{PipelineCoordinator, TOPIC_RAW_PAGES};
@@ -338,13 +340,10 @@ async fn run_file(paths: &[PathBuf]) -> miette::Result<()> {
         };
 
         let url = format!("file://{}", path.display());
-        let page = RawPage {
-            url: url.clone(),
-            html,
-        };
+        let item = SourceItem::news(url.clone(), html);
 
         let locked = producer.lock().await;
-        locked.send(&url, &page).await?;
+        locked.send(&url, &item).await?;
         println!("  → Produced to {}", TOPIC_RAW_PAGES);
         total_produced += 1;
     }
