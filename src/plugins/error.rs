@@ -60,6 +60,20 @@ pub enum ConfigError {
         span: Option<SourceSpan>,
     },
 
+    /// A plugin file parses, but a `[host]` value is out of range.
+    #[error("plugin `{plugin}` (`{path}`): `{field}`: {message}")]
+    #[diagnostic(code(fili::config::invalid_value))]
+    InvalidValue {
+        plugin: String,
+        path: String,
+        field: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("invalid value")]
+        span: Option<SourceSpan>,
+    },
+
     /// A `[host.secrets]` alias names an env var that is set nowhere.
     #[error(
         "plugin `{plugin}`: `host.secrets.{alias}` needs env var `{env_var}`, which is not set in the process environment or {dotenv}"
@@ -94,6 +108,49 @@ pub enum ConfigError {
         #[label("declared here")]
         span: SourceSpan,
     },
+
+    /// An enabled source's `fetcher` names no `[fetchers.<name>]` table.
+    #[error(
+        "`sources.{plugin}.fetcher` references fetcher `{fetcher}`, which is not defined under [fetchers]"
+    )]
+    #[diagnostic(
+        code(fili::config::unknown_fetcher),
+        help("defined fetchers: {defined}")
+    )]
+    UnknownFetcher {
+        plugin: String,
+        fetcher: String,
+        /// Comma-separated defined fetcher names, or `none`.
+        defined: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not defined under [fetchers]")]
+        span: SourceSpan,
+    },
+
+    /// An enabled source's `fetcher` names a fetcher with `enabled = false`.
+    #[error("`sources.{plugin}.fetcher` references fetcher `{fetcher}`, which is disabled")]
+    #[diagnostic(code(fili::config::disabled_fetcher))]
+    DisabledFetcher {
+        plugin: String,
+        fetcher: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this fetcher has enabled = false")]
+        span: SourceSpan,
+    },
+
+    /// A plugin name uses characters outside `[a-z0-9_-]`, or is empty.
+    #[error("`{table}.{plugin}`: plugin names may only contain a-z, 0-9, '_' and '-'")]
+    #[diagnostic(code(fili::config::invalid_name))]
+    InvalidName { plugin: String, table: String },
+
+    /// The same name appears under both `[sources]` and `[fetchers]`.
+    #[error(
+        "`{plugin}` is defined under both [sources] and [fetchers]; plugin names must be unique"
+    )]
+    #[diagnostic(code(fili::config::duplicate_name))]
+    DuplicateName { plugin: String },
 
     /// The `.env` file exists but cannot be used. Never carries line content.
     #[error(

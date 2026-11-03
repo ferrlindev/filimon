@@ -36,18 +36,6 @@ fn default_timeout_secs() -> NonZeroU64 {
     DEFAULT_TIMEOUT_SECS
 }
 
-fn default_backoff_initial_secs() -> NonZeroU64 {
-    DEFAULT_BACKOFF_INITIAL_SECS
-}
-
-fn default_backoff_max_secs() -> NonZeroU64 {
-    DEFAULT_BACKOFF_MAX_SECS
-}
-
-fn default_backoff_multiplier() -> f64 {
-    DEFAULT_BACKOFF_MULTIPLIER
-}
-
 // ── File Shapes (private) ─────────────────────────────────────────────────────
 
 /// `filimon.toml`: every plugin, by kind and name.
@@ -105,25 +93,33 @@ struct HostSection {
     secrets: BTreeMap<String, toml::Spanned<String>>,
 }
 
-/// The `[host.backoff]` table.
-#[derive(Debug, Deserialize)]
+/// The `[host.backoff]` table. Each value keeps its span when it is given, so
+/// a range diagnostic can label it; an absent value takes its default.
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackoffSection {
-    #[serde(default = "default_backoff_initial_secs")]
-    initial_secs: NonZeroU64,
-    #[serde(default = "default_backoff_max_secs")]
-    max_secs: NonZeroU64,
-    #[serde(default = "default_backoff_multiplier")]
-    multiplier: f64,
+    initial_secs: Option<toml::Spanned<NonZeroU64>>,
+    max_secs: Option<toml::Spanned<NonZeroU64>>,
+    multiplier: Option<toml::Spanned<f64>>,
 }
 
-impl Default for BackoffSection {
-    fn default() -> Self {
-        Self {
-            initial_secs: DEFAULT_BACKOFF_INITIAL_SECS,
-            max_secs: DEFAULT_BACKOFF_MAX_SECS,
-            multiplier: DEFAULT_BACKOFF_MULTIPLIER,
-        }
+impl BackoffSection {
+    fn initial(&self) -> NonZeroU64 {
+        self.initial_secs
+            .as_ref()
+            .map_or(DEFAULT_BACKOFF_INITIAL_SECS, |v| *v.get_ref())
+    }
+
+    fn max(&self) -> NonZeroU64 {
+        self.max_secs
+            .as_ref()
+            .map_or(DEFAULT_BACKOFF_MAX_SECS, |v| *v.get_ref())
+    }
+
+    fn multiplier(&self) -> f64 {
+        self.multiplier
+            .as_ref()
+            .map_or(DEFAULT_BACKOFF_MULTIPLIER, |v| *v.get_ref())
     }
 }
 
@@ -229,20 +225,31 @@ pub fn load_registry_with_env(
 
     // `Path::new("filimon.toml").parent()` is `Some("")`, which joins correctly.
     let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-    let mut problems = Vec::new();
+    let registry_src = RegistrySource {
+        name: &registry_name,
+        text: &registry_text,
+    };
 
-    // Pass 1: read and type-check each enabled source's plugin file.
+    // Problems are reported in a fixed order: registry-level problems first,
+    // then each enabled, validly named source's problems in name order.
+    let mut registry_problems = registry_level_problems(&registry);
+    let mut source_problems: BTreeMap<&str, Vec<ConfigError>> = BTreeMap::new();
+
+    // Pass 1: check each enabled source's fetcher reference, then read and
+    // type-check its plugin file and range-check its [host] values.
     let mut parsed: BTreeMap<&str, ParsedPlugin> = BTreeMap::new();
-    for (name, entry) in &registry.sources {
-        if !entry.enabled {
-            continue;
+    for (name, entry) in loadable(&registry.sources).filter(|(_, entry)| entry.enabled) {
+        let bucket = source_problems.entry(name).or_default();
+        if let Some(problem) = fetcher_problem(name, entry, &registry.fetchers, registry_src) {
+            bucket.push(problem);
         }
         let config_path = base_dir.join(entry.config.get_ref());
-        match read_plugin(name, entry, &config_path, &registry_name, &registry_text) {
-            Ok(plugin) => {
+        match read_plugin(name, entry, &config_path, registry_src) {
+            Ok(mut plugin) => {
+                bucket.append(&mut plugin.invalid);
                 parsed.insert(name, plugin);
             }
-            Err(problem) => problems.push(problem),
+            Err(problem) => bucket.push(problem),
         }
     }
 
@@ -251,7 +258,7 @@ pub fn load_registry_with_env(
     let dotenv_path = base_dir.join(".env");
     let dotenv = if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
         secrets::read_dotenv(&dotenv_path).unwrap_or_else(|problem| {
-            problems.push(problem);
+            registry_problems.push(problem);
             HashMap::new()
         })
     } else {
@@ -260,37 +267,19 @@ pub fn load_registry_with_env(
 
     // Pass 3: resolve secrets per enabled source and assemble the output.
     let mut sources = BTreeMap::new();
-    for (name, entry) in &registry.sources {
+    for (name, entry) in loadable(&registry.sources) {
         let plugin = if entry.enabled {
             // A missing entry means its plugin file problem is already recorded.
-            let Some(parsed) = parsed.remove(name.as_str()) else {
+            let Some(parsed) = parsed.remove(name) else {
                 continue;
             };
-            match secrets::resolve_secrets(
-                name,
-                &parsed.path,
-                &parsed.text,
-                &parsed.aliases,
-                &dotenv,
-                &dotenv_path,
-                env,
-            ) {
-                Ok(secrets) => {
-                    // Names only, never values: makes alias mappings auditable.
-                    let env_vars: Vec<&str> = parsed
-                        .aliases
-                        .values()
-                        .map(|v| v.get_ref().as_str())
-                        .collect();
-                    tracing::info!(plugin = %name, ?env_vars, "resolved plugin secrets");
-                    Some(PluginConfig {
-                        host: parsed.host,
-                        settings_toml: parsed.settings_toml,
-                        secrets,
-                    })
-                }
+            match finish_plugin(name, parsed, &dotenv, &dotenv_path, env) {
+                Ok(plugin) => Some(plugin),
                 Err(mut missing) => {
-                    problems.append(&mut missing);
+                    source_problems
+                        .entry(name)
+                        .or_default()
+                        .append(&mut missing);
                     continue;
                 }
             }
@@ -298,9 +287,9 @@ pub fn load_registry_with_env(
             None
         };
         sources.insert(
-            name.clone(),
+            name.to_string(),
             LoadedSource {
-                name: name.clone(),
+                name: name.to_string(),
                 component: base_dir.join(entry.component.get_ref()),
                 config_path: base_dir.join(entry.config.get_ref()),
                 enabled: entry.enabled,
@@ -312,6 +301,10 @@ pub fn load_registry_with_env(
 
     let fetchers = load_fetchers(&registry.fetchers, &base_dir);
 
+    let problems: Vec<ConfigError> = registry_problems
+        .into_iter()
+        .chain(source_problems.into_values().flatten())
+        .collect();
     if !problems.is_empty() {
         return Err(ConfigErrors { problems });
     }
@@ -320,6 +313,37 @@ pub fn load_registry_with_env(
         base_dir,
         sources,
         fetchers,
+    })
+}
+
+/// Resolves a parsed plugin's secrets and builds its `PluginConfig`.
+fn finish_plugin(
+    name: &str,
+    parsed: ParsedPlugin,
+    dotenv: &HashMap<String, String>,
+    dotenv_path: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PluginConfig, Vec<ConfigError>> {
+    let secrets = secrets::resolve_secrets(
+        name,
+        &parsed.path,
+        &parsed.text,
+        &parsed.aliases,
+        dotenv,
+        dotenv_path,
+        env,
+    )?;
+    // Names only, never values: makes alias mappings auditable.
+    let env_vars: Vec<&str> = parsed
+        .aliases
+        .values()
+        .map(|v| v.get_ref().as_str())
+        .collect();
+    tracing::info!(plugin = %name, ?env_vars, "resolved plugin secrets");
+    Ok(PluginConfig {
+        host: parsed.host,
+        settings_toml: parsed.settings_toml,
+        secrets,
     })
 }
 
@@ -340,6 +364,102 @@ fn load_fetchers(
         .collect()
 }
 
+/// The registry file's display name and text, for diagnostic snippets.
+#[derive(Clone, Copy)]
+struct RegistrySource<'a> {
+    name: &'a str,
+    text: &'a str,
+}
+
+impl RegistrySource<'_> {
+    fn named(self) -> NamedSource<String> {
+        NamedSource::new(self.name, self.text.to_string())
+    }
+}
+
+/// `true` when `name` is non-empty and uses only `[a-z0-9_-]`. Names become
+/// CLI arguments and per-plugin state keys, so nothing else is accepted.
+fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Sources whose names pass the name rule, in name order. A source with an
+/// invalid name is reported once at registry level and not loaded further.
+fn loadable(sources: &BTreeMap<String, SourceEntry>) -> impl Iterator<Item = (&str, &SourceEntry)> {
+    sources
+        .iter()
+        .filter(|(name, _)| is_valid_name(name))
+        .map(|(name, entry)| (name.as_str(), entry))
+}
+
+/// Name-rule problems across the whole registry: invalid names (sources, then
+/// fetchers, each in name order), then names used under both tables.
+fn registry_level_problems(registry: &Registry) -> Vec<ConfigError> {
+    let invalid = |table: &str, names: Vec<&String>| {
+        names
+            .into_iter()
+            .filter(|name| !is_valid_name(name))
+            .map(|name| ConfigError::InvalidName {
+                plugin: name.clone(),
+                table: table.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut problems = invalid("sources", registry.sources.keys().collect());
+    problems.extend(invalid("fetchers", registry.fetchers.keys().collect()));
+    problems.extend(
+        registry
+            .sources
+            .keys()
+            .filter(|name| registry.fetchers.contains_key(*name))
+            .map(|name| ConfigError::DuplicateName {
+                plugin: name.clone(),
+            }),
+    );
+    problems
+}
+
+/// Checks an enabled source's `fetcher` reference: it must name a fetcher
+/// defined under `[fetchers]`, and that fetcher must be enabled.
+fn fetcher_problem(
+    name: &str,
+    entry: &SourceEntry,
+    fetchers: &BTreeMap<String, FetcherEntry>,
+    registry: RegistrySource<'_>,
+) -> Option<ConfigError> {
+    let fetcher = entry.fetcher.as_ref()?;
+    match fetchers.get(fetcher.get_ref()) {
+        Some(defined) if defined.enabled => None,
+        Some(_) => Some(ConfigError::DisabledFetcher {
+            plugin: name.to_string(),
+            fetcher: fetcher.get_ref().clone(),
+            src: registry.named(),
+            span: fetcher.span().into(),
+        }),
+        None => {
+            let defined = if fetchers.is_empty() {
+                "none".to_string()
+            } else {
+                fetchers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Some(ConfigError::UnknownFetcher {
+                plugin: name.to_string(),
+                fetcher: fetcher.get_ref().clone(),
+                defined,
+                src: registry.named(),
+                span: fetcher.span().into(),
+            })
+        }
+    }
+}
+
 fn single(problem: ConfigError) -> ConfigErrors {
     ConfigErrors {
         problems: vec![problem],
@@ -353,6 +473,8 @@ struct ParsedPlugin {
     host: HostConfig,
     settings_toml: String,
     aliases: BTreeMap<String, toml::Spanned<String>>,
+    /// `[host]` values that parsed but are out of range.
+    invalid: Vec<ConfigError>,
 }
 
 /// Reads one plugin file once and builds its typed values and its diagnostic
@@ -365,8 +487,7 @@ fn read_plugin(
     name: &str,
     entry: &SourceEntry,
     config_path: &Path,
-    registry_name: &str,
-    registry_text: &str,
+    registry: RegistrySource<'_>,
 ) -> Result<ParsedPlugin, ConfigError> {
     let display = config_path.display().to_string();
     let text =
@@ -374,7 +495,7 @@ fn read_plugin(
             plugin: name.to_string(),
             path: display.clone(),
             reason: e.to_string(),
-            src: NamedSource::new(registry_name, registry_text.to_string()),
+            src: registry.named(),
             span: entry.config.span().into(),
         })?;
 
@@ -396,6 +517,8 @@ fn read_plugin(
             .map_err(|e| malformed(format!("cannot re-serialise [settings]: {e}"), None))?
     };
 
+    let invalid = host_problems(name, &display, &text, &file.host);
+
     let HostSection {
         poll_interval_secs,
         timeout_secs,
@@ -411,9 +534,9 @@ fn read_plugin(
             .map(toml::Spanned::into_inner)
             .collect(),
         backoff: BackoffConfig {
-            initial: Duration::from_secs(backoff.initial_secs.get()),
-            max: Duration::from_secs(backoff.max_secs.get()),
-            multiplier: backoff.multiplier,
+            initial: Duration::from_secs(backoff.initial().get()),
+            max: Duration::from_secs(backoff.max().get()),
+            multiplier: backoff.multiplier(),
         },
     };
 
@@ -423,7 +546,66 @@ fn read_plugin(
         host,
         settings_toml,
         aliases: secrets,
+        invalid,
     })
+}
+
+/// Range checks on a parsed `[host]` table, in a fixed order: allowlist
+/// entries by index, then the backoff multiplier, then `max_secs`.
+fn host_problems(plugin: &str, path: &str, text: &str, host: &HostSection) -> Vec<ConfigError> {
+    let invalid =
+        |field: String, message: String, span: Option<SourceSpan>| ConfigError::InvalidValue {
+            plugin: plugin.to_string(),
+            path: path.to_string(),
+            field,
+            message,
+            src: NamedSource::new(path, text.to_string()),
+            span,
+        };
+    let mut problems = Vec::new();
+
+    // Phase 5 matches request hosts against these entries, so anything with a
+    // scheme, port, path or other non-host text would never match as written.
+    for (index, entry) in host.allowlist.iter().enumerate() {
+        if url::Host::parse(entry.get_ref()).is_err() {
+            problems.push(invalid(
+                format!("host.allowlist[{index}]"),
+                format!(
+                    "`{}` is not a bare host name such as `api.example.com` (no scheme, port or path)",
+                    entry.get_ref()
+                ),
+                Some(entry.span().into()),
+            ));
+        }
+    }
+
+    let backoff = &host.backoff;
+    let multiplier = backoff.multiplier();
+    if !(multiplier.is_finite() && multiplier >= 1.0) {
+        problems.push(invalid(
+            "host.backoff.multiplier".to_string(),
+            "must be a finite number >= 1.0".to_string(),
+            backoff.multiplier.as_ref().map(|v| v.span().into()),
+        ));
+    }
+
+    let initial = backoff.initial();
+    if backoff.max() < initial {
+        // Label `max_secs` when given; otherwise the default max is exceeded
+        // by an explicit `initial_secs`, so label that instead.
+        let span = backoff
+            .max_secs
+            .as_ref()
+            .or(backoff.initial_secs.as_ref())
+            .map(|v| v.span().into());
+        problems.push(invalid(
+            "host.backoff.max_secs".to_string(),
+            format!("must be >= initial_secs ({initial})"),
+            span,
+        ));
+    }
+
+    problems
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -735,5 +917,545 @@ config = "beta.toml"
             std::env::var(KEY).is_err(),
             "{KEY} leaked into the process env"
         );
+    }
+
+    // ── Diagnostics (CONF-03) ─────────────────────────────────────────────────
+
+    /// Renders the full miette report as a terminal would show it, without
+    /// colour. The wide width stops wrapping from splitting asserted text.
+    fn render(errors: &ConfigErrors) -> String {
+        let mut out = String::new();
+        miette::GraphicalReportHandler::new_themed(miette::GraphicalTheme::unicode_nocolor())
+            .with_width(400)
+            .render_report(&mut out, errors)
+            .expect("render report");
+        out
+    }
+
+    #[test]
+    fn unknown_fetcher() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+fetcher = "htp"
+
+[fetchers.http]
+component = "http.wasm"
+"#,
+        );
+        write(&dir, "alpha.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("an unknown fetcher is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::UnknownFetcher { plugin, fetcher, .. }
+                    if plugin == "alpha" && fetcher == "htp"
+            ),
+            "{errors:?}"
+        );
+        let report = render(&errors);
+        for needle in ["sources.alpha.fetcher", "htp", "filimon.toml", "http"] {
+            assert!(report.contains(needle), "missing {needle:?} in:\n{report}");
+        }
+    }
+
+    fn assert_contains(report: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(report.contains(needle), "missing {needle:?} in:\n{report}");
+        }
+    }
+
+    // ── Registry-level diagnostics ────────────────────────────────────────────
+
+    #[test]
+    fn registry_missing() {
+        let dir = TempDir::new().expect("tempdir");
+
+        let errors = load_registry_with_env(&dir.path().join("nonexistent.toml"), &no_env)
+            .expect_err("a missing registry is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors.problems[0], ConfigError::RegistryUnreadable { .. }),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["nonexistent.toml", "FILI_REGISTRY"]);
+    }
+
+    #[test]
+    fn registry_malformed() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.alpha\ncomponent = \"a.wasm\"\n",
+        );
+
+        let errors = load(&dir).expect_err("malformed registry TOML is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::RegistryMalformed { span: Some(_), .. }
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn registry_unknown_key() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.alpha]\ncomponent = \"alpha.wasm\"\nconfg = \"x.toml\"\n",
+        );
+
+        let errors = load(&dir).expect_err("an unknown registry key is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::RegistryMalformed { message, .. } if message.contains("confg")
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_table_is_malformed() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+"#,
+        );
+
+        let errors = load(&dir).expect_err("a duplicate table is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors.problems[0], ConfigError::RegistryMalformed { .. }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn missing_plugin_file() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.alpha]\ncomponent = \"alpha.wasm\"\nconfig = \"missing.toml\"\n",
+        );
+
+        let errors = load(&dir).expect_err("a missing plugin file is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::PluginFileMissing { plugin, .. } if plugin == "alpha"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["sources.alpha.config", "missing.toml"]);
+    }
+
+    #[test]
+    fn disabled_fetcher() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+fetcher = "beta"
+
+[fetchers.beta]
+component = "beta.wasm"
+enabled = false
+"#,
+        );
+        write(&dir, "alpha.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("a disabled fetcher reference is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DisabledFetcher { plugin, fetcher, .. }
+                    if plugin == "alpha" && fetcher == "beta"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["sources.alpha.fetcher", "disabled"]);
+    }
+
+    #[test]
+    fn invalid_plugin_name() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources."Bad Name"]
+component = "bad.wasm"
+config = "bad.toml"
+
+[fetchers.UPPER]
+component = "upper.wasm"
+"#,
+        );
+
+        let errors = load(&dir).expect_err("invalid plugin names are errors");
+
+        assert_eq!(errors.problems.len(), 2, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::InvalidName { plugin, table }
+                    if plugin == "Bad Name" && table == "sources"
+            ),
+            "{errors:?}"
+        );
+        assert!(
+            matches!(
+                &errors.problems[1],
+                ConfigError::InvalidName { plugin, table }
+                    if plugin == "UPPER" && table == "fetchers"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["Bad Name", "UPPER"]);
+    }
+
+    #[test]
+    fn duplicate_plugin_name() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.shared]
+component = "shared.wasm"
+config = "shared.toml"
+
+[fetchers.shared]
+component = "shared-fetcher.wasm"
+"#,
+        );
+        write(&dir, "shared.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("a name in both tables is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DuplicateName { plugin } if plugin == "shared"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_fetcher_on_disabled_source_ignored() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.off]
+component = "off.wasm"
+config = "off.toml"
+enabled = false
+fetcher = "nope"
+"#,
+        );
+
+        load(&dir).expect("a disabled source's fetcher reference is not checked");
+    }
+
+    // ── Plugin-file diagnostics ───────────────────────────────────────────────
+
+    /// Writes a registry with one enabled source `alpha` and the given
+    /// `alpha.toml` text.
+    fn alpha_with_plugin(dir: &TempDir, plugin_text: &str) {
+        write(
+            dir,
+            "filimon.toml",
+            "[sources.alpha]\ncomponent = \"alpha.wasm\"\nconfig = \"alpha.toml\"\n",
+        );
+        write(dir, "alpha.toml", plugin_text);
+    }
+
+    /// Loads `alpha` and returns its single `PluginFileMalformed` message,
+    /// asserting the problem names the plugin.
+    fn malformed_message(dir: &TempDir) -> String {
+        let errors = load(dir).expect_err("a malformed plugin file is an error");
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::PluginFileMalformed {
+            plugin, message, ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected PluginFileMalformed, got {:?}", errors.problems[0]);
+        };
+        assert_eq!(plugin, "alpha");
+        message.clone()
+    }
+
+    /// Loads `alpha` and returns the fields of its `InvalidValue` problems.
+    fn invalid_fields(dir: &TempDir) -> Vec<String> {
+        let errors = load(dir).expect_err("an invalid host value is an error");
+        errors
+            .problems
+            .iter()
+            .map(|problem| match problem {
+                ConfigError::InvalidValue { plugin, field, .. } => {
+                    assert_eq!(plugin, "alpha");
+                    field.clone()
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn malformed_plugin_toml() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, "[host\npoll_interval_secs = 60\n");
+
+        let errors = load(&dir).expect_err("malformed plugin TOML is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::PluginFileMalformed { plugin, message, span: Some(_), .. }
+                    if plugin == "alpha" && message.contains("unclosed table")
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_host_key() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\npoll_intervall_secs = 60\n",
+        );
+
+        assert!(malformed_message(&dir).contains("poll_intervall_secs"));
+    }
+
+    #[test]
+    fn zero_poll_interval() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, "[host]\npoll_interval_secs = 0\n");
+
+        assert!(malformed_message(&dir).contains("nonzero"));
+    }
+
+    #[test]
+    fn missing_host_table() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, "[settings]\ngreeting = \"hi\"\n");
+
+        let message = malformed_message(&dir);
+        assert!(message.contains("missing field"), "{message}");
+        assert!(message.contains("host"), "{message}");
+    }
+
+    #[test]
+    fn invalid_allowlist_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\nallowlist = [\"api.example.com\", \"https://www.reddit.com/r\"]\n",
+        );
+
+        let errors = load(&dir).expect_err("a non-host allowlist entry is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::InvalidValue { plugin, field, span: Some(_), .. }
+                    if plugin == "alpha" && field == "host.allowlist[1]"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(
+            &render(&errors),
+            &[
+                "host.allowlist[1]",
+                "https://www.reddit.com/r",
+                "alpha.toml",
+            ],
+        );
+    }
+
+    #[test]
+    fn invalid_backoff() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.backoff]\nmultiplier = 0.5\n",
+        );
+        assert_eq!(invalid_fields(&dir), ["host.backoff.multiplier"]);
+
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.backoff]\ninitial_secs = 60\nmax_secs = 10\n",
+        );
+        assert_eq!(invalid_fields(&dir), ["host.backoff.max_secs"]);
+    }
+
+    #[test]
+    fn missing_secret() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.reddit]\ncomponent = \"reddit.wasm\"\nconfig = \"reddit.toml\"\n",
+        );
+        write(
+            &dir,
+            "reddit.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\nclient_id = \"REDDIT_CLIENT_ID\"\n",
+        );
+
+        let errors = load(&dir).expect_err("a missing secret is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::MissingSecret { plugin, .. } if plugin == "reddit"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(
+            &render(&errors),
+            &[
+                "host.secrets.client_id",
+                "REDDIT_CLIENT_ID",
+                "declared here",
+                "reddit.toml",
+            ],
+        );
+    }
+
+    // ── Collect-all report (D-14) ─────────────────────────────────────────────
+
+    #[test]
+    fn collects_all_problems() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources."Bad Name"]
+component = "bad.wasm"
+config = "bad.toml"
+
+[sources.alpha]
+component = "alpha.wasm"
+config = "missing.toml"
+
+[sources.beta]
+component = "beta.wasm"
+config = "beta.toml"
+
+[sources.gamma]
+component = "gamma.wasm"
+config = "gamma.toml"
+fetcher = "nope"
+"#,
+        );
+        write(&dir, "beta.toml", "[host\npoll_interval_secs = 60\n");
+        write(
+            &dir,
+            "gamma.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"GAMMA_TOKEN\"\n",
+        );
+
+        let first = load(&dir).expect_err("a broken registry fails closed");
+        let second = load(&dir).expect_err("a broken registry fails closed");
+
+        let order = |errors: &ConfigErrors| format!("{:?}", errors.problems);
+        assert_eq!(order(&first), order(&second), "problem order is stable");
+
+        let problems = &first.problems;
+        assert_eq!(problems.len(), 5, "{first:?}");
+        assert!(
+            matches!(&problems[0], ConfigError::InvalidName { plugin, .. } if plugin == "Bad Name"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[1], ConfigError::PluginFileMissing { plugin, .. } if plugin == "alpha"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[2], ConfigError::PluginFileMalformed { plugin, .. } if plugin == "beta"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[3], ConfigError::UnknownFetcher { plugin, .. } if plugin == "gamma"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[4], ConfigError::MissingSecret { plugin, .. } if plugin == "gamma"),
+            "{first:?}"
+        );
+
+        let report = render(&first);
+        assert!(report.contains("5 problem(s)"), "{report}");
+        assert_eq!(report.matches("fili::config::").count(), 5, "{report}");
+    }
+
+    #[test]
+    fn rendered_report_omits_secret_values() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\nenvtok = \"ALPHA_ENV\"\nmissing = \"ALPHA_MISSING\"\n",
+        );
+        write(&dir, ".env", "ALPHA_TOKEN=pa55-present-VALUE\n");
+        let env = |key: &str| (key == "ALPHA_ENV").then(|| "env-supplied-VALUE".to_string());
+
+        let errors = load_registry_with_env(&dir.path().join("filimon.toml"), &env)
+            .expect_err("a missing secret is an error");
+
+        let report = render(&errors);
+        assert!(report.contains("ALPHA_MISSING"), "{report}");
+        for value in ["pa55-present-VALUE", "env-supplied-VALUE"] {
+            assert!(!report.contains(value), "leaked {value:?} in:\n{report}");
+            assert!(!format!("{errors:?}").contains(value), "leaked {value:?}");
+        }
     }
 }
