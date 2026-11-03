@@ -255,15 +255,21 @@ pub fn load_registry_with_env(
 
     // Pass 2: `.env` is read only when some enabled source declares secrets,
     // so a `.env` shared with other tools cannot break plugin-free registries.
+    // `None` means the file is unusable: its DotenvInvalid problems are
+    // recorded here in line order, and pass 3 reports no MissingSecret.
     let dotenv_path = base_dir.join(".env");
-    let dotenv = if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
-        secrets::read_dotenv(&dotenv_path).unwrap_or_else(|problem| {
-            registry_problems.push(problem);
-            HashMap::new()
-        })
-    } else {
-        HashMap::new()
-    };
+    let dotenv: Option<HashMap<String, String>> =
+        if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
+            match secrets::read_dotenv(&dotenv_path) {
+                Ok(map) => Some(map),
+                Err(mut problems) => {
+                    registry_problems.append(&mut problems);
+                    None
+                }
+            }
+        } else {
+            Some(HashMap::new())
+        };
 
     // Pass 3: resolve secrets per enabled source and assemble the output.
     let mut sources = BTreeMap::new();
@@ -273,7 +279,7 @@ pub fn load_registry_with_env(
             let Some(parsed) = parsed.remove(name) else {
                 continue;
             };
-            match finish_plugin(name, parsed, &dotenv, &dotenv_path, env) {
+            match finish_plugin(name, parsed, dotenv.as_ref(), &dotenv_path, env) {
                 Ok(plugin) => Some(plugin),
                 Err(mut missing) => {
                     source_problems
@@ -320,7 +326,7 @@ pub fn load_registry_with_env(
 fn finish_plugin(
     name: &str,
     parsed: ParsedPlugin,
-    dotenv: &HashMap<String, String>,
+    dotenv: Option<&HashMap<String, String>>,
     dotenv_path: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<PluginConfig, Vec<ConfigError>> {
@@ -887,11 +893,12 @@ config = "beta.toml"
 
         let errors = load(&dir).expect_err("a malformed .env is an error");
 
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
         assert!(
-            errors
-                .problems
-                .iter()
-                .any(|problem| matches!(problem, ConfigError::DotenvInvalid { line: Some(2), .. })),
+            matches!(
+                &errors.problems[0],
+                ConfigError::DotenvInvalid { line: Some(2), .. }
+            ),
             "{errors:?}"
         );
         for problem in &errors.problems {
@@ -902,6 +909,62 @@ config = "beta.toml"
         }
         assert!(!errors.to_string().contains("s3cr3t"));
         assert!(!format!("{errors:?}").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn dotenv_single_quoted_dollar_round_trips() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "ALPHA_TOKEN='pa$$word'\n");
+
+        let registry = load(&dir).expect("a single-quoted `$` value loads");
+
+        assert_eq!(secrets_of(&registry, "alpha")["token"].expose(), "pa$$word");
+    }
+
+    #[test]
+    fn dotenv_unquoted_dollar_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_secret(&dir, "ALPHA_TOKEN", "ALPHA_TOKEN=pa$$word\n");
+
+        let errors = load(&dir).expect_err("an unquoted `$` is rejected");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            errors.problems.iter().any(|problem| matches!(
+                problem,
+                ConfigError::DotenvInvalid { line: Some(1), reason, .. }
+                    if reason.contains("single-quote")
+            )),
+            "{errors:?}"
+        );
+        let report = render(&errors);
+        let debug = format!("{errors:?}");
+        for leaked in ["pa$$word", "$$word"] {
+            assert!(!report.contains(leaked), "leaked {leaked:?} in:\n{report}");
+            assert!(!debug.contains(leaked), "leaked {leaked:?} in: {debug}");
+        }
+    }
+
+    #[test]
+    fn dotenv_never_expands_process_env() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\nbraced = \"ALPHA_BRACED\"\n",
+        );
+        // Plain literals: `${PATH}` inside a format macro would be a placeholder.
+        write(&dir, ".env", "ALPHA_TOKEN='$PATH'\nALPHA_BRACED='${PATH}'\n");
+        let env = |key: &str| -> Option<String> {
+            assert!(key != "PATH", "loader looked up PATH");
+            None
+        };
+
+        let registry = load_registry_with_env(&dir.path().join("filimon.toml"), &env)
+            .expect("literal `$` values load");
+
+        let secrets = secrets_of(&registry, "alpha");
+        assert_eq!(secrets["token"].expose(), "$PATH");
+        assert_eq!(secrets["braced"].expose(), "${PATH}");
     }
 
     #[test]
@@ -1457,5 +1520,80 @@ fetcher = "nope"
             assert!(!report.contains(value), "leaked {value:?} in:\n{report}");
             assert!(!format!("{errors:?}").contains(value), "leaked {value:?}");
         }
+    }
+
+    #[test]
+    fn unusable_dotenv_suppresses_missing_secret() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\nkey = \"ALPHA_KEY\"\nenvtok = \"ALPHA_ENV\"\n",
+        );
+        write(&dir, ".env", "ALPHA_TOKEN=ok\nALPHA_KEY=bad value\n");
+        let env = |key: &str| (key == "ALPHA_ENV").then(|| "from-env".to_string());
+
+        let errors = load_registry_with_env(&dir.path().join("filimon.toml"), &env)
+            .expect_err("an unusable .env is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DotenvInvalid { line: Some(2), .. }
+            ),
+            "{errors:?}"
+        );
+        assert!(
+            !errors
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, ConfigError::MissingSecret { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn dotenv_problems_keep_line_order() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources."Bad Name"]
+component = "bad.wasm"
+config = "bad.toml"
+
+[sources.alpha]
+component = "alpha.wasm"
+config = "alpha.toml"
+"#,
+        );
+        write(
+            &dir,
+            "alpha.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"ALPHA_TOKEN\"\n",
+        );
+        write(&dir, ".env", "ALPHA_TOKEN=x\nB=x y\nC=1\nD=\"$X\"\n");
+
+        let first = load(&dir).expect_err("a broken .env fails closed");
+        let second = load(&dir).expect_err("a broken .env fails closed");
+
+        let order = |errors: &ConfigErrors| format!("{:?}", errors.problems);
+        assert_eq!(order(&first), order(&second), "problem order is stable");
+
+        let problems = &first.problems;
+        assert_eq!(problems.len(), 3, "{first:?}");
+        assert!(
+            matches!(&problems[0], ConfigError::InvalidName { plugin, .. } if plugin == "Bad Name"),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[1], ConfigError::DotenvInvalid { line: Some(2), .. }),
+            "{first:?}"
+        );
+        assert!(
+            matches!(&problems[2], ConfigError::DotenvInvalid { line: Some(4), .. }),
+            "{first:?}"
+        );
     }
 }
