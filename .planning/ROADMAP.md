@@ -56,14 +56,14 @@ Plans:
   2. `fili produce <url>` and `fili file <paths>` still yield extracted articles at the consumer through `map-preprocess → map-extract → filter-relevance`. The news path does not regress.
   3. A social `SourceItem` produced to Fluvio reaches the consumer without any social-specific filtering, even when its text would fall below the news relevance threshold.
   4. In the consumer's existing NER mode (`--enrich-ner` with `--limit`), NER runs on social item text, and social and news records go to the same JSON output, each labelled with source type and platform.
-**Plans:** 1/3 plans executed
+**Plans:** 2/3 plans executed
 
 Plans:
 **Wave 1**
 - [x] 02-01-PLAN.md — News `SourceItem` through the unmodified SmartModule chain attached by `fili consume` (consumer_with_config) into one JSON output; SourceItem contract (WIT alignment, round-trip, RFC 3339) and articles topic retired in code (PIPE-01, PIPE-02)
 
 **Wave 2** *(blocked on Wave 1 completion)*
-- [ ] 02-02-PLAN.md — Social items on `filimon-social-items` with no SmartModules, merged with news under one total `--limit`, NER on social text, `--source`/`--output` flags, named missing-topic error (PIPE-03, PIPE-04)
+- [x] 02-02-PLAN.md — Social items on `filimon-social-items` with no SmartModules, merged with news under one total `--limit`, NER on social text, `--source`/`--output` flags, named missing-topic error (PIPE-03, PIPE-04)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 02-03-PLAN.md — README operator path proven live on both topics, codebase map and compose comment updated, no doc names the retired topic (PIPE-02, PIPE-03, PIPE-04)
@@ -144,7 +144,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
-| 2. SourceItem Pipeline | 1/3 | In Progress | - |
+| 2. SourceItem Pipeline | 2/3 | In Progress | - |
 | 3. Component Host Runtime | 0/TBD | Not started | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
