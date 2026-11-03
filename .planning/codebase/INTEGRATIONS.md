@@ -33,19 +33,19 @@ last_mapped_at: 2026-11-03
 
 **Streaming Platform:**
 - Fluvio 0.50 - Central message broker for WISE pipeline
-  - Topics created: `filimon-raw-pages`, `filimon-articles` (created automatically on first connection)
+  - Topics: `filimon-raw-pages` (created automatically by `fili produce`, `fili file` and `fili watch` via `ensure_topics()`) and `filimon-social-items` (created by operators with `fluvio topic create filimon-social-items`; `fili` never creates it, and `fili consume` preflight names it when missing)
   - Connection: `src/streaming.rs` PipelineCoordinator manages FluvioStream
   - Protocol: Native Fluvio protocol on ports 9003 (SC private), 9005 (SC public), 9010 (SPU public), 9011 (SPU private)
   - Cluster address: `FLUVIO_CLUSTER_ADDR` env var (default in Docker: `fluvio-sc:9003`)
   - Data format: JSON-serialized records via serde_json
   - Topics:
-    - `filimon-raw-pages`: Input from producer/file/watch modes (RawPage: url + html)
-    - `filimon-articles`: Output after SmartModule pipeline (ExtractedArticle: structured metadata)
+    - `filimon-raw-pages`: news `SourceItem` JSON from produce/file/watch modes (`source_type: "news"`, with `html`). `fili consume` reads it through the news SmartModule chain, which uses only `url` and `html`
+    - `filimon-social-items`: social `SourceItem` JSON (`source_type: "social"`, no `html`) from source plugins (Phase 3) or `fluvio produce`. Read by `fili consume` with no SmartModules
 
 **File Output:**
-- Local filesystem JSON - Processed articles written to disk
-  - Path: `OUTPUT_PATH` env var (default: `wise_output.json`)
-  - Format: JSON array of ExtractedArticle objects
+- Local filesystem JSON - news and social records written to disk by `fili consume` in `--limit` mode (`output::save_json`)
+  - Path: `fili consume --output <PATH>` (default: `output/wise_output.json`). `fili` does not read an `OUTPUT_PATH` env var
+  - Format: one JSON array of `OutputRecord` objects (`source_type`, `platform`, `id`, `url`, `title`, `text`, `author`, `published` as RFC 3339 or null, `raw`, `entities`, `article` for news only); page HTML is never written
   - Location in Docker: `/app/output/wise_output.json` (volume-mounted)
   - Written by: Consumer stage in `src/output.rs` and `src/commands/consume.rs`
 
@@ -115,7 +115,7 @@ last_mapped_at: 2026-11-03
 **Required env vars (set at build/runtime):**
 - `TOKENIZER_PATH` - Path to GLiNER tokenizer.json (default: `models/gliner_small-v2.1/tokenizer.json`)
 - `MODEL_PATH` - Path to GLiNER ONNX model (default: `models/gliner_small-v2.1/onnx/model.onnx`)
-- `OUTPUT_PATH` - Path to write results JSON (default: `wise_output.json`)
+- `OUTPUT_PATH` - Set in docker-compose.yml but not read by `fili`; the output path comes from `fili consume --output` (default: `output/wise_output.json`)
 - `FLUVIO_CLUSTER_ADDR` - Fluvio cluster endpoint for container-to-container (default: `fluvio-sc:9003`)
 - `ORT_NUM_THREADS` - ONNX Runtime CPU threads (default: 4)
 - `RUST_LOG` - Logging level filter (default: `info,filimon=debug`)
@@ -146,7 +146,7 @@ last_mapped_at: 2026-11-03
 **filimon ↔ Fluvio Cluster:**
 - Address: `fluvio-sc:9003` (internal Docker DNS)
 - Connection: Async Fluvio client in `src/streaming.rs` PipelineCoordinator
-- Topics: Produce to `filimon-raw-pages`, consume from `filimon-articles`
+- Topics: Produce to `filimon-raw-pages`; consume `filimon-raw-pages` through the news SmartModule chain plus `filimon-social-items` with no SmartModules
 
 **filimon-stream-processor ↔ Fluvio Cluster:**
 - Address: `fluvio-sc:9003` (same as main filimon service)
@@ -163,11 +163,11 @@ transforms:
 ```
 
 **Data flow:**
-1. Input: `filimon-raw-pages` topic (RawPage: url + html)
+1. Input: `filimon-raw-pages` topic (news `SourceItem`; the chain reads it as RawPage: url + html)
 2. Map-preprocess: Tokenize, extract text, compute frequencies
 3. Map-extract: Title, author, date, body_preview, relevance_score, top_keywords, inferred_category
 4. Filter-relevance: Keep only articles with relevance_score >= 0.05
-5. Output: `filimon-articles` topic (ExtractedArticle)
+5. Output: `ExtractedArticle` records read directly by `fili consume`, which attaches the chain to its own `filimon-raw-pages` stream (`consumer_with_config` with `news_chain()` in `src/streaming.rs`); the chain output is not written to a topic. `transforms.yaml` holds the same chain for manual checks with `fluvio consume --transforms-file`
 
 **SmartModule packages** (WASM):
 - Build: `smdk build` in each smartmodules/ subdirectory
