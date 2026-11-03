@@ -56,7 +56,17 @@ Plans:
   2. `fili produce <url>` and `fili file <paths>` still yield extracted articles at the consumer through `map-preprocess → map-extract → filter-relevance`. The news path does not regress.
   3. A social `SourceItem` produced to Fluvio reaches the consumer without any social-specific filtering, even when its text would fall below the news relevance threshold.
   4. In the consumer's existing NER mode (`--enrich-ner` with `--limit`), NER runs on social item text, and social and news records go to the same JSON output, each labelled with source type and platform.
-**Plans**: TBD
+**Plans:** 3 plans
+
+Plans:
+**Wave 1**
+- [ ] 02-01-PLAN.md — News `SourceItem` through the unmodified SmartModule chain attached by `fili consume` (consumer_with_config) into one JSON output; SourceItem contract (WIT alignment, round-trip, RFC 3339) and articles topic retired in code (PIPE-01, PIPE-02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 02-02-PLAN.md — Social items on `filimon-social-items` with no SmartModules, merged with news under one total `--limit`, NER on social text, `--source`/`--output` flags, named missing-topic error (PIPE-03, PIPE-04)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 02-03-PLAN.md — README operator path proven live on both topics, codebase map and compose comment updated, no doc names the retired topic (PIPE-02, PIPE-03, PIPE-04)
 
 ### Phase 3: Component Host Runtime
 **Goal**: `fili` hosts WASM components. It loads only what the registry lists, polls each source on its schedule, persists cursors across restarts, isolates failing plugins, and produces returned items to Fluvio as `SourceItem` records
@@ -134,7 +144,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
-| 2. SourceItem Pipeline | 0/TBD | Not started | - |
+| 2. SourceItem Pipeline | 0/3 | Planned | - |
 | 3. Component Host Runtime | 0/TBD | Not started | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
