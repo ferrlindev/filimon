@@ -205,11 +205,12 @@ fn utc_rfc3339(utc: DateTime<Utc>, precision: SecondsFormat) -> Option<String> {
 
 /// Convert WIT epoch milliseconds to RFC 3339 UTC with millisecond precision.
 ///
-/// Values outside chrono's range give None.
+/// Values outside chrono's range, and times whose UTC year is after 9999,
+/// give None.
 pub fn epoch_ms_to_rfc3339(ms: u64) -> Option<String> {
     let ms = i64::try_from(ms).ok()?;
-    DateTime::<Utc>::from_timestamp_millis(ms)
-        .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true))
+    let d = DateTime::<Utc>::from_timestamp_millis(ms)?;
+    utc_rfc3339(d, SecondsFormat::Millis)
 }
 
 /// An RFC 3339 timestamp converted to UTC with millisecond precision, or
@@ -222,7 +223,8 @@ pub fn rfc3339_to_utc(s: &str) -> Option<String> {
 /// Best-effort parse of a news date string to RFC 3339 UTC.
 ///
 /// Accepts RFC 3339, RFC 2822, offset-less `YYYY-MM-DDTHH:MM:SS` (read as
-/// UTC) and date-only `YYYY-MM-DD` (midnight UTC). Anything else gives None.
+/// UTC) and date-only `YYYY-MM-DD` (midnight UTC). Anything else, or a time
+/// whose UTC year is outside 0000..=9999, gives None.
 pub fn parse_news_published(raw: Option<&str>) -> Option<String> {
     let s = raw?.trim();
     if s.is_empty() {
@@ -239,7 +241,7 @@ pub fn parse_news_published(raw: Option<&str>) -> Option<String> {
     } else {
         return None;
     };
-    Some(utc.to_rfc3339_opts(SecondsFormat::Secs, true))
+    utc_rfc3339(utc, SecondsFormat::Secs)
 }
 
 /// Short platform name for a URL: the host without one leading `www.`.
