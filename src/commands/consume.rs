@@ -304,8 +304,8 @@ pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
 ///
 /// Every record read here is labelled social (topic of origin), whatever
 /// `source_type` it claims; a claimed `news` adds a diagnostic. An RFC 3339
-/// `published` is converted to UTC; any other value becomes null with a
-/// diagnostic. A value that is not a
+/// `published` is converted to UTC; any other value, or one whose UTC year is
+/// outside 0000..=9999, becomes null with a diagnostic. A value that is not a
 /// `SourceItem` becomes one diagnostic, which carries only the JSON error
 /// class and position. No diagnostic includes the value.
 pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
@@ -340,7 +340,7 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
         item.published = rfc3339_to_utc(&published);
         if item.published.is_none() {
             out.push(note(format!(
-                "{topic} offset {offset}: published is not RFC 3339; set to null"
+                "{topic} offset {offset}: published is not an RFC 3339 time with a UTC year from 0000 to 9999; set to null"
             )));
         }
     }
@@ -1911,6 +1911,47 @@ mod tests {
         ));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].published.as_deref(), Some("2024-05-01T09:00:00.000Z"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn social_published_outside_year_range_becomes_null() {
+        let item = |published: &str| {
+            json(&serde_json::json!({
+                "source_type": "social",
+                "platform": "reddit",
+                "id": "t3_year",
+                "url": "https://www.reddit.com/r/test/comments/year",
+                "text": "hi",
+                "published": published
+            }))
+        };
+
+        // Valid RFC 3339 whose UTC year is outside 0000..=9999: the record is
+        // kept with published null and one located note without the value.
+        for (offset, published, hidden) in [
+            (7, "9999-12-31T23:00:00-05:00", "9999-12-31"),
+            (8, "0000-01-01T00:30:00+01:00", "0000-01-01"),
+        ] {
+            let (records, diagnostics) =
+                split(decode_social("filimon-social-items", offset, &item(published)));
+            assert_eq!(records.len(), 1, "{published:?}");
+            assert_eq!(records[0].published, None, "{published:?}");
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            let located = format!("filimon-social-items offset {offset}");
+            assert!(diagnostics[0].contains(&located), "{}", diagnostics[0]);
+            assert!(diagnostics[0].contains("set to null"), "{}", diagnostics[0]);
+            assert!(!diagnostics[0].contains(hidden), "{}", diagnostics[0]);
+        }
+
+        // The in-range limit still converts, with no diagnostic.
+        let (records, diagnostics) = split(decode_social(
+            "filimon-social-items",
+            9,
+            &item("9999-12-31T23:59:59Z"),
+        ));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].published.as_deref(), Some("9999-12-31T23:59:59.000Z"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
