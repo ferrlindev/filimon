@@ -45,8 +45,8 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 - [ ] **PIPE-01**: A unified `SourceItem` envelope (source type, platform, id, url, title, text, author, published time, raw metadata) covers news pages and social posts
 - [ ] **PIPE-02**: News items continue through the existing WISE SmartModule chain
-- [ ] **PIPE-03**: Social items pass through to the consumer with no social-specific filtering in v1
-- [ ] **PIPE-04**: The consumer runs NER on social item text and writes it to the same JSON output as news articles, labelled by source
+- [x] **PIPE-03**: Social items pass through to the consumer with no social-specific filtering in v1
+- [x] **PIPE-04**: The consumer runs NER on social item text and writes it to the same JSON output as news articles, labelled by source
 
 ### CLI
 
@@ -147,8 +147,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | AUTH-04 | Phase 6 | Pending |
 | PIPE-01 | Phase 2 | Gaps Found |
 | PIPE-02 | Phase 2 | Gaps Found |
-| PIPE-03 | Phase 2 | Gaps Found |
-| PIPE-04 | Phase 2 | Gaps Found |
+| PIPE-03 | Phase 2 | Complete |
+| PIPE-04 | Phase 2 | Complete |
 | CLI-01 | Phase 4 | Pending |
 | CLI-02 | Phase 4 | Pending |
 | CLI-03 | Phase 4 | Pending |

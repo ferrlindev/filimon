@@ -60,15 +60,21 @@ pub struct RecordDiagnostic {
     pub message: String,
 }
 
-/// One item from a consumed stream: a record, a located diagnostic about one
-/// record (`Skipped` or `Note`), or the diagnostic of a stream error that
-/// ended its branch (`Fatal`).
+/// One item from a consumed stream: a record (`Record`), a record with the
+/// located diagnostics about it (`Noted`), a located diagnostic about a
+/// record that gives no output record (`Skipped`), or the diagnostic of a
+/// stream error that ended its branch (`Fatal`).
 pub enum Incoming {
     Record(OutputRecord),
+    /// A written record with the located diagnostics about it, as one item,
+    /// so no stop (limit, diagnostic budget, idle timeout, end of stream) can
+    /// fall between them.
+    Noted {
+        record: OutputRecord,
+        notes: Vec<RecordDiagnostic>,
+    },
     /// The record at this topic and offset gives no output record.
     Skipped(RecordDiagnostic),
-    /// A diagnostic about a record that still gives an output record.
-    Note(RecordDiagnostic),
     Fatal(String),
 }
 
@@ -300,52 +306,56 @@ pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
     }
 }
 
-/// Decode one value from the social topic.
+/// Decode one value from the social topic into one item.
 ///
 /// Every record read here is labelled social (topic of origin), whatever
-/// `source_type` it claims; a claimed `news` adds a diagnostic. An RFC 3339
+/// `source_type` it claims; a claimed `news` adds a note. An RFC 3339
 /// `published` is converted to UTC; any other value, or one whose UTC year is
-/// outside 0000..=9999, becomes null with a diagnostic. A value that is not a
-/// `SourceItem` becomes one diagnostic, which carries only the JSON error
-/// class and position. No diagnostic includes the value.
-pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
+/// outside 0000..=9999, becomes null with a note. A record with no note gives
+/// `Incoming::Record`; one with notes gives `Incoming::Noted`, the claims-news
+/// note first. A value that is not a `SourceItem` gives `Incoming::Skipped`,
+/// whose diagnostic carries only the JSON error class and position. No
+/// diagnostic includes the value.
+pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Incoming {
     let mut item = match serde_json::from_slice::<SourceItem>(value) {
         Ok(item) => item,
         Err(e) => {
-            return vec![Incoming::Skipped(RecordDiagnostic {
+            return Incoming::Skipped(RecordDiagnostic {
                 topic: topic.to_string(),
                 offset,
                 message: format!(
                     "{topic} offset {offset}: not a social item: {}",
                     describe_json_error(&e)
                 ),
-            })];
+            });
         }
     };
 
-    let mut out = Vec::new();
-    let note = |message: String| {
-        Incoming::Note(RecordDiagnostic {
-            topic: topic.to_string(),
-            offset,
-            message,
-        })
+    let mut notes = Vec::new();
+    let note = |message: String| RecordDiagnostic {
+        topic: topic.to_string(),
+        offset,
+        message,
     };
     if item.source_type == SourceType::News {
-        out.push(note(format!(
+        notes.push(note(format!(
             "{topic} offset {offset}: record claims source_type news; labelled social by topic of origin"
         )));
     }
     if let Some(published) = item.published.take() {
         item.published = rfc3339_to_utc(&published);
         if item.published.is_none() {
-            out.push(note(format!(
+            notes.push(note(format!(
                 "{topic} offset {offset}: published is not an RFC 3339 time with a UTC year from 0000 to 9999; set to null"
             )));
         }
     }
-    out.push(Incoming::Record(OutputRecord::from_social(item)));
-    out
+    let record = OutputRecord::from_social(item);
+    if notes.is_empty() {
+        Incoming::Record(record)
+    } else {
+        Incoming::Noted { record, notes }
+    }
 }
 
 /// Describe a stream error without the record value.
@@ -493,29 +503,28 @@ where
 
 /// Turn a raw social stream into `Incoming` items.
 ///
-/// Each record gives its `decode_social` items, and the first stream error
-/// gives one diagnostic and ends the branch. The social stream has no chain,
-/// so no record can be rejected and there is nothing to reopen past.
+/// Each record gives its one `decode_social` item (a record and its notes
+/// stay together), and the first stream error gives one diagnostic and ends
+/// the branch. The social stream has no chain, so no record can be rejected
+/// and there is nothing to reopen past.
 fn social_incoming<S>(stream: S, topic: &str) -> impl Stream<Item = Incoming> + Unpin + use<S>
 where
     S: Stream<Item = Result<Record, ErrorCode>> + Unpin,
 {
     let topic = topic.to_string();
-    stream
-        .scan(false, move |failed, item| {
-            if *failed {
-                return future::ready(None);
+    stream.scan(false, move |failed, item| {
+        if *failed {
+            return future::ready(None);
+        }
+        let incoming = match item {
+            Ok(record) => decode_social(&topic, record.offset(), record.value()),
+            Err(code) => {
+                *failed = true;
+                Incoming::Fatal(describe_stream_error(&topic, &code))
             }
-            let items = match item {
-                Ok(record) => decode_social(&topic, record.offset(), record.value()),
-                Err(code) => {
-                    *failed = true;
-                    vec![Incoming::Fatal(describe_stream_error(&topic, &code))]
-                }
-            };
-            future::ready(Some(futures_util::stream::iter(items)))
-        })
-        .flatten()
+        };
+        future::ready(Some(incoming))
+    })
 }
 
 /// Merge the news and social branches into one stream.
@@ -533,12 +542,17 @@ where
 /// Collect up to `limit` records, in arrival order.
 ///
 /// Stops when the stream ends, nothing arrives within `idle`, or
-/// `diagnostic_budget(limit)` diagnostics have arrived, so a topic full of
-/// undecodable values cannot keep a run going. Diagnostics are kept
-/// separately and do not count toward `limit`: at most `MAX_DIAGNOSTICS`
-/// record diagnostics keep their message, and past that each keeps only its
-/// topic and offset (see `Collected::skip` and `Collected::note`). A fatal one
-/// is always kept and also marks the run failed.
+/// `diagnostic_budget(limit)` skipped and fatal items have arrived, so a
+/// topic full of undecodable values cannot keep a run going. A note does not
+/// count toward that budget: it comes with a record, a record has at most two
+/// notes, and records are bounded by `limit`, so notes cannot keep a run
+/// going. Diagnostics are kept separately and do not count toward `limit`: at
+/// most `MAX_DIAGNOSTICS` record diagnostics keep their message, and past that
+/// each keeps only its topic and offset (see `Collected::skip` and
+/// `Collected::note`). A fatal one is always kept and also marks the run
+/// failed. A record and its notes arrive as one item (`Incoming::Noted`): the
+/// record is written first, so a note is recorded only after its record is
+/// in `records`, and no stop can fall between them.
 pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
     mut stream: S,
     limit: usize,
@@ -554,9 +568,11 @@ pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
                 seen += 1;
                 collected.skip(d);
             }
-            Ok(Some(Incoming::Note(d))) => {
-                seen += 1;
-                collected.note(d);
+            Ok(Some(Incoming::Noted { record, notes })) => {
+                collected.records.push(record);
+                for d in notes {
+                    collected.note(d);
+                }
             }
             Ok(Some(Incoming::Fatal(message))) => {
                 seen += 1;
@@ -914,7 +930,13 @@ async fn consume_stream(
     while let Some(item) = incoming.next().await {
         match item {
             Incoming::Record(record) => output::print_summary(&record),
-            Incoming::Skipped(d) | Incoming::Note(d) => print_diagnostic(&d.message),
+            Incoming::Noted { record, notes } => {
+                for d in &notes {
+                    print_diagnostic(&d.message);
+                }
+                output::print_summary(&record);
+            }
+            Incoming::Skipped(d) => print_diagnostic(&d.message),
             Incoming::Fatal(message) => {
                 failed = true;
                 print_diagnostic(&message);
@@ -982,13 +1004,33 @@ mod tests {
         serde_json::to_vec(value).expect("serializable")
     }
 
+    /// A social value with id `t3_edge`, the given claimed `source_type`, and
+    /// a `published` key only when one is given.
+    fn edge_social(source_type: &str, published: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "source_type": source_type,
+            "platform": "reddit",
+            "id": "t3_edge",
+            "url": "https://www.reddit.com/r/test/comments/edge",
+            "text": "hi"
+        });
+        if let Some(published) = published {
+            value["published"] = serde_json::Value::String(published.to_string());
+        }
+        value
+    }
+
     fn split(items: Vec<Incoming>) -> (Vec<OutputRecord>, Vec<String>) {
         let mut records = Vec::new();
         let mut diagnostics = Vec::new();
         for item in items {
             match item {
                 Incoming::Record(r) => records.push(r),
-                Incoming::Skipped(d) | Incoming::Note(d) => diagnostics.push(d.message),
+                Incoming::Noted { record, notes } => {
+                    records.push(record);
+                    diagnostics.extend(notes.into_iter().map(|d| d.message));
+                }
+                Incoming::Skipped(d) => diagnostics.push(d.message),
                 Incoming::Fatal(d) => panic!("a decode gave a fatal item: {d:?}"),
             }
         }
@@ -1002,7 +1044,11 @@ mod tests {
         for item in items {
             match item {
                 Incoming::Record(r) => records.push(r),
-                Incoming::Skipped(d) | Incoming::Note(d) => diagnostics.push((d.message, false)),
+                Incoming::Noted { record, notes } => {
+                    records.push(record);
+                    diagnostics.extend(notes.into_iter().map(|d| (d.message, false)));
+                }
+                Incoming::Skipped(d) => diagnostics.push((d.message, false)),
                 Incoming::Fatal(d) => diagnostics.push((d, true)),
             }
         }
@@ -1069,7 +1115,7 @@ mod tests {
         let ticks = poison_social(r"a`b`PAGE-BODY");
         for value in [esc, ticks] {
             let (records, diagnostics) =
-                split(decode_social("filimon-social-items", 9, &json(&value)));
+                split(vec![decode_social("filimon-social-items", 9, &json(&value))]);
             assert!(records.is_empty(), "{value}");
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
             let message = &diagnostics[0];
@@ -1129,7 +1175,7 @@ mod tests {
         assert!(message.contains("filimon-raw-pages offset 3"), "{message:?}");
         assert!(message.contains("truncated JSON at line 1 column 0"), "{message:?}");
 
-        let (records, diagnostics) = split(decode_social("filimon-social-items", 4, b""));
+        let (records, diagnostics) = split(vec![decode_social("filimon-social-items", 4, b"")]);
         assert!(records.is_empty());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(
@@ -1152,11 +1198,11 @@ mod tests {
         assert!(message.contains("filimon-raw-pages offset 5"), "{message:?}");
         assert!(!message.contains("PAGE-BODY"), "{message:?}");
 
-        let (records, diagnostics) = split(decode_social(
+        let (records, diagnostics) = split(vec![decode_social(
             "filimon-social-items",
             6,
             &json(&poison_social("")),
-        ));
+        )]);
         assert!(records.is_empty());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(
@@ -1408,16 +1454,17 @@ mod tests {
     async fn fatal_item_marks_collection_failed() {
         let items = vec![
             record("a"),
-            noted("t", 0),
+            noted("t", 0, 1),
             skipped("t", 1),
             Incoming::Fatal("ended".into()),
         ];
         let collected = collect_records(iter(items), 10, Duration::from_secs(1)).await;
         assert!(collected.failed);
-        assert_eq!(collected.records.len(), 1);
+        // The noted item carries a record of its own.
+        assert_eq!(collected.records.len(), 2);
         assert_eq!(collected.diagnostics, ["t offset 0: note", "t offset 1: bad", "ended"]);
 
-        let clean = vec![record("a"), noted("t", 0), skipped("t", 1)];
+        let clean = vec![record("a"), noted("t", 0, 1), skipped("t", 1)];
         let collected = collect_records(iter(clean), 10, Duration::from_secs(1)).await;
         assert!(!collected.failed);
     }
@@ -1431,13 +1478,18 @@ mod tests {
         })
     }
 
-    /// A located diagnostic for a record that is still written.
-    fn noted(topic: &str, offset: i64) -> Incoming {
-        Incoming::Note(RecordDiagnostic {
-            topic: topic.to_string(),
-            offset,
-            message: format!("{topic} offset {offset}: note"),
-        })
+    /// A written record with `count` located notes about it, as one item.
+    fn noted(topic: &str, offset: i64, count: usize) -> Incoming {
+        Incoming::Noted {
+            record: OutputRecord::from_article(article(&format!("noted-at-{topic}-{offset}"))),
+            notes: (0..count)
+                .map(|_| RecordDiagnostic {
+                    topic: topic.to_string(),
+                    offset,
+                    message: format!("{topic} offset {offset}: note"),
+                })
+                .collect(),
+        }
     }
 
     #[test]
@@ -1561,9 +1613,8 @@ mod tests {
             skipped(RAW, 103),
             skipped(SOCIAL, 100),
             skipped(RAW, 104),
-            noted(RAW, 105),
-            record("written-at-raw-105"),
-            noted(RAW, 105),
+            // One written record at raw offset 105 with two notes.
+            noted(RAW, 105, 2),
             skipped(SOCIAL, 101),
             skipped(RAW, 107),
         ]);
@@ -1601,11 +1652,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_at_budget_boundary_keeps_its_record() {
+        const SOCIAL: &str = "filimon-social-items";
+        const OUT_OF_RANGE: &str = "9999-12-31T23:00:00-05:00";
+        // `n` skipped social items at offsets 0..n, then the value at offset n.
+        async fn run(n: i64, limit: usize, value: &serde_json::Value) -> Collected {
+            let mut items: Vec<Incoming> = (0..n).map(|offset| skipped(SOCIAL, offset)).collect();
+            items.push(decode_social(SOCIAL, n, &json(value)));
+            collect_records(iter(items), limit, Duration::from_secs(1)).await
+        }
+        fn assert_no_stop(collected: &Collected) {
+            assert!(
+                collected.diagnostics.iter().all(|m| !m.contains("stopped after")),
+                "{:?}",
+                collected.diagnostics
+            );
+        }
+        fn assert_offsets_in_order(collected: &Collected, upto: usize) {
+            for (i, message) in collected.diagnostics[..upto].iter().enumerate() {
+                assert!(message.contains(&format!("{SOCIAL} offset {i}:")), "{message:?}");
+            }
+        }
+        assert_eq!(diagnostic_budget(1) - 1, 99);
+
+        // A: the 100th diagnostic is the published note of a record that fills the limit.
+        let collected = run(99, 1, &edge_social("social", Some(OUT_OF_RANGE))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        let record = &collected.records[0];
+        assert_eq!(record.id, "t3_edge");
+        assert_eq!(record.source_type, SourceType::Social);
+        assert_eq!(record.published, None);
+        assert!(!collected.failed);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        assert_offsets_in_order(&collected, 99);
+        let last = &collected.diagnostics[99];
+        assert!(last.contains(&format!("{SOCIAL} offset 99:")), "{last:?}");
+        assert!(last.contains("set to null"), "{last:?}");
+        assert_no_stop(&collected);
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+
+        // B: the claims-news note, with an in-range published converted to UTC.
+        let collected =
+            run(99, 1, &edge_social("news", Some("2024-05-01T10:00:00+01:00"))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        let record = &collected.records[0];
+        assert_eq!(record.source_type, SourceType::Social);
+        assert_eq!(record.published.as_deref(), Some("2024-05-01T09:00:00.000Z"));
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        let last = &collected.diagnostics[99];
+        assert!(last.contains("claims source_type news"), "{last:?}");
+        assert_no_stop(&collected);
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+
+        // C: two notes; the first is the 100th message, the second is named by range.
+        let collected = run(99, 1, &edge_social("news", Some(OUT_OF_RANGE))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        assert_eq!(collected.records[0].published, None);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        let last = &collected.diagnostics[99];
+        assert!(last.contains("claims source_type news"), "{last:?}");
+        assert_no_stop(&collected);
+        let social = &collected.unshown[SOCIAL];
+        assert_eq!(social.noted.ranges, [(99, 99)]);
+        assert_eq!(social.noted.count, 1);
+        assert_eq!(social.skipped, OffsetRanges::default());
+
+        // D: limit 50; the note of the record at offset 499 is past the cap.
+        let collected = run(499, 50, &edge_social("social", Some(OUT_OF_RANGE))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        assert_eq!(collected.records[0].published, None);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        assert_offsets_in_order(&collected, 100);
+        assert_no_stop(&collected);
+        let social = &collected.unshown[SOCIAL];
+        assert_eq!(social.skipped.ranges, [(100, 498)]);
+        assert_eq!(social.skipped.count, 399);
+        assert_eq!(social.noted.ranges, [(499, 499)]);
+        assert_eq!(social.noted.count, 1);
+        assert_eq!(
+            unshown_lines(&collected.unshown),
+            [
+                "filimon-social-items: 399 more skipped record(s), details not shown, offsets 100-498",
+                "filimon-social-items: 1 more record diagnostic(s), details not shown, offsets 499",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn located_diagnostics_match_their_message() {
-        fn located(item: &Incoming) -> Option<&RecordDiagnostic> {
+        // Every located diagnostic an item carries: one for `Skipped`, each
+        // note for `Noted`, none otherwise.
+        fn located(item: &Incoming) -> Vec<&RecordDiagnostic> {
             match item {
-                Incoming::Skipped(d) | Incoming::Note(d) => Some(d),
-                _ => None,
+                Incoming::Skipped(d) => vec![d],
+                Incoming::Noted { notes, .. } => notes.iter().collect(),
+                _ => Vec::new(),
             }
         }
         fn skipped_offsets(items: &[Incoming]) -> Vec<i64> {
@@ -1618,7 +1759,7 @@ mod tests {
                 .collect()
         }
         fn assert_located(items: &[Incoming]) {
-            for d in items.iter().filter_map(located) {
+            for d in items.iter().flat_map(located) {
                 let prefix = format!("{} offset {}:", d.topic, d.offset);
                 assert!(d.message.starts_with(&prefix), "{d:?}");
             }
@@ -1631,9 +1772,9 @@ mod tests {
         );
         assert_located(&news);
 
-        let social = decode_social("filimon-social-items", 7, b"not json");
+        let social = [decode_social("filimon-social-items", 7, b"not json")];
         assert!(
-            matches!(social.as_slice(), [Incoming::Skipped(d)] if d.topic == "filimon-social-items" && d.offset == 7),
+            matches!(&social, [Incoming::Skipped(d)] if d.topic == "filimon-social-items" && d.offset == 7),
             "decode_social must give a located Skipped item"
         );
         assert_located(&social);
@@ -1654,13 +1795,41 @@ mod tests {
             "published": "yesterday"
         }));
         for (offset, value) in [(8, claims_news), (9, yesterday)] {
-            let items = decode_social("filimon-social-items", offset, &value);
+            let items = [decode_social("filimon-social-items", offset, &value)];
             assert!(
-                matches!(items.as_slice(), [Incoming::Note(d), Incoming::Record(_)] if d.topic == "filimon-social-items" && d.offset == offset),
-                "decode_social must give one located Note and the record (offset {offset})"
+                matches!(&items, [Incoming::Noted { notes, .. }]
+                    if matches!(notes.as_slice(), [d] if d.topic == "filimon-social-items" && d.offset == offset)),
+                "decode_social must give one Noted item with one located note (offset {offset})"
             );
             assert_located(&items);
         }
+
+        // Both notes on one record: claims-news first, then the published note.
+        let both = json(&serde_json::json!({
+            "source_type": "news",
+            "platform": "reddit",
+            "id": "t3_both",
+            "url": "https://www.reddit.com/r/test/comments/both",
+            "text": "hi",
+            "published": "yesterday"
+        }));
+        let items = [decode_social("filimon-social-items", 10, &both)];
+        let [Incoming::Noted { notes, .. }] = &items else {
+            panic!("decode_social must give one Noted item for two notes");
+        };
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().all(|d| d.topic == "filimon-social-items" && d.offset == 10));
+        assert!(notes[0].message.contains("claims source_type news"), "{:?}", notes[0]);
+        assert!(notes[1].message.contains("set to null"), "{:?}", notes[1]);
+        assert_located(&items);
+
+        // A record with no note is a plain Record, never a Noted with no notes.
+        let plain = [decode_social("filimon-social-items", 11, &json(&edge_social("social", None)))];
+        assert!(
+            matches!(&plain, [Incoming::Record(_)]),
+            "a social record with no note must give Incoming::Record"
+        );
+        assert_located(&plain);
 
         // In-batch steps: the start offset is the skipped record's offset.
         let first = news_items(vec![Err(runtime_error_at(0))]);
@@ -1674,7 +1843,7 @@ mod tests {
         };
         let items: Vec<Incoming> = news_incoming(first, "raw", reopen).collect().await;
         assert_eq!(skipped_offsets(&items), [0, 1, 2]);
-        assert!(items.iter().filter_map(located).all(|d| d.topic == "raw"));
+        assert!(items.iter().flat_map(located).all(|d| d.topic == "raw"));
         assert_located(&items);
 
         // The reopen limit: every rejected record, then the fatal closing line.
@@ -1771,10 +1940,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merged_stop_never_splits_a_note_from_its_record() {
+        const RAW: &str = "filimon-raw-pages";
+        const SOCIAL: &str = "filimon-social-items";
+        let edge = || json(&edge_social("social", Some("9999-12-31T23:00:00-05:00")));
+        // Every kept note names a record that is in the output.
+        fn assert_notes_have_records(collected: &Collected) {
+            for message in collected.diagnostics.iter().filter(|m| m.contains("set to null")) {
+                assert!(
+                    ids_of(&collected.records, SourceType::Social).contains(&"t3_edge"),
+                    "note without its record: {message:?}"
+                );
+            }
+        }
+
+        // Limit stop: a news record that fills the limit cannot land between
+        // the social note and its record.
+        let news = iter(vec![record("n1"), record("n2")]);
+        let social = iter(vec![decode_social(SOCIAL, 7, &edge())]);
+        let collected =
+            collect_records(merge_incoming(news, social), 2, Duration::from_secs(1)).await;
+        assert_eq!(ids_of(&collected.records, SourceType::News), ["n1"]);
+        assert_eq!(ids_of(&collected.records, SourceType::Social), ["t3_edge"]);
+        let edge_record = collected
+            .records
+            .iter()
+            .find(|r| r.id == "t3_edge")
+            .expect("social record");
+        assert_eq!(edge_record.published, None);
+        assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+        assert!(collected.diagnostics[0].contains(&format!("{SOCIAL} offset 7:")));
+        assert!(collected.diagnostics[0].contains("set to null"));
+        assert!(!collected.failed);
+        assert_notes_have_records(&collected);
+
+        // Budget stop: a news skip that hits the budget cannot land between
+        // the social note and its record.
+        let news = futures_util::stream::iter((0..100).map(|offset| skipped(RAW, offset)));
+        let social = futures_util::stream::iter(
+            (0..49)
+                .map(|offset| skipped(SOCIAL, offset))
+                .chain(std::iter::once(decode_social(SOCIAL, 49, &edge()))),
+        );
+        let collected =
+            collect_records(merge_incoming(news, social), 1, Duration::from_secs(1)).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        assert_eq!(collected.records[0].id, "t3_edge");
+        assert_eq!(collected.records[0].published, None);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        let last = collected.diagnostics.last().expect("note");
+        assert!(last.contains(&format!("{SOCIAL} offset 49:")), "{last:?}");
+        assert!(last.contains("set to null"), "{last:?}");
+        assert!(
+            collected.diagnostics.iter().all(|m| !m.contains("stopped after")),
+            "{:?}",
+            collected.diagnostics
+        );
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+        assert_notes_have_records(&collected);
+    }
+
+    #[tokio::test]
     async fn low_relevance_social_is_kept() {
         let item = social_item("t3_lol", "https://www.reddit.com/r/test/comments/lol", "lol cat");
         let value = serde_json::to_vec(&item).expect("serializable");
-        let social = iter(decode_social("filimon-social-items", 0, &value));
+        let social = iter(vec![decode_social("filimon-social-items", 0, &value)]);
         let collected =
             collect_records(merge_incoming(iter(vec![]), social), 10, Duration::from_secs(1))
                 .await;
@@ -1793,7 +2023,7 @@ mod tests {
             "url": "https://www.reddit.com/r/test/comments/spoof",
             "text": "claims to be news"
         }));
-        let (records, diagnostics) = split(decode_social("filimon-social-items", 5, &value));
+        let (records, diagnostics) = split(vec![decode_social("filimon-social-items", 5, &value)]);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].source_type, SourceType::Social);
         assert!(records[0].article.is_none());
@@ -1805,11 +2035,11 @@ mod tests {
 
     #[test]
     fn undeserializable_social_record_is_reported() {
-        let (records, diagnostics) = split(decode_social(
+        let (records, diagnostics) = split(vec![decode_social(
             "filimon-social-items",
             9,
             br#"{"text":"SECRET-BODY"}"#,
-        ));
+        )]);
         assert!(records.is_empty());
         assert_eq!(diagnostics.len(), 1);
         let message = &diagnostics[0];
@@ -1818,7 +2048,7 @@ mod tests {
         assert!(!message.contains("SECRET-BODY"), "{message}");
 
         // An invalid-type error quotes the value; it must still not leak.
-        let (records, diagnostics) = split(decode_social("t", 1, br#""SECRET-BODY""#));
+        let (records, diagnostics) = split(vec![decode_social("t", 1, br#""SECRET-BODY""#)]);
         assert!(records.is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert!(!diagnostics[0].contains("SECRET-BODY"), "{}", diagnostics[0]);
@@ -1833,7 +2063,7 @@ mod tests {
             "url": "https://www.reddit.com/r/test/comments/empty",
             "text": ""
         }));
-        let social = iter(decode_social("filimon-social-items", 0, &value));
+        let social = iter(vec![decode_social("filimon-social-items", 0, &value)]);
         let collected =
             collect_records(merge_incoming(iter(vec![]), social), 10, Duration::from_secs(1))
                 .await;
@@ -1886,7 +2116,7 @@ mod tests {
         };
 
         let (records, diagnostics) =
-            split(decode_social("filimon-social-items", 3, &item("yesterday")));
+            split(vec![decode_social("filimon-social-items", 3, &item("yesterday"))]);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].published, None);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -1894,21 +2124,21 @@ mod tests {
         assert!(diagnostics[0].contains('3'), "{}", diagnostics[0]);
         assert!(!diagnostics[0].contains("yesterday"), "{}", diagnostics[0]);
 
-        let (records, diagnostics) = split(decode_social(
+        let (records, diagnostics) = split(vec![decode_social(
             "filimon-social-items",
             4,
             &item("2024-10-27T03:33:20.123Z"),
-        ));
+        )]);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].published.as_deref(), Some("2024-10-27T03:33:20.123Z"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
         // An offset is converted to UTC, as the output contract states.
-        let (records, diagnostics) = split(decode_social(
+        let (records, diagnostics) = split(vec![decode_social(
             "filimon-social-items",
             5,
             &item("2024-05-01T10:00:00+01:00"),
-        ));
+        )]);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].published.as_deref(), Some("2024-05-01T09:00:00.000Z"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -1934,7 +2164,7 @@ mod tests {
             (8, "0000-01-01T00:30:00+01:00", "0000-01-01"),
         ] {
             let (records, diagnostics) =
-                split(decode_social("filimon-social-items", offset, &item(published)));
+                split(vec![decode_social("filimon-social-items", offset, &item(published))]);
             assert_eq!(records.len(), 1, "{published:?}");
             assert_eq!(records[0].published, None, "{published:?}");
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -1945,11 +2175,11 @@ mod tests {
         }
 
         // The in-range limit still converts, with no diagnostic.
-        let (records, diagnostics) = split(decode_social(
+        let (records, diagnostics) = split(vec![decode_social(
             "filimon-social-items",
             9,
             &item("9999-12-31T23:59:59Z"),
-        ));
+        )]);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].published.as_deref(), Some("9999-12-31T23:59:59.000Z"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -2445,6 +2675,50 @@ mod tests {
                 let line = diagnostic_line(message);
                 assert!(!line.chars().any(char::is_control), "{line:?}");
             }
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with the filimon SmartModules loaded"]
+    async fn social_note_at_budget_boundary_is_written() -> miette::Result<()> {
+        with_scratch_topics(|raw, social| async move {
+            let stream = FluvioStream::connect().await?;
+
+            // 99 undecodable values, then a social item whose published is
+            // out of range: its note is the 100th diagnostic (the budget for limit 1).
+            let bad = serde_json::Value::String("PAGE-BODY".to_string());
+            let producer = ready_producer(&stream, &social).await?;
+            for _ in 0..99 {
+                producer.send("bad", &bad).await?;
+            }
+            producer
+                .send("t3_edge", &edge_social("social", Some("9999-12-31T23:00:00-05:00")))
+                .await?;
+            producer.flush().await?;
+
+            let topics = ConsumeTopics {
+                raw_pages: &raw,
+                social: &social,
+            };
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 1, SourceFilter::Social)
+                    .await?;
+            assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+            let record = &collected.records[0];
+            assert_eq!(record.id, "t3_edge");
+            assert_eq!(record.published, None);
+            assert!(!collected.failed);
+            assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+            let last = &collected.diagnostics[99];
+            assert!(last.contains(&format!("{social} offset 99:")), "{last:?}");
+            assert!(last.contains("set to null"), "{last:?}");
+            for message in &collected.diagnostics {
+                assert!(!message.contains("stopped after"), "{message:?}");
+                assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            }
+            assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
             Ok(())
         })
         .await
