@@ -3,10 +3,6 @@ phase: 02
 review: 02-REVIEW.md
 titles: json
 findings:
-  - id: WR-12
-    severity: warning
-    disposition: open
-    title: "A budget stop can fall between a social note and its record, so a note describes a record that was never written"
   - id: WR-08
     severity: warning
     disposition: open
@@ -15,14 +11,22 @@ findings:
     severity: warning
     disposition: open
     title: "Already-defended-elsewhere: second `check_ner_mode` inside `consume::run` (carried forward, unchanged)"
+  - id: IN-14
+    severity: info
+    disposition: open
+    title: "The budget stop line and the `diagnostic_budget` doc still say \"diagnostics\", but notes are no longer counted (new, from 02-07)"
+  - id: IN-15
+    severity: info
+    disposition: open
+    title: "`merged_stop_never_splits_a_note_from_its_record` asserts counts that depend on futures-util's polling order (new, from 02-07)"
   - id: IN-12
     severity: info
     disposition: open
-    title: "Fatal and budget-stop lines use up the record-diagnostic message cap"
+    title: "Fatal and budget-stop lines use up the record-diagnostic message cap (carried forward, unchanged)"
   - id: IN-13
     severity: info
     disposition: open
-    title: "The reopen-limit closing line says it skipped 100 records, but 101 are reported as skipped"
+    title: "The reopen-limit closing line says it skipped 100 records, but 101 are reported as skipped (carried forward, unchanged)"
   - id: IN-10
     severity: info
     disposition: open
@@ -31,6 +35,10 @@ findings:
     severity: info
     disposition: open
     title: "A failed reopen reports the rejected record as \"skipped\" right before the branch ends (carried forward, unchanged)"
+  - id: WR-12
+    severity: warning
+    disposition: open
+    title: "A budget stop can fall between a social note and its record, so a note describes a record that was never written"
   - id: WR-07
     severity: warning
     disposition: open
@@ -107,22 +115,24 @@ findings:
     severity: info
     disposition: open
     title: "Already-defended-elsewhere — empty-parent guard before `create_dir_all`"
-open: 19
-total: 26
-recorded: 2026-11-04T12:20:45.056Z
+open: 21
+total: 28
+recorded: 2026-11-04T13:34:46.261Z
 ---
 
 # Phase 02: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-12 | warning | open | - |
 | WR-08 | warning | open | - |
 | WR-11 | warning | open | - |
+| IN-14 | info | open | - |
+| IN-15 | info | open | - |
 | IN-12 | info | open | - |
 | IN-13 | info | open | - |
 | IN-10 | info | open | - |
 | IN-11 | info | open | - |
+| WR-12 | warning | open | - (not in the current review) |
 | WR-07 | warning | open | - (not in the current review) |
 | WR-09 | warning | open | - (not in the current review) |
 | WR-10 | warning | open | - (not in the current review) |
