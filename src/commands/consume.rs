@@ -60,12 +60,11 @@ pub struct RecordDiagnostic {
     pub message: String,
 }
 
-/// One item from a consumed stream: a record, a diagnostic for stderr, a
-/// located diagnostic about a record that gives no output record, or the
-/// diagnostic of a stream error that ended its branch.
+/// One item from a consumed stream: a record, a located diagnostic about one
+/// record (`Skipped` or `Note`), or the diagnostic of a stream error that
+/// ended its branch (`Fatal`).
 pub enum Incoming {
     Record(OutputRecord),
-    Diagnostic(String),
     /// The record at this topic and offset gives no output record.
     Skipped(RecordDiagnostic),
     /// A diagnostic about a record that still gives an output record.
@@ -123,7 +122,11 @@ impl std::fmt::Display for OffsetRanges {
 }
 
 /// The records of one topic whose diagnostics were not kept past
-/// `MAX_DIAGNOSTICS`.
+/// `MAX_DIAGNOSTICS`, by offset only.
+///
+/// `skipped` names records that gave no output record; `noted` names
+/// records that were written but had a diagnostic. The two are kept apart so
+/// a skipped range never spans a written record.
 #[derive(Debug, Default)]
 pub struct Unshown {
     pub skipped: OffsetRanges,
@@ -134,19 +137,18 @@ pub struct Unshown {
 #[derive(Default)]
 pub struct Collected {
     pub records: Vec<OutputRecord>,
-    /// Every diagnostic, fatal ones included, in arrival order.
+    /// The kept diagnostic messages, fatal ones included, in arrival order.
     pub diagnostics: Vec<String>,
     /// Whether a branch ended on a stream error.
     pub failed: bool,
-    /// Diagnostics counted but not kept, past `MAX_DIAGNOSTICS`.
-    pub suppressed: usize,
     /// Per topic, the records named only by offset because the message cap
     /// was reached.
     pub unshown: BTreeMap<String, Unshown>,
 }
 
-/// Most diagnostics a batch run keeps; later ones are only counted. Fatal
-/// diagnostics are always kept.
+/// Most record diagnostics a batch run keeps as messages; later ones keep
+/// only their topic and offset (see `Unshown`). Fatal diagnostics and the
+/// budget stop line are always kept.
 const MAX_DIAGNOSTICS: usize = 100;
 
 /// Most diagnostics a batch run for `limit` records reads before it stops:
@@ -156,15 +158,6 @@ fn diagnostic_budget(limit: usize) -> usize {
 }
 
 impl Collected {
-    /// Keep `message`, or only count it once `MAX_DIAGNOSTICS` are kept.
-    fn note(&mut self, message: String, fatal: bool) {
-        if fatal || self.diagnostics.len() < MAX_DIAGNOSTICS {
-            self.diagnostics.push(message);
-        } else {
-            self.suppressed += 1;
-        }
-    }
-
     /// Keep the message of a skipped record, or, once `MAX_DIAGNOSTICS` are
     /// kept, drop it and add only the record's offset to its topic's skipped
     /// ranges.
@@ -174,6 +167,23 @@ impl Collected {
         } else {
             self.unshown.entry(d.topic).or_default().skipped.add(d.offset);
         }
+    }
+
+    /// Keep the message of a note about a written record, or, once
+    /// `MAX_DIAGNOSTICS` are kept, drop it and add only the record's offset to
+    /// its topic's noted ranges.
+    fn note(&mut self, d: RecordDiagnostic) {
+        if self.diagnostics.len() < MAX_DIAGNOSTICS {
+            self.diagnostics.push(d.message);
+        } else {
+            self.unshown.entry(d.topic).or_default().noted.add(d.offset);
+        }
+    }
+
+    /// Keep `message` whatever the cap: fatal diagnostics and the budget stop
+    /// line. Does not mark the run failed.
+    fn keep_always(&mut self, message: String) {
+        self.diagnostics.push(message);
     }
 }
 
@@ -279,10 +289,14 @@ fn hint_summary(text: &str) -> String {
 pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
     match serde_json::from_slice::<ExtractedArticle>(value) {
         Ok(article) => Incoming::Record(OutputRecord::from_article(article)),
-        Err(e) => Incoming::Diagnostic(format!(
-            "{topic} offset {offset}: not an extracted article: {}",
-            describe_json_error(&e)
-        )),
+        Err(e) => Incoming::Skipped(RecordDiagnostic {
+            topic: topic.to_string(),
+            offset,
+            message: format!(
+                "{topic} offset {offset}: not an extracted article: {}",
+                describe_json_error(&e)
+            ),
+        }),
     }
 }
 
@@ -310,15 +324,22 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
     };
 
     let mut out = Vec::new();
+    let note = |message: String| {
+        Incoming::Note(RecordDiagnostic {
+            topic: topic.to_string(),
+            offset,
+            message,
+        })
+    };
     if item.source_type == SourceType::News {
-        out.push(Incoming::Diagnostic(format!(
+        out.push(note(format!(
             "{topic} offset {offset}: record claims source_type news; labelled social by topic of origin"
         )));
     }
     if let Some(published) = item.published.take() {
         item.published = rfc3339_to_utc(&published);
         if item.published.is_none() {
-            out.push(Incoming::Diagnostic(format!(
+            out.push(note(format!(
                 "{topic} offset {offset}: published is not RFC 3339; set to null"
             )));
         }
@@ -422,24 +443,36 @@ where
         let ErrorCode::SmartModuleRuntimeError(e) = &code else {
             return Some((Incoming::Fatal(describe_stream_error(&b.topic, &code)), b));
         };
-        let (message, next) = match b.start {
+        // The skipped record: the start offset in the in-batch case, else the
+        // rejected offset. Its message starts with that topic and offset.
+        let (message, skipped) = match b.start {
             Some(start) if e.offset < start => (
                 format!(
                     "{} offset {start}: stored in one batch with rejected offset {}, \
                      so it cannot pass the SmartModule chain",
                     b.topic, e.offset
                 ),
-                start.saturating_add(1),
+                start,
             ),
-            _ => (describe_stream_error(&b.topic, &code), e.offset.saturating_add(1)),
+            _ => (describe_stream_error(&b.topic, &code), e.offset),
+        };
+        let next = skipped.saturating_add(1);
+        let located = |message: String| {
+            Incoming::Skipped(RecordDiagnostic {
+                topic: b.topic.clone(),
+                offset: skipped,
+                message,
+            })
         };
         if b.reopens >= MAX_REOPENS {
+            let item = located(message);
             b.closing = Some(format!(
                 "{}: stopped after skipping {MAX_REOPENS} records the SmartModule chain rejected",
                 b.topic
             ));
-            return Some((Incoming::Diagnostic(message), b));
+            return Some((item, b));
         }
+        let item = located(format!("{message}; skipped"));
         b.reopens += 1;
         match (b.reopen)(next).await {
             Ok(stream) => {
@@ -454,7 +487,7 @@ where
                 ));
             }
         }
-        Some((Incoming::Diagnostic(format!("{message}; skipped")), b))
+        Some((item, b))
     }))
 }
 
@@ -502,9 +535,10 @@ where
 /// Stops when the stream ends, nothing arrives within `idle`, or
 /// `diagnostic_budget(limit)` diagnostics have arrived, so a topic full of
 /// undecodable values cannot keep a run going. Diagnostics are kept
-/// separately (at most `MAX_DIAGNOSTICS` messages, see `Collected::note` and
-/// `Collected::skip`; past that a skipped record keeps only its offset) and
-/// do not count toward `limit`; a fatal one also marks the run failed.
+/// separately and do not count toward `limit`: at most `MAX_DIAGNOSTICS`
+/// record diagnostics keep their message, and past that each keeps only its
+/// topic and offset (see `Collected::skip` and `Collected::note`). A fatal one
+/// is always kept and also marks the run failed.
 pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
     mut stream: S,
     limit: usize,
@@ -516,30 +550,25 @@ pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
     while collected.records.len() < limit {
         match tokio::time::timeout(idle, stream.next()).await {
             Ok(Some(Incoming::Record(record))) => collected.records.push(record),
-            Ok(Some(Incoming::Diagnostic(message))) => {
-                seen += 1;
-                collected.note(message, false);
-            }
             Ok(Some(Incoming::Skipped(d))) => {
                 seen += 1;
                 collected.skip(d);
             }
             Ok(Some(Incoming::Note(d))) => {
                 seen += 1;
-                collected.note(d.message, false);
+                collected.note(d);
             }
             Ok(Some(Incoming::Fatal(message))) => {
                 seen += 1;
                 collected.failed = true;
-                collected.note(message, true);
+                collected.keep_always(message);
             }
             Ok(None) | Err(_) => break,
         }
         if seen >= budget {
-            collected.note(
-                format!("stopped after {seen} diagnostics before {limit} records arrived"),
-                true,
-            );
+            collected.keep_always(format!(
+                "stopped after {seen} diagnostics before {limit} records arrived"
+            ));
             break;
         }
     }
@@ -792,15 +821,11 @@ async fn consume_batch(
         mut records,
         diagnostics,
         failed,
-        suppressed,
         unshown,
     } = collect_from_topics(stream, topics, offset, limit, source).await?;
 
     for message in &diagnostics {
         print_diagnostic(message);
-    }
-    if suppressed > 0 {
-        print_diagnostic(&format!("{suppressed} more diagnostics not shown"));
     }
     for line in unshown_lines(&unshown) {
         print_diagnostic(&line);
@@ -855,6 +880,12 @@ fn unshown_lines(unshown: &BTreeMap<String, Unshown>) -> Vec<String> {
                 records.skipped.count, records.skipped
             ));
         }
+        if records.noted.count > 0 {
+            lines.push(format!(
+                "{topic}: {} more record diagnostic(s), details not shown, offsets {}",
+                records.noted.count, records.noted
+            ));
+        }
     }
     lines
 }
@@ -883,9 +914,7 @@ async fn consume_stream(
     while let Some(item) = incoming.next().await {
         match item {
             Incoming::Record(record) => output::print_summary(&record),
-            Incoming::Diagnostic(message) => print_diagnostic(&message),
-            Incoming::Skipped(d) => print_diagnostic(&d.message),
-            Incoming::Note(d) => print_diagnostic(&d.message),
+            Incoming::Skipped(d) | Incoming::Note(d) => print_diagnostic(&d.message),
             Incoming::Fatal(message) => {
                 failed = true;
                 print_diagnostic(&message);
@@ -959,7 +988,6 @@ mod tests {
         for item in items {
             match item {
                 Incoming::Record(r) => records.push(r),
-                Incoming::Diagnostic(d) => diagnostics.push(d),
                 Incoming::Skipped(d) | Incoming::Note(d) => diagnostics.push(d.message),
                 Incoming::Fatal(d) => panic!("a decode gave a fatal item: {d:?}"),
             }
@@ -974,7 +1002,6 @@ mod tests {
         for item in items {
             match item {
                 Incoming::Record(r) => records.push(r),
-                Incoming::Diagnostic(d) => diagnostics.push((d, false)),
                 Incoming::Skipped(d) | Incoming::Note(d) => diagnostics.push((d.message, false)),
                 Incoming::Fatal(d) => diagnostics.push((d, true)),
             }
@@ -993,7 +1020,9 @@ mod tests {
     #[test]
     fn decode_news_reports_bad_value_without_content() {
         let value = br#"{"secret":"<html>PAGE-BODY</html>"}"#;
-        let Incoming::Diagnostic(message) = decode_news("filimon-raw-pages", 42, value) else {
+        let Incoming::Skipped(RecordDiagnostic { message, .. }) =
+            decode_news("filimon-raw-pages", 42, value)
+        else {
             panic!("expected a diagnostic");
         };
         assert!(message.contains("filimon-raw-pages"), "{message}");
@@ -1001,7 +1030,8 @@ mod tests {
         assert!(!message.contains("PAGE-BODY"), "{message}");
 
         // An invalid-type error quotes the value; it must still not leak.
-        let Incoming::Diagnostic(message) = decode_news("t", 1, br#""<html>PAGE-BODY</html>""#)
+        let Incoming::Skipped(RecordDiagnostic { message, .. }) =
+            decode_news("t", 1, br#""<html>PAGE-BODY</html>""#)
         else {
             panic!("expected a diagnostic");
         };
@@ -1077,7 +1107,9 @@ mod tests {
             "inferred_category": "General"
         }));
         for value in [ESCAPED_QUOTE_VALUE, three_quotes, article_shaped.as_slice()] {
-            let Incoming::Diagnostic(message) = decode_news("filimon-raw-pages", 42, value) else {
+            let Incoming::Skipped(RecordDiagnostic { message, .. }) =
+                decode_news("filimon-raw-pages", 42, value)
+            else {
                 panic!("expected a diagnostic");
             };
             assert!(message.contains("filimon-raw-pages"), "{message:?}");
@@ -1089,7 +1121,9 @@ mod tests {
 
     #[test]
     fn empty_and_malformed_values_are_reported() {
-        let Incoming::Diagnostic(message) = decode_news("filimon-raw-pages", 3, b"") else {
+        let Incoming::Skipped(RecordDiagnostic { message, .. }) =
+            decode_news("filimon-raw-pages", 3, b"")
+        else {
             panic!("expected a diagnostic");
         };
         assert!(message.contains("filimon-raw-pages offset 3"), "{message:?}");
@@ -1110,7 +1144,7 @@ mod tests {
         );
 
         // Bytes that are not valid UTF-8 inside a JSON string.
-        let Incoming::Diagnostic(message) =
+        let Incoming::Skipped(RecordDiagnostic { message, .. }) =
             decode_news("filimon-raw-pages", 5, b"\"\xFFPAGE-BODY\"")
         else {
             panic!("expected a diagnostic");
