@@ -62,9 +62,11 @@ Task IDs are bound to the PLAN.md files (02-01, 02-02, 02-03, 02-04). Every task
 | 02-04-T1 | 02-04 | 3 | PIPE-02/03 | T-02-02, T-02-04 | every diagnostic printed via `print_diagnostic` → `sanitize_for_terminal` | unit + structural grep | `cargo test -p filimon commands::consume::tests::diagnostic_line_strips_control_chars` (+ eprintln grep gate in 02-04-PLAN.md) | ✅ | ✅ green |
 | 02-04-T1 | 02-04 | 3 | PIPE-03 | T-02-02 | live social poison record → one content-free diagnostic | integration (cluster) | `cargo test -p filimon -- --ignored poison_social_record_is_reported_without_value` | ✅ | ✅ green |
 | 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | news decode diagnostics built from serde class/line/column only | unit | `cargo test -p filimon commands::consume::tests::decode_news_withholds_escaped_quote_content` | ✅ | ✅ green |
-| 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | SmartModule hint cut before first quote/backtick/control char | unit | `cargo test -p filimon commands::consume::tests::stream_error_hint_withholds_quoted_value` + `other_stream_errors_withhold_record_value` | ✅ | ✅ green |
+| 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | SmartModule hint never copied: described from a closed allow-list of module prefixes and serde phrases (tightened by review fix WR-05); other stream-error text cut before first quote/backtick/control char | unit | `cargo test -p filimon commands::consume::tests::stream_error_hint_withholds_quoted_value` + `other_stream_errors_withhold_record_value` | ✅ | ✅ green |
 | 02-04-T2 | 02-04 | 3 | PIPE-01/02/03 | — | edge: 200-char cut by scalar values; empty/malformed values reported | unit | `cargo test -p filimon commands::consume::tests::hint_detail_truncates_by_chars` + `empty_and_malformed_values_are_reported` | ✅ | ✅ green |
 | 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | live news poison record through real map-preprocess hint | integration (cluster) | `cargo test -p filimon -- --ignored poison_news_record_is_reported_without_value` | ✅ | ✅ green |
+
+Post-review fixes WR-01..WR-06 (02-REVIEW-FIX.md; commits 308e775, 9382d43, ec72c90, 4c2845e, fc99d4e, 7330aa6) are not plan tasks, so they add no rows; their 18 new tests (e.g. news_branch_reopens_past_rejected_record, failed_batch_with_no_records_keeps_previous_output, enrich_ner_is_rejected_in_streaming_mode, rfc3339_to_utc_normalizes_only_rfc3339, module_hint_prefixes_match_smartmodule_sources, undecodable_flood_stops_at_diagnostic_budget, cluster good_news_after_poison_record_is_delivered) run in the same `cargo test -p filimon` sample.
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -98,7 +100,7 @@ The `fili file` news smoke (SC2) and the README operator path (SC2/SC3/D-05) are
 - [x] Feedback latency < 60s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** validated 2026-11-04 (re-audit after gap closure 02-04: 109 unit + 5 cluster tests green on 02351bc; 2 live checks remain manual-only)
+**Approval:** validated 2026-11-04 (re-audit after review fixes WR-01..WR-06: 125 unit + 6 cluster tests green on 172681a; every map command re-run; 2 live checks remain manual-only)
 
 ## Validation Audit 2026-11-03
 
