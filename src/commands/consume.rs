@@ -1874,6 +1874,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merged_stop_never_splits_a_note_from_its_record() {
+        const RAW: &str = "filimon-raw-pages";
+        const SOCIAL: &str = "filimon-social-items";
+        let edge = || json(&edge_social("social", Some("9999-12-31T23:00:00-05:00")));
+        // Every kept note names a record that is in the output.
+        fn assert_notes_have_records(collected: &Collected) {
+            for message in collected.diagnostics.iter().filter(|m| m.contains("set to null")) {
+                assert!(
+                    ids_of(&collected.records, SourceType::Social).contains(&"t3_edge"),
+                    "note without its record: {message:?}"
+                );
+            }
+        }
+
+        // Limit stop: a news record that fills the limit cannot land between
+        // the social note and its record.
+        let news = iter(vec![record("n1"), record("n2")]);
+        let social = iter(decode_social(SOCIAL, 7, &edge()));
+        let collected =
+            collect_records(merge_incoming(news, social), 2, Duration::from_secs(1)).await;
+        assert_eq!(ids_of(&collected.records, SourceType::News), ["n1"]);
+        assert_eq!(ids_of(&collected.records, SourceType::Social), ["t3_edge"]);
+        let edge_record = collected
+            .records
+            .iter()
+            .find(|r| r.id == "t3_edge")
+            .expect("social record");
+        assert_eq!(edge_record.published, None);
+        assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+        assert!(collected.diagnostics[0].contains(&format!("{SOCIAL} offset 7:")));
+        assert!(collected.diagnostics[0].contains("set to null"));
+        assert!(!collected.failed);
+        assert_notes_have_records(&collected);
+
+        // Budget stop: a news skip that hits the budget cannot land between
+        // the social note and its record.
+        let news = futures_util::stream::iter((0..100).map(|offset| skipped(RAW, offset)));
+        let social = futures_util::stream::iter(
+            (0..49)
+                .map(|offset| skipped(SOCIAL, offset))
+                .chain(decode_social(SOCIAL, 49, &edge())),
+        );
+        let collected =
+            collect_records(merge_incoming(news, social), 1, Duration::from_secs(1)).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        assert_eq!(collected.records[0].id, "t3_edge");
+        assert_eq!(collected.records[0].published, None);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        let last = collected.diagnostics.last().expect("note");
+        assert!(last.contains(&format!("{SOCIAL} offset 49:")), "{last:?}");
+        assert!(last.contains("set to null"), "{last:?}");
+        assert!(
+            collected.diagnostics.iter().all(|m| !m.contains("stopped after")),
+            "{:?}",
+            collected.diagnostics
+        );
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+        assert_notes_have_records(&collected);
+    }
+
+    #[tokio::test]
     async fn low_relevance_social_is_kept() {
         let item = social_item("t3_lol", "https://www.reddit.com/r/test/comments/lol", "lol cat");
         let value = serde_json::to_vec(&item).expect("serializable");
