@@ -83,14 +83,39 @@ pub struct OffsetRanges {
 
 impl OffsetRanges {
     /// Add one offset.
+    ///
+    /// An offset already inside the last range only counts. An offset one
+    /// past the end of the last range extends it (a checked add, so
+    /// `i64::MAX` cannot overflow). Any other offset starts a new range.
     fn add(&mut self, offset: i64) {
         self.count += 1;
+        if let Some((start, end)) = self.ranges.last_mut() {
+            if (*start..=*end).contains(&offset) {
+                return;
+            }
+            if end.checked_add(1) == Some(offset) {
+                *end = offset;
+                return;
+            }
+        }
         self.ranges.push((offset, offset));
     }
 }
 
+/// Each range as `start`, or `start-end` when it spans more than one offset,
+/// joined by `, `. An empty set writes nothing.
 impl std::fmt::Display for OffsetRanges {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, &(start, end)) in self.ranges.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            if start == end {
+                write!(f, "{start}")?;
+            } else {
+                write!(f, "{start}-{end}")?;
+            }
+        }
         Ok(())
     }
 }
@@ -134,6 +159,17 @@ impl Collected {
             self.diagnostics.push(message);
         } else {
             self.suppressed += 1;
+        }
+    }
+
+    /// Keep the message of a skipped record, or, once `MAX_DIAGNOSTICS` are
+    /// kept, drop it and add only the record's offset to its topic's skipped
+    /// ranges.
+    fn skip(&mut self, d: RecordDiagnostic) {
+        if self.diagnostics.len() < MAX_DIAGNOSTICS {
+            self.diagnostics.push(d.message);
+        } else {
+            self.unshown.entry(d.topic).or_default().skipped.add(d.offset);
         }
     }
 }
@@ -259,10 +295,14 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
     let mut item = match serde_json::from_slice::<SourceItem>(value) {
         Ok(item) => item,
         Err(e) => {
-            return vec![Incoming::Diagnostic(format!(
-                "{topic} offset {offset}: not a social item: {}",
-                describe_json_error(&e)
-            ))];
+            return vec![Incoming::Skipped(RecordDiagnostic {
+                topic: topic.to_string(),
+                offset,
+                message: format!(
+                    "{topic} offset {offset}: not a social item: {}",
+                    describe_json_error(&e)
+                ),
+            })];
         }
     };
 
@@ -459,8 +499,9 @@ where
 /// Stops when the stream ends, nothing arrives within `idle`, or
 /// `diagnostic_budget(limit)` diagnostics have arrived, so a topic full of
 /// undecodable values cannot keep a run going. Diagnostics are kept
-/// separately (at most `MAX_DIAGNOSTICS`, see `Collected::note`) and do not
-/// count toward `limit`; a fatal one also marks the run failed.
+/// separately (at most `MAX_DIAGNOSTICS` messages, see `Collected::note` and
+/// `Collected::skip`; past that a skipped record keeps only its offset) and
+/// do not count toward `limit`; a fatal one also marks the run failed.
 pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
     mut stream: S,
     limit: usize,
@@ -478,7 +519,7 @@ pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
             }
             Ok(Some(Incoming::Skipped(d))) => {
                 seen += 1;
-                collected.note(d.message, false);
+                collected.skip(d);
             }
             Ok(Some(Incoming::Fatal(message))) => {
                 seen += 1;
@@ -745,7 +786,7 @@ async fn consume_batch(
         diagnostics,
         failed,
         suppressed,
-        unshown: _,
+        unshown,
     } = collect_from_topics(stream, topics, offset, limit, source).await?;
 
     for message in &diagnostics {
@@ -753,6 +794,9 @@ async fn consume_batch(
     }
     if suppressed > 0 {
         print_diagnostic(&format!("{suppressed} more diagnostics not shown"));
+    }
+    for line in unshown_lines(&unshown) {
+        print_diagnostic(&line);
     }
 
     for message in enrich(&mut records, ner.map(|engine| engine as &dyn EntityDetector)) {
@@ -792,8 +836,20 @@ fn finish_batch(records: &[OutputRecord], failed: bool, path: &Path) -> miette::
 }
 
 /// One stderr line per topic for the records named only by offset.
-fn unshown_lines(_unshown: &BTreeMap<String, Unshown>) -> Vec<String> {
-    Vec::new()
+///
+/// Topics come in name order. A line holds the topic name, a count and the
+/// exact offset ranges; it reads only the map, never a message.
+fn unshown_lines(unshown: &BTreeMap<String, Unshown>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (topic, records) in unshown {
+        if records.skipped.count > 0 {
+            lines.push(format!(
+                "{topic}: {} more skipped record(s), details not shown, offsets {}",
+                records.skipped.count, records.skipped
+            ));
+        }
+    }
+    lines
 }
 
 /// One stderr diagnostic line, with control characters removed.
