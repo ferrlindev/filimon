@@ -3,22 +3,54 @@ phase: 02
 review: 02-REVIEW.md
 titles: json
 findings:
+  - id: WR-07
+    severity: warning
+    disposition: open
+    title: "Diagnostic-budget stop counts as a clean run, so a run that got only errors overwrites the last good output with `[]` and exits 0"
+  - id: WR-08
+    severity: warning
+    disposition: open
+    title: "`MAX_REOPENS` counts over the whole run, and each record left in a rejected batch costs one reopen"
+  - id: WR-09
+    severity: warning
+    disposition: open
+    title: "`rfc3339_to_utc` can turn valid RFC 3339 input into output that is not RFC 3339"
+  - id: WR-10
+    severity: warning
+    disposition: open
+    title: "`save_json` writes through a predictable temp path that follows symlinks"
+  - id: WR-11
+    severity: warning
+    disposition: open
+    title: "Already-defended-elsewhere: second `check_ner_mode` inside `consume::run`"
+  - id: IN-09
+    severity: info
+    disposition: open
+    title: "Atomic `save_json` changes the output file's identity and does not make the rename durable"
+  - id: IN-10
+    severity: info
+    disposition: open
+    title: "SmartModule prefix drift test is narrow and brittle"
+  - id: IN-11
+    severity: info
+    disposition: open
+    title: "A failed reopen reports the rejected record as \"skipped\" right before the branch ends"
   - id: WR-01
     severity: warning
     disposition: fixed
-    title: "One poison record permanently halts the news branch (carried forward, open)"
+    title: "One poison record permanently halts the news branch"
   - id: WR-02
     severity: warning
     disposition: fixed
-    title: "Consume exits 0 and overwrites prior output when streams fail (carried forward, open)"
+    title: "Consume exits 0 and overwrites prior output when streams fail"
   - id: WR-03
     severity: warning
     disposition: fixed
-    title: "`--enrich-ner` silently ignored in streaming mode (carried forward, open)"
+    title: "`--enrich-ner` silently ignored in streaming mode"
   - id: WR-04
     severity: warning
     disposition: fixed
-    title: "Social `published` validated but not normalized to UTC (carried forward, open)"
+    title: "Social `published` validated but not normalized to UTC"
   - id: WR-05
     severity: warning
     disposition: fixed
@@ -63,24 +95,32 @@ findings:
     severity: info
     disposition: open
     title: "Already-defended-elsewhere — empty-parent guard before `create_dir_all`"
-open: 8
-total: 15
-recorded: 2026-11-04T10:21:41.933Z
+open: 16
+total: 23
+recorded: 2026-11-04T10:33:26.560Z
 ---
 
 # Phase 02: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-01 | warning | fixed | 02-REVIEW-FIX.md (commit 308e775; title differs from review by its carried-forward suffix) |
-| WR-02 | warning | fixed | 02-REVIEW-FIX.md (commit 9382d43; title differs from review by its carried-forward suffix) |
-| WR-03 | warning | fixed | 02-REVIEW-FIX.md (commit ec72c90; title differs from review by its carried-forward suffix) |
-| WR-04 | warning | fixed | 02-REVIEW-FIX.md (commit 4c2845e; title differs from review by its carried-forward suffix) |
-| WR-05 | warning | fixed | 02-REVIEW-FIX.md |
-| WR-06 | warning | fixed | 02-REVIEW-FIX.md |
-| IN-01 | info | open | - |
-| IN-02 | info | open | - |
-| IN-03 | info | open | - |
+| WR-07 | warning | open | - |
+| WR-08 | warning | open | - |
+| WR-09 | warning | open | - |
+| WR-10 | warning | open | - |
+| WR-11 | warning | open | - |
+| IN-09 | info | open | - |
+| IN-10 | info | open | - |
+| IN-11 | info | open | - |
+| WR-01 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
+| WR-02 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
+| WR-03 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
+| WR-04 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
+| WR-05 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
+| WR-06 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
+| IN-01 | info | open | - (not in the current review) |
+| IN-02 | info | open | - (not in the current review) |
+| IN-03 | info | open | - (not in the current review) |
 | CR-01 | critical | fixed | gap plan 02-04 (commits 1e895e0, e406c7a); incremental re-review 16e529d confirms all three parts resolved (not in the current review) |
 | IN-04 | info | open | - (not in the current review) |
 | IN-05 | info | open | - (not in the current review) |
