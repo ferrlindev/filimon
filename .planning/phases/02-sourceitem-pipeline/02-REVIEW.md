@@ -1,110 +1,139 @@
 ---
 phase: 02-sourceitem-pipeline
-reviewed: 2026-11-04T12:19:37Z
+reviewed: 2026-11-04T13:33:36Z
 depth: standard
-files_reviewed: 2
+files_reviewed: 1
 files_reviewed_list:
   - src/commands/consume.rs
-  - src/models.rs
 findings:
   critical: 0
-  warning: 3
-  info: 4
-  total: 7
+  warning: 2
+  info: 6
+  total: 8
   necessity: 1
 status: issues_found
 ---
 
-# Phase 2: Code Review Report (re-review after gap-closure plans 02-05 and 02-06)
+# Phase 2: Code Review Report (re-review after gap-closure plan 02-07)
 
-**Reviewed:** 2026-11-04T12:19:37Z
+**Reviewed:** 2026-11-04T13:33:36Z
 **Depth:** standard
-**Files Reviewed:** 2
+**Files Reviewed:** 1
 **Status:** issues_found
 
 ## Summary
 
-Scope: `src/commands/consume.rs` and `src/models.rs` at HEAD `4799bbd`, diff base `6d61d72`. The source commits are 66075b0..1e09a35 (02-05: located record diagnostics and exact per-topic offset ranges past `MAX_DIAGNOSTICS`) and cd7f8e8..74ce6c3 (02-06: the `utc_rfc3339` year guard). As instructed, WR-07 (a budget stop does not mark the run failed) is out of scope under plan 02-05 and is not raised again. The `fluvio/` checkout was read but not modified.
+Scope: `src/commands/consume.rs` at HEAD `d5bfb44`, diff base `9f38a1c`. The source commits since that base are only the four 02-07 commits: d39e9a5 and 972c4cc (Task 1: notes no longer charged to the diagnostic budget), and 08452d7 and eadd9b2 (Task 2: `Incoming::Noted { record, notes }`). They were merged in 8a85020. 02-07-PLAN.md, 02-07-SUMMARY.md and 02-REVIEW-DISPOSITION.md were read for intent. No source file was modified.
 
 Evidence:
-- `cargo test -p filimon --offline`: 132 passed, 0 failed, 7 ignored. The cluster tests were not run.
-- `fluvio/crates/fluvio-spu/src/smartengine/batch.rs:39-135`: `process_batch` returns the successes before an error together with that error. So the records before a rejected offset in the same batch are still delivered. The `news_incoming` in-batch reasoning (consume.rs:407-411) still holds.
-- The only `eprintln!` in consume.rs is at line 900, inside `print_diagnostic`. Every `unshown_lines` line passes through it (consume.rs:830-832). Range lines are built only from the topic map key, a count and integer offsets, so content-freedom (CR-01) holds.
-- `src/output.rs` is unchanged since 98e70f6. That file is not in scope, so WR-10 and IN-09 stay as recorded.
+- `cargo test -p filimon --offline`: 134 passed, 0 failed, 8 ignored. The cluster tests (`#[ignore]`) were not run.
+- `grep` across `src/` and `tests/`: `Incoming`, `decode_social` and `collect_records` have no users outside consume.rs. The return-type change of `decode_social` (`Vec<Incoming>` to `Incoming`) breaks no other caller.
+- futures-util 0.3.31 (Cargo.lock), `stream/select.rs:52-54` and `select_with_strategy.rs:32-35`: `select` alternates starting with the left (news) stream. This matters for IN-15.
 
-02-06 is sound. All three date paths (`rfc3339_to_utc`, `epoch_ms_to_rfc3339`, `parse_news_published`) go through `utc_rfc3339` (models.rs:199-245). The 0000 and 9999 boundaries are tested on both sides, and every in-range output is re-parsed as RFC 3339. 02-05 locates every skip path: `decode_news` (consume.rs:292), `decode_social` (315) and every `news_incoming` skip (460-475). One new warning: a social `Note` counts toward the diagnostic budget and arrives before its `Record`. A budget stop can therefore fall between the two, so a note (kept, or named in a "noted" range) describes a record that was never written. This breaks the documented invariant "noted names records that were written" (WR-12). WR-08 and WR-11 are unchanged and carried forward.
+**WR-12 is resolved.** Each stop path was traced:
+- **Limit stop.** `while collected.records.len() < limit` (consume.rs:564) is checked only between items. The `Noted` arm (571-576) pushes the record before any of its notes.
+- **Budget stop.** `seen += 1` now happens only in the `Skipped` (567-570) and `Fatal` (577-581) arms. The check at 584 therefore runs only after an item that gives no record, never inside a `Noted` item.
+- **Idle and end-of-stream stops.** These come from `stream.next()` (565), between whole items.
+- **Merged stream.** `decode_social` (319-359) returns exactly one item per value. `social_incoming` (510-528) no longer flattens, so `stream::select` cannot interleave a news item between a note and its record.
+- **Noted ranges.** A noted range now always names a pushed record. `Collected::note` is reached only from the `Noted` arm, after `records.push`. Also, `finish_batch` (866-884) can refuse to write only when `records` is empty, which cannot happen once a `Noted` item has arrived.
+- **Streaming mode** (933-938) prints the notes and then the summary from the same item.
+- **Tests.** `note_at_budget_boundary_keeps_its_record` reproduces the exact WR-12 trace (cases A-D), and `merged_stop_never_splits_a_note_from_its_record` covers both merged-stream splits.
 
-### Prior findings in these files
+The diff adds no correctness or security defect. Content-freedom is unchanged: the `Noted` notes are the same fixed-format strings as before, and every one is printed through `print_diagnostic` (915-917). Two new Info items follow from the change. The budget stop line and the `diagnostic_budget` doc still say "diagnostics", but notes are no longer counted (IN-14). One new test asserts exact counts that depend on futures-util's left-first polling order (IN-15). WR-08, WR-11, IN-10, IN-11, IN-12 and IN-13 are still present and are carried forward with updated line numbers.
+
+### Prior findings in this file
 
 | Prior ID | Status | Evidence |
 |---|---|---|
-| WR-07: budget stop is a clean run | **Open, out of scope (plan 02-05)** | `collect_records` consume.rs:568-572 still does not set `failed`. `finish_batch` 850-868 is unchanged. |
-| WR-08: `MAX_REOPENS` counts over the whole run | **Open** (carried below) | consume.rs:438-439, 467, 476: `reopens` is never reset and goes up on in-batch steps too. |
-| WR-09: `rfc3339_to_utc` can emit non-RFC 3339 | **Resolved** by 02-06 | `utc_rfc3339` models.rs:199-204 is used at 213, 220 and 244. Tests at models.rs:514-554, 556-608, 735-801 and consume.rs:1917-1956. |
-| WR-10: predictable temp path in `save_json` | Not in scope (output.rs) | output.rs is unchanged since 98e70f6. |
-| WR-11: second `check_ner_mode` in `run` | **Open** (carried below) | consume.rs:763. |
-| IN-03: single-digit offset assertions | **Open** | consume.rs:1077 `contains('9')`, 1894 `contains('3')`. The new 02-05 and 02-06 tests use full `"{topic} offset {n}:"` prefixes. |
-| IN-06 / IN-07 (models.rs) | **Open** (unchanged) | models.rs:228-245 and 185-187. |
-| IN-09 | Not in scope (output.rs) | |
-| IN-10: brittle prefix drift test | **Open** (carried below) | consume.rs:1246-1267. |
-| IN-11: failed reopen still says "skipped" | **Open** (carried below) | consume.rs:475-489. |
-| CR-01 | **Resolved**, no regression | See the evidence above. |
+| WR-12: budget stop between a social note and its record | **Resolved** by 02-07 | consume.rs:564-590 (`Noted` arm pushes record first; notes not charged to `seen`); 319-359 one item per value; 510-528 no flatten; tests at 1650-1730 and 1942-2000. |
+| WR-08: `MAX_REOPENS` counts over the whole run | **Open** (carried below) | consume.rs:408, 441, 477, 486: `reopens` is never reset, and in-batch steps (458-466) still increase it. |
+| WR-11: second `check_ner_mode` in `run` | **Open** (carried below) | consume.rs:779; main.rs:73 already checks. |
+| IN-10: brittle prefix drift test | **Open** (carried below) | consume.rs:1292-1313. |
+| IN-11: failed reopen still says "skipped" | **Open** (carried below) | consume.rs:485, 492-498. |
+| IN-12: fatal lines use up the record-diagnostic cap | **Open** (carried below) | consume.rs:170-187 still compare `self.diagnostics.len()`. |
+| IN-13: reopen-limit line says 100, but 101 are reported as skipped | **Open** (carried below) | consume.rs:477-483. |
+| IN-03: single-digit offset assertions | **Open** (not re-raised; not in this re-review's carry list) | consume.rs:1123 `contains('9')`, 2124 `contains('3')`. The 02-07 tests use full `"{topic} offset {n}:"` prefixes. |
+| WR-07, WR-10, IN-06, IN-07, IN-09 | Not in scope | Out of scope (WR-07) or in files not reviewed here (models.rs, output.rs). |
 
 ## Narrative Findings (AI reviewer)
 
 ## Warnings
 
-### WR-12: A budget stop can fall between a social note and its record, so a note describes a record that was never written
-
-**File:** `src/commands/consume.rs:326-348, 553-573` (docs at 70-71, 127-129)
-**Issue:** `decode_social` returns `[Note, ..., Record]`. `social_incoming` flattens these into separate stream items, and `merge_incoming` can interleave news items between them. `collect_records` counts every `Note` toward `seen` (557-560) and runs the budget check after each item (568-572). So the run can stop right after a `Note`, before its `Record` arrives. Trace with `--limit 1` (budget 100): 99 undecodable social values, then a value with `"published":"yesterday"` at offset 99. The `Note` brings `seen` to 100 and is kept as the 100th message (`offset 99: published is not an RFC 3339 time ...; set to null`). The loop then breaks, and the record is never collected. With `--limit 50` and the stop at item 500, the offset goes into `unshown[topic].noted` and prints as "more record diagnostic(s)". Both outcomes contradict `Incoming::Note` ("a record that still gives an output record", line 70) and `Unshown::noted` ("records that were written", line 128), and break the 02-05 truth that notes concern written records. The operator sees a published value nulled on a record that is missing from the file, and nothing marks that record as unread. None of the tests feeds a `Note` into the budget boundary.
-**Fix:** Notes cannot make a run unbounded: at most two arrive per record, and records are bounded by `limit`. So do not charge them to the budget:
-```rust
-Ok(Some(Incoming::Note(d))) => collected.note(d), // no `seen += 1`
-```
-Alternatively, carry notes with their record (`Incoming::Record(OutputRecord, Vec<RecordDiagnostic>)`) so they cannot be separated. Add a test: 99 `skipped(...)` items, then `noted("t", 99)` and a record, collected with limit 1. It must yield the record and no dangling note.
-
 ### WR-08: `MAX_REOPENS` counts over the whole run, and each record left in a rejected batch costs one reopen (carried forward, unchanged)
 
-**File:** `src/commands/consume.rs:438-439, 467-476`
-**Issue:** The code is the same as in the previous review. `b.reopens` is never reset when a record is delivered (line 439), and the in-batch step (449-456) charges the cap once per offset (476). A streaming run that sees 101 rejected records over its whole lifetime loses the news branch for good. So does a single poison record followed by 100 or more records in the same stored batch. Since 02-05, each in-batch step is also reported as a separate `Skipped` record, so the cap now also limits how many in-batch records get named before the branch ends.
-**Fix:** As before: reset `b.reopens = 0` on `Ok(Incoming::Record(_))`, and do not count the in-batch steps (`Some(start) if e.offset < start`) toward `MAX_REOPENS`, or give them their own larger per-batch cap. Add unit tests for both cases.
+**File:** `src/commands/consume.rs:408, 441, 458-466, 477, 486`
+**Issue:** 02-07 did not touch this code. `b.reopens` starts at 0 (441), is never reset when the branch delivers a record (449), and goes up once per reopen (486), in-batch steps included (458-466). A streaming run (`--limit 0`) that meets 101 rejected records over its whole life loses the news branch for good: the closing line at 479-482 becomes `Incoming::Fatal`, and `consume_stream` then exits with an error once the social branch ends. A single poison record followed by 100 or more records in the same stored batch has the same effect, because each in-batch step costs one reopen.
+**Fix:** Reset the counter when a record gets through, and do not charge in-batch steps to the cap (or give them their own per-batch cap):
+```rust
+let code = match b.stream.as_mut()?.next().await? {
+    Ok(incoming) => {
+        if matches!(incoming, Incoming::Record(_)) {
+            b.reopens = 0;
+        }
+        return Some((incoming, b));
+    }
+    Err(code) => code,
+};
+// ...
+let in_batch = matches!(b.start, Some(start) if e.offset < start);
+// ...
+if !in_batch {
+    b.reopens += 1;
+}
+```
+Add unit tests for both cases: 101 rejections separated by good records, and 101 or more in-batch steps.
 
 ### WR-11: Already-defended-elsewhere: second `check_ner_mode` inside `consume::run` (carried forward, unchanged)
 
-**File:** `src/commands/consume.rs:763`
+**File:** `src/commands/consume.rs:779`
 **Category:** necessity
-**Issue:** The code is unchanged from the previous review. The crate is binary-only, and `main.rs` already rejects `--enrich-ner` with `--limit 0` before the model loads. `ner` is `Some` only when that flag is set. So the state `ner.is_some() && limit == 0` cannot reach `run`.
-**Fix:** Remove the call at consume.rs:763, or keep a single check in `run` and pass it the flag.
+**Issue:** The crate is a binary only. `main.rs:73` already calls `commands::consume::check_ner_mode(enrich_ner, limit)?` before the model loads, and `ner` is `Some` only when `enrich_ner` is set (main.rs:74). So `run` can never receive `ner.is_some() && limit == 0`, and the check at consume.rs:779 cannot fail.
+**Fix:** Remove the call at consume.rs:779. Or keep a single check in `run`, pass it the flag, and drop the one in main.rs.
 
 ## Info
 
-### IN-12: Fatal and budget-stop lines use up the record-diagnostic message cap
+### IN-14: The budget stop line and the `diagnostic_budget` doc still say "diagnostics", but notes are no longer counted (new, from 02-07)
 
-**File:** `src/commands/consume.rs:149-152, 164-187`
-**Issue:** `skip` and `note` compare `self.diagnostics.len()` against `MAX_DIAGNOSTICS`. `diagnostics` also holds the messages from `keep_always` (fatal lines). Each fatal line kept before the cap is reached therefore cuts one record diagnostic from the "100 kept messages", and pushes that record into the range line. For example, if the social branch fails at once and news then floods, only 99 news messages are kept. No record goes unnamed, but the behavior contradicts the doc on `MAX_DIAGNOSTICS` ("Most record diagnostics a batch run keeps as messages") and the 02-05 statement that "a flood keeps exactly MAX_DIAGNOSTICS + 1 messages".
-**Fix:** Keep a separate `kept_records: usize` counter and compare that counter against `MAX_DIAGNOSTICS`. Or reword the doc to "most diagnostic messages, fatal ones included".
+**File:** `src/commands/consume.rs:160-164, 584-587`
+**Issue:** Since 972c4cc, `seen` counts only `Skipped` and `Fatal` items, while notes are still pushed into `collected.diagnostics` or the noted ranges. Two texts were not updated:
+- The doc on `diagnostic_budget` (160-161) still says "Most diagnostics a batch run for `limit` records reads before it stops".
+- The stop line still prints `stopped after {seen} diagnostics before {limit} records arrived`.
 
-### IN-13: The reopen-limit closing line says it skipped 100 records, but 101 are reported as skipped
+Example: `--limit 10`, 9 social records that each carry a note, and 100 undecodable values. The run prints 100 kept messages (9 notes and 91 skips), then "9 more skipped record(s)", then "stopped after 100 diagnostics". The operator counts 109 diagnostics against a line that says 100. The collect_records doc (544-549) was rewritten correctly. 02-07-SUMMARY says the `diagnostic_budget` region was left byte-identical on purpose, but the text it pins is now wrong.
+**Fix:** Change the doc to "Most skipped and fatal items a batch run for `limit` records reads before it stops". Change the stop line to `stopped after {seen} skipped or failed records before {limit} records arrived`. Update the tests that match `stopped after` if they pin the full text.
 
-**File:** `src/commands/consume.rs:467-473`
-**Issue:** When the limit is reached, the 101st rejected record is now sent as `Incoming::Skipped` (line 468). In batch mode past the cap, it is counted in "N more skipped record(s)". The test at consume.rs:1685 confirms this: skipped offsets run `0..=MAX_REOPENS`. The closing fatal line still says `stopped after skipping {MAX_REOPENS} records`, which is one fewer than the run reported.
-**Fix:** Word the closing line as `stopped after {MAX_REOPENS} reopens; {MAX_REOPENS + 1} records rejected`, or count the records actually sent.
+### IN-15: `merged_stop_never_splits_a_note_from_its_record` asserts counts that depend on futures-util's polling order (new, from 02-07)
+
+**File:** `src/commands/consume.rs:1977-1999`
+**Issue:** The budget case asserts exactly 100 kept messages and that the last one is `filimon-social-items offset 49:`. That holds only because `stream::select` polls the left (news) stream first and then alternates (futures-util 0.3.31, `select.rs:52-54`, `PollNext::default() == Left`). With right-first polling, the `Noted` item arrives after 98 skips. The record then fills the limit with 99 messages, and the test fails even though the invariant it protects (no note without its record) still holds. A futures-util upgrade, or swapping the arguments of `merge_incoming`, would break this test for a reason unrelated to WR-12.
+**Fix:** Assert the invariant rather than the interleaving: the record `t3_edge` is present, every message containing `set to null` has its record, no `stopped after` line appears, and `collected.diagnostics.len()` is 99 or 100. Or build the interleaving by hand with `iter(vec![...])` instead of `merge_incoming`, so the order is explicit.
+
+### IN-12: Fatal and budget-stop lines use up the record-diagnostic message cap (carried forward, unchanged)
+
+**File:** `src/commands/consume.rs:155-158, 170-187, 191-193`
+**Issue:** `skip` and `note` compare `self.diagnostics.len()` against `MAX_DIAGNOSTICS`, but `diagnostics` also holds the `keep_always` fatal lines. Each fatal line kept before the cap is reached cuts one record diagnostic from the 100 kept messages. This contradicts the doc on `MAX_DIAGNOSTICS` ("Most record diagnostics a batch run keeps as messages").
+**Fix:** Count kept record diagnostics in a separate `kept_records: usize` field and compare that against `MAX_DIAGNOSTICS`. Or reword the doc to "most diagnostic messages, fatal ones included".
+
+### IN-13: The reopen-limit closing line says it skipped 100 records, but 101 are reported as skipped (carried forward, unchanged)
+
+**File:** `src/commands/consume.rs:477-483`
+**Issue:** When the limit is reached, the 101st rejected record is still sent as `Incoming::Skipped` (478). The closing fatal line then says `stopped after skipping {MAX_REOPENS} records`, one fewer than the number reported. The test at `news_branch_reopens_at_most_max_times` confirms this: it expects `MAX_REOPENS + 2` diagnostics, which are `MAX_REOPENS + 1` skipped plus the closing line.
+**Fix:** Word the line as `stopped after {MAX_REOPENS} reopens; {} records rejected` with `MAX_REOPENS + 1`, or count the records actually sent.
 
 ### IN-10: SmartModule prefix drift test is narrow and brittle (carried forward, unchanged)
 
-**File:** `src/commands/consume.rs:1246-1267`
-**Issue:** The test only matches `eyre!("` with the literal on the same line, and it asserts an exact count. The details are unchanged from the previous review.
-**Fix:** Match `eyre!|bail!|ensure!|wrap_err|context` across lines, and assert set inclusion rather than equal counts.
+**File:** `src/commands/consume.rs:1292-1313`
+**Issue:** The test only matches `eyre!("` with the literal on the same line, and it asserts that the number of matches equals `MODULE_HINT_PREFIXES.len()`. A multi-line `eyre!(` call, `bail!`, `wrap_err` or `.context(...)` would be missed. Two messages that share one prefix would fail the count even though both are covered.
+**Fix:** Match `eyre!|bail!|ensure!|wrap_err|context` across lines, and check that every found message is covered by a listed prefix rather than comparing counts.
 
 ### IN-11: A failed reopen reports the rejected record as "skipped" right before the branch ends (carried forward, unchanged)
 
-**File:** `src/commands/consume.rs:475-489`
-**Issue:** `"{message}; skipped"` is built before `(b.reopen)(next)` runs. If the reopen fails, the next line is the fatal "could not reopen". No later read moves past the record.
-**Fix:** In the `Err(err)` arm, send the message without the `; skipped` suffix, as the reopen-limit path does.
+**File:** `src/commands/consume.rs:485, 492-498`
+**Issue:** `located(format!("{message}; skipped"))` is built before `(b.reopen)(next)` runs. If the reopen fails, the next item is the fatal "could not reopen at offset {next}". No later read moves past the record, so "skipped" overstates what happened.
+**Fix:** Build the item after the reopen result is known. In the `Err(err)` arm, send `located(message)` without the `; skipped` suffix, as the reopen-limit path does.
 
 ---
 
-_Reviewed: 2026-11-04T12:19:37Z_
+_Reviewed: 2026-11-04T13:33:36Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
