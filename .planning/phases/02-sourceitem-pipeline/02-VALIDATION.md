@@ -40,7 +40,7 @@ created: "2026-11-04"
 
 ## Per-Task Verification Map
 
-Task IDs are bound to the PLAN.md files (02-01 through 02-06). Every task's full `<automated>` gate and its `<fails_when>` statement live in its plan; the commands below are the primary test filter for each row.
+Task IDs are bound to the PLAN.md files (02-01 through 02-07). Every task's full `<automated>` gate and its `<fails_when>` statement live in its plan; the commands below are the primary test filter for each row.
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
@@ -70,6 +70,9 @@ Task IDs are bound to the PLAN.md files (02-01 through 02-06). Every task's full
 | 02-05-T2 | 02-05 | 4 | PIPE-02/03 | T-02-02 | every skip path located; notes kept apart; no skipped range covers a written record | unit | `cargo test -p filimon commands::consume::tests::located_diagnostics_match_their_message` + `unshown_ranges_never_cover_written_records` + `fatal_diagnostic_is_kept_past_the_cap` | ✅ | ✅ green |
 | 02-06-T1 | 02-06 | 5 | PIPE-01/03 | — | social `published` outside UTC year 0000..=9999 becomes null plus one located note | unit | `cargo test -p filimon commands::consume::tests::social_published_outside_year_range_becomes_null` + `models::tests::rfc3339_to_utc_normalizes_only_rfc3339` + `models::tests::chrono_writes_out_of_range_years_with_sign` | ✅ | ✅ green |
 | 02-06-T2 | 02-06 | 5 | PIPE-01/02 | — | news and epoch `published` outside the year range become null; `published_raw` keeps the original | unit | `cargo test -p filimon models::tests::from_article_drops_out_of_range_published` + `epoch_ms_to_rfc3339_converts` + `parse_news_published_best_effort` | ✅ | ✅ green |
+| 02-07-T1 | 02-07 | 6 | PIPE-03/04 | T-02-27, T-02-28 | a social note at the diagnostic budget boundary keeps its record; notes do not charge the budget | unit | `cargo test -p filimon commands::consume::tests::note_at_budget_boundary_keeps_its_record` + `undecodable_flood_stops_at_diagnostic_budget` + `fatal_diagnostic_is_kept_past_the_cap` | ✅ | ✅ green |
+| 02-07-T1 | 02-07 | 6 | PIPE-03 | T-02-27, T-02-29 | live scratch topic: a noted social record at the budget boundary is written with its note, content-free | integration (cluster) | `cargo test -p filimon -- --ignored social_note_at_budget_boundary_is_written` | ✅ | ✅ green |
+| 02-07-T2 | 02-07 | 6 | PIPE-03/04 | T-02-27 | a record and its notes are one `Incoming::Noted` item; no limit/budget stop in the merged stream splits them | unit + structural grep | `cargo test -p filimon commands::consume::tests::merged_stop_never_splits_a_note_from_its_record` + `located_diagnostics_match_their_message` + `unshown_ranges_never_cover_written_records` + `fatal_item_marks_collection_failed` (+ Noted/no-standalone-note grep gates in 02-07-PLAN.md) | ✅ | ✅ green |
 
 Post-review fixes WR-01..WR-06 (02-REVIEW-FIX.md; commits 308e775, 9382d43, ec72c90, 4c2845e, fc99d4e, 7330aa6) are not plan tasks, so they add no rows; their 18 new tests (e.g. news_branch_reopens_past_rejected_record, failed_batch_with_no_records_keeps_previous_output, enrich_ner_is_rejected_in_streaming_mode, rfc3339_to_utc_normalizes_only_rfc3339, module_hint_prefixes_match_smartmodule_sources, undecodable_flood_stops_at_diagnostic_budget, cluster good_news_after_poison_record_is_delivered) run in the same `cargo test -p filimon` sample.
 
@@ -105,7 +108,7 @@ The `fili file` news smoke (SC2) and the README operator path (SC2/SC3/D-05) are
 - [x] Feedback latency < 60s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** validated 2026-11-04 (re-audit after gap-closure plans 02-05 and 02-06: 132 unit + 7 cluster tests green on 5caa89b; 2 live checks remain manual-only)
+**Approval:** validated 2026-11-04 (re-audit after gap-closure plan 02-07 / WR-12: 134 unit + 8 cluster tests green on a62b2fb; 3 new rows for 02-07-T1/T2, 0 gaps; 2 live checks remain manual-only. Earlier: after 02-05/02-06, 132 unit + 7 cluster on 5caa89b)
 
 ## Validation Audit 2026-11-03
 
