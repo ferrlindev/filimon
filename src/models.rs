@@ -5,7 +5,7 @@
 // topics as JSON-encoded messages.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -190,6 +190,19 @@ impl SourceItem {
     }
 }
 
+/// Format a UTC time as RFC 3339, or None when its year is outside 0000..=9999.
+///
+/// RFC 3339 has exactly four year digits. chrono writes a year outside
+/// 0000..=9999 with a sign and five or more digits (for example
+/// `+10000-01-01T04:00:00.000Z`), which no RFC 3339 parser accepts, so such a
+/// time gives None and D-09's "RFC 3339 or null" holds.
+fn utc_rfc3339(utc: DateTime<Utc>, precision: SecondsFormat) -> Option<String> {
+    if !(0..=9999).contains(&utc.year()) {
+        return None;
+    }
+    Some(utc.to_rfc3339_opts(precision, true))
+}
+
 /// Convert WIT epoch milliseconds to RFC 3339 UTC with millisecond precision.
 ///
 /// Values outside chrono's range give None.
@@ -200,11 +213,10 @@ pub fn epoch_ms_to_rfc3339(ms: u64) -> Option<String> {
 }
 
 /// An RFC 3339 timestamp converted to UTC with millisecond precision, or
-/// None when `s` is not RFC 3339.
+/// None when `s` is not RFC 3339 or its UTC year is outside 0000..=9999.
 pub fn rfc3339_to_utc(s: &str) -> Option<String> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Millis, true))
+    let utc = DateTime::parse_from_rfc3339(s).ok()?.with_timezone(&Utc);
+    utc_rfc3339(utc, SecondsFormat::Millis)
 }
 
 /// Best-effort parse of a news date string to RFC 3339 UTC.

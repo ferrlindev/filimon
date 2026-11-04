@@ -304,8 +304,8 @@ pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
 ///
 /// Every record read here is labelled social (topic of origin), whatever
 /// `source_type` it claims; a claimed `news` adds a diagnostic. An RFC 3339
-/// `published` is converted to UTC; any other value becomes null with a
-/// diagnostic. A value that is not a
+/// `published` is converted to UTC; any other value, or one whose UTC year is
+/// outside 0000..=9999, becomes null with a diagnostic. A value that is not a
 /// `SourceItem` becomes one diagnostic, which carries only the JSON error
 /// class and position. No diagnostic includes the value.
 pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
@@ -340,7 +340,7 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
         item.published = rfc3339_to_utc(&published);
         if item.published.is_none() {
             out.push(note(format!(
-                "{topic} offset {offset}: published is not RFC 3339; set to null"
+                "{topic} offset {offset}: published is not an RFC 3339 time with a UTC year from 0000 to 9999; set to null"
             )));
         }
     }
