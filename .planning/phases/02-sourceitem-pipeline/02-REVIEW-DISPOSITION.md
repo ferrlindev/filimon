@@ -63,9 +63,9 @@ findings:
     severity: info
     disposition: open
     title: "Already-defended-elsewhere — empty-parent guard before `create_dir_all`"
-open: 12
+open: 8
 total: 15
-recorded: 2026-11-04T10:21:31.273Z
+recorded: 2026-11-04T10:21:41.933Z
 ---
 
 # Phase 02: Code Review Disposition
