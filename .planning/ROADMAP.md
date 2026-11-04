@@ -56,7 +56,7 @@ Plans:
   2. `fili produce <url>` and `fili file <paths>` still yield extracted articles at the consumer through `map-preprocess → map-extract → filter-relevance`. The news path does not regress.
   3. A social `SourceItem` produced to Fluvio reaches the consumer without any social-specific filtering, even when its text would fall below the news relevance threshold.
   4. In the consumer's existing NER mode (`--enrich-ner` with `--limit`), NER runs on social item text, and social and news records go to the same JSON output, each labelled with source type and platform.
-**Plans:** 6/6 plans executed
+**Plans:** 6/7 plans executed
 
 Plans:
 **Wave 1**
@@ -74,6 +74,9 @@ Plans:
 
 **Wave 5** *(gap closure; blocked on 02-05, same file)*
 - [x] 02-06-PLAN.md — Gap 3 (D-09 year limits, WR-09): one guarded RFC 3339 formatter returns null for UTC years outside 0000..=9999 on the social, news and epoch paths (PIPE-01, PIPE-03)
+
+**Wave 6** *(gap closure; blocked on 02-06, same file)*
+- [ ] 02-07-PLAN.md — WR-12: a social record and its notes travel as one stream item (`Incoming::Noted`), and notes no longer count toward the diagnostic budget, so no limit or budget stop can leave a note about an unwritten record (PIPE-03, PIPE-04)
 
 ### Phase 3: Component Host Runtime
 **Goal**: `fili` hosts WASM components. It loads only what the registry lists, polls each source on its schedule, persists cursors across restarts, isolates failing plugins, and produces returned items to Fluvio as `SourceItem` records
@@ -151,7 +154,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
-| 2. SourceItem Pipeline | 6/6 | In Progress | - |
+| 2. SourceItem Pipeline | 6/7 | In Progress | - |
 | 3. Component Host Runtime | 0/TBD | Not started | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
