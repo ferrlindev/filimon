@@ -40,7 +40,7 @@ created: "2026-11-04"
 
 ## Per-Task Verification Map
 
-Task IDs are bound to the PLAN.md files (02-01, 02-02, 02-03, 02-04). Every task's full `<automated>` gate and its `<fails_when>` statement live in its plan; the commands below are the primary test filter for each row.
+Task IDs are bound to the PLAN.md files (02-01 through 02-06). Every task's full `<automated>` gate and its `<fails_when>` statement live in its plan; the commands below are the primary test filter for each row.
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
@@ -65,6 +65,11 @@ Task IDs are bound to the PLAN.md files (02-01, 02-02, 02-03, 02-04). Every task
 | 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | SmartModule hint never copied: described from a closed allow-list of module prefixes and serde phrases (tightened by review fix WR-05); other stream-error text cut before first quote/backtick/control char | unit | `cargo test -p filimon commands::consume::tests::stream_error_hint_withholds_quoted_value` + `other_stream_errors_withhold_record_value` | ✅ | ✅ green |
 | 02-04-T2 | 02-04 | 3 | PIPE-01/02/03 | — | edge: 200-char cut by scalar values; empty/malformed values reported | unit | `cargo test -p filimon commands::consume::tests::hint_detail_truncates_by_chars` + `empty_and_malformed_values_are_reported` | ✅ | ✅ green |
 | 02-04-T2 | 02-04 | 3 | PIPE-02 | T-02-02 | live news poison record through real map-preprocess hint | integration (cluster) | `cargo test -p filimon -- --ignored poison_news_record_is_reported_without_value` | ✅ | ✅ green |
+| 02-05-T1 | 02-05 | 4 | PIPE-02/03 | T-02-02 | past `MAX_DIAGNOSTICS`, every skipped record is named by topic and exact offset range; no record content kept | unit | `cargo test -p filimon commands::consume::tests::undecodable_flood_stops_at_diagnostic_budget` + `offset_ranges_are_exact` + `cap_boundary_moves_only_later_offsets_into_ranges` | ✅ | ✅ green |
+| 02-05-T1 | 02-05 | 4 | PIPE-03 | T-02-02 | live social flood names every offset 0..=149 exactly once, content-free | integration (cluster) | `cargo test -p filimon -- --ignored undecodable_social_flood_names_every_offset` | ✅ | ✅ green |
+| 02-05-T2 | 02-05 | 4 | PIPE-02/03 | T-02-02 | every skip path located; notes kept apart; no skipped range covers a written record | unit | `cargo test -p filimon commands::consume::tests::located_diagnostics_match_their_message` + `unshown_ranges_never_cover_written_records` + `fatal_diagnostic_is_kept_past_the_cap` | ✅ | ✅ green |
+| 02-06-T1 | 02-06 | 5 | PIPE-01/03 | — | social `published` outside UTC year 0000..=9999 becomes null plus one located note | unit | `cargo test -p filimon commands::consume::tests::social_published_outside_year_range_becomes_null` + `models::tests::rfc3339_to_utc_normalizes_only_rfc3339` + `models::tests::chrono_writes_out_of_range_years_with_sign` | ✅ | ✅ green |
+| 02-06-T2 | 02-06 | 5 | PIPE-01/02 | — | news and epoch `published` outside the year range become null; `published_raw` keeps the original | unit | `cargo test -p filimon models::tests::from_article_drops_out_of_range_published` + `epoch_ms_to_rfc3339_converts` + `parse_news_published_best_effort` | ✅ | ✅ green |
 
 Post-review fixes WR-01..WR-06 (02-REVIEW-FIX.md; commits 308e775, 9382d43, ec72c90, 4c2845e, fc99d4e, 7330aa6) are not plan tasks, so they add no rows; their 18 new tests (e.g. news_branch_reopens_past_rejected_record, failed_batch_with_no_records_keeps_previous_output, enrich_ner_is_rejected_in_streaming_mode, rfc3339_to_utc_normalizes_only_rfc3339, module_hint_prefixes_match_smartmodule_sources, undecodable_flood_stops_at_diagnostic_budget, cluster good_news_after_poison_record_is_delivered) run in the same `cargo test -p filimon` sample.
 
@@ -100,7 +105,7 @@ The `fili file` news smoke (SC2) and the README operator path (SC2/SC3/D-05) are
 - [x] Feedback latency < 60s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** validated 2026-11-04 (re-audit after review fixes WR-01..WR-06: 125 unit + 6 cluster tests green on 172681a; every map command re-run; 2 live checks remain manual-only)
+**Approval:** validated 2026-11-04 (re-audit after gap-closure plans 02-05 and 02-06: 132 unit + 7 cluster tests green on 5caa89b; 2 live checks remain manual-only)
 
 ## Validation Audit 2026-11-03
 
