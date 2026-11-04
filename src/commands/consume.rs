@@ -178,34 +178,119 @@ pub fn describe_stream_error(topic: &str, code: &ErrorCode) -> String {
     }
 }
 
-/// Turn a raw news stream into `Incoming` items.
-///
-/// The first stream error becomes one diagnostic and then the stream ends,
-/// because a retry-disabled consumer cannot move past it.
-fn news_incoming<S>(stream: S, topic: &str) -> impl Stream<Item = Incoming> + Unpin + use<S>
+/// Most times one news branch reopens its stream past a record the chain
+/// rejected. After that the branch ends.
+const MAX_REOPENS: usize = 100;
+
+/// One decoded item of the news stream, or the stream error.
+type NewsItem = Result<Incoming, ErrorCode>;
+
+/// Decode each record of a raw news stream; stream errors pass through.
+fn decoded_news<S>(stream: S, topic: String) -> impl Stream<Item = NewsItem> + Unpin + use<S>
 where
     S: Stream<Item = Result<Record, ErrorCode>> + Unpin,
 {
-    let topic = topic.to_string();
-    stream.scan(false, move |failed, item| {
-        if *failed {
-            return future::ready(None);
+    stream.map(move |item| item.map(|record| decode_news(&topic, record.offset(), record.value())))
+}
+
+/// State of the news branch between items.
+struct NewsBranch<S, F> {
+    topic: String,
+    stream: Option<S>,
+    /// The offset the current stream was reopened at, if it was.
+    start: Option<i64>,
+    /// A last diagnostic to give before the branch ends.
+    closing: Option<String>,
+    reopen: F,
+    reopens: usize,
+}
+
+/// Turn a decoded news stream into `Incoming` items.
+///
+/// A retry-disabled consumer cannot move past a record the chain rejects, so
+/// a `SmartModule` runtime error becomes one diagnostic and the branch calls
+/// `reopen` with the next offset, at most `MAX_REOPENS` times.
+///
+/// The cluster runs the chain over whole stored batches, whatever the start
+/// offset. A reopened stream that fails again on a record before its start
+/// offset therefore started inside the rejected record's batch: the record at
+/// the start offset cannot pass the chain either, so it is reported as
+/// skipped and the next reopen starts one further on.
+///
+/// Any other stream error, a failed reopen or the reopen limit gives a
+/// diagnostic and ends the branch.
+fn news_incoming<S, F, Fut>(
+    first: S,
+    topic: &str,
+    reopen: F,
+) -> impl Stream<Item = Incoming> + Unpin + use<S, F, Fut>
+where
+    S: Stream<Item = NewsItem> + Unpin,
+    F: FnMut(i64) -> Fut,
+    Fut: Future<Output = miette::Result<S>>,
+{
+    let branch = NewsBranch {
+        topic: topic.to_string(),
+        stream: Some(first),
+        start: None,
+        closing: None,
+        reopen,
+        reopens: 0,
+    };
+    Box::pin(futures_util::stream::unfold(branch, |mut b| async move {
+        if let Some(message) = b.closing.take() {
+            b.stream = None;
+            return Some((Incoming::Diagnostic(message), b));
         }
-        let incoming = match item {
-            Ok(record) => decode_news(&topic, record.offset(), record.value()),
-            Err(code) => {
-                *failed = true;
-                Incoming::Diagnostic(describe_stream_error(&topic, &code))
-            }
+        let code = match b.stream.as_mut()?.next().await? {
+            Ok(incoming) => return Some((incoming, b)),
+            Err(code) => code,
         };
-        future::ready(Some(incoming))
-    })
+        b.stream = None;
+        let ErrorCode::SmartModuleRuntimeError(e) = &code else {
+            return Some((Incoming::Diagnostic(describe_stream_error(&b.topic, &code)), b));
+        };
+        let (message, next) = match b.start {
+            Some(start) if e.offset < start => (
+                format!(
+                    "{} offset {start}: stored in one batch with rejected offset {}, \
+                     so it cannot pass the SmartModule chain",
+                    b.topic, e.offset
+                ),
+                start.saturating_add(1),
+            ),
+            _ => (describe_stream_error(&b.topic, &code), e.offset.saturating_add(1)),
+        };
+        if b.reopens >= MAX_REOPENS {
+            b.closing = Some(format!(
+                "{}: stopped after skipping {MAX_REOPENS} records the SmartModule chain rejected",
+                b.topic
+            ));
+            return Some((Incoming::Diagnostic(message), b));
+        }
+        b.reopens += 1;
+        match (b.reopen)(next).await {
+            Ok(stream) => {
+                b.stream = Some(stream);
+                b.start = Some(next);
+            }
+            Err(err) => {
+                b.closing = Some(format!(
+                    "{}: could not reopen at offset {next}: {}",
+                    b.topic,
+                    hint_summary(&err.to_string())
+                ));
+            }
+        }
+        Some((Incoming::Diagnostic(format!("{message}; skipped")), b))
+    }))
 }
 
 /// Turn a raw social stream into `Incoming` items.
 ///
-/// Same shape as `news_incoming`: each record gives its `decode_social`
-/// items, and the first stream error gives one diagnostic and ends the branch.
+/// Each record gives its `decode_social` items, and the first stream error
+/// gives one diagnostic and ends the branch. The social stream has no chain,
+/// so no record can be rejected and there is nothing to reopen past.
 fn social_incoming<S>(stream: S, topic: &str) -> impl Stream<Item = Incoming> + Unpin + use<S>
 where
     S: Stream<Item = Result<Record, ErrorCode>> + Unpin,
@@ -365,21 +450,33 @@ pub fn required_inputs<'a>(
 ///
 /// The social stream is opened with no chain modules, so the chain never sees
 /// social records. Preflight runs before any stream opens, and an unselected
-/// source is an empty branch.
-async fn open_incoming(
-    stream: &FluvioStream,
+/// source is an empty branch. The news branch reopens its stream past a
+/// record the chain rejects (see `news_incoming`).
+async fn open_incoming<'s>(
+    stream: &'s FluvioStream,
     topics: &ConsumeTopics<'_>,
     offset: Offset,
     source: SourceFilter,
-) -> miette::Result<impl Stream<Item = Incoming> + Unpin + use<>> {
+) -> miette::Result<impl Stream<Item = Incoming> + Unpin + use<'s>> {
     let (needed, chain) = required_inputs(source, topics);
     stream.preflight(&needed, chain).await?;
 
     let news = if reads_news(source) {
+        let raw_pages = topics.raw_pages.to_string();
         let raw = stream
-            .topic_stream(topics.raw_pages, offset.clone(), news_chain())
+            .topic_stream(&raw_pages, offset.clone(), news_chain())
             .await?;
-        news_incoming(raw, topics.raw_pages).boxed()
+        let first = decoded_news(raw, raw_pages.clone());
+        let reopen = move |next: i64| {
+            let raw_pages = raw_pages.clone();
+            async move {
+                let offset = Offset::absolute(next)
+                    .map_err(|e| miette::miette!("bad offset {next}: {e}"))?;
+                let raw = stream.topic_stream(&raw_pages, offset, news_chain()).await?;
+                Ok(decoded_news(raw, raw_pages))
+            }
+        };
+        news_incoming(first, topics.raw_pages, reopen).boxed()
     } else {
         futures_util::stream::empty().boxed()
     };
@@ -825,6 +922,117 @@ mod tests {
         };
         let message = describe_stream_error("filimon-raw-pages", &not_found);
         assert!(message.contains("filimon/missing@0.1.0"), "{message:?}");
+    }
+
+    fn runtime_error_at(offset: i64) -> ErrorCode {
+        ErrorCode::SmartModuleRuntimeError(Box::new(SmartModuleTransformRuntimeError {
+            hint: "Failed to parse RawPage: invalid type: string \"PAGE-BODY\"".into(),
+            offset,
+            record_value: "PAGE-BODY".into(),
+            ..Default::default()
+        }))
+    }
+
+    type NewsIter = futures_util::stream::Iter<std::vec::IntoIter<NewsItem>>;
+
+    fn news_items(items: Vec<NewsItem>) -> NewsIter {
+        futures_util::stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn news_branch_reopens_past_rejected_record() {
+        let first = news_items(vec![Ok(record("n0")), Err(runtime_error_at(1))]);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let reopen = |next: i64| {
+            calls.borrow_mut().push(next);
+            future::ready(Ok(news_items(vec![Ok(record("n2"))])))
+        };
+        let collected =
+            collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
+        assert_eq!(*calls.borrow(), [2]);
+        let ids: Vec<&str> = collected.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["n0", "n2"]);
+        assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+        let message = &collected.diagnostics[0];
+        assert!(message.contains("raw offset 1"), "{message:?}");
+        assert!(message.contains("skipped"), "{message:?}");
+        assert!(!message.contains("PAGE-BODY"), "{message:?}");
+    }
+
+    #[tokio::test]
+    async fn news_branch_steps_through_rejected_batch() {
+        // The cluster feeds the chain whole stored batches, so a stream
+        // reopened inside the rejected record's batch fails on it again.
+        let first = news_items(vec![Err(runtime_error_at(0))]);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let reopen = |next: i64| {
+            calls.borrow_mut().push(next);
+            let items = if next < 3 {
+                vec![Err(runtime_error_at(0))]
+            } else {
+                vec![Ok(record("n3"))]
+            };
+            future::ready(Ok(news_items(items)))
+        };
+        let collected =
+            collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
+        assert_eq!(*calls.borrow(), [1, 2, 3]);
+        let ids: Vec<&str> = collected.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["n3"]);
+        let d = &collected.diagnostics;
+        assert_eq!(d.len(), 3, "{d:?}");
+        assert!(d[0].contains("raw offset 0: SmartModule error"), "{d:?}");
+        for (message, offset) in d[1..].iter().zip(1..) {
+            assert!(message.contains(&format!("raw offset {offset}: stored in one batch")), "{d:?}");
+            assert!(message.contains("rejected offset 0"), "{d:?}");
+        }
+        assert!(d.iter().all(|m| m.ends_with("; skipped")), "{d:?}");
+        assert!(d.iter().all(|m| !m.contains("PAGE-BODY")), "{d:?}");
+    }
+
+    #[tokio::test]
+    async fn news_branch_ends_on_other_stream_error() {
+        let first = news_items(vec![
+            Err(ErrorCode::Other("broken".into())),
+            Ok(record("never")),
+        ]);
+        let reopen = |_next: i64| -> future::Ready<miette::Result<NewsIter>> {
+            panic!("must not reopen on a non-SmartModule error")
+        };
+        let collected =
+            collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
+        assert!(collected.records.is_empty(), "{:?}", collected.records);
+        assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
+    }
+
+    #[tokio::test]
+    async fn news_branch_reopens_at_most_max_times() {
+        let first = news_items(vec![Err(runtime_error_at(0))]);
+        let calls = std::cell::Cell::new(0_usize);
+        let reopen = |next: i64| {
+            calls.set(calls.get() + 1);
+            future::ready(Ok(news_items(vec![Err(runtime_error_at(next))])))
+        };
+        let collected =
+            collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
+        assert_eq!(calls.get(), MAX_REOPENS);
+        assert!(collected.records.is_empty());
+        // One per rejected record, then the closing line.
+        assert_eq!(collected.diagnostics.len(), MAX_REOPENS + 2);
+        let last = collected.diagnostics.last().expect("closing line");
+        assert!(last.contains("stopped after skipping"), "{last:?}");
+    }
+
+    #[tokio::test]
+    async fn news_branch_reports_failed_reopen() {
+        let first = news_items(vec![Err(runtime_error_at(4))]);
+        let reopen = |_next: i64| future::ready(Err::<NewsIter, _>(miette::miette!("no stream")));
+        let collected =
+            collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
+        assert!(collected.records.is_empty());
+        let d = &collected.diagnostics;
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d[1].contains("could not reopen at offset 5"), "{d:?}");
     }
 
     #[test]
@@ -1485,6 +1693,53 @@ mod tests {
             assert!(!message.contains("PAGE-BODY-SECRET"), "{message:?}");
             let line = diagnostic_line(message);
             assert!(!line.chars().any(char::is_control), "{line:?}");
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with the filimon SmartModules loaded"]
+    async fn good_news_after_poison_record_is_delivered() -> miette::Result<()> {
+        with_scratch_topics(|raw, social| async move {
+            let stream = FluvioStream::connect().await?;
+
+            let same_batch = "https://example.com/same-batch";
+            let next_batch = "https://example.com/next-batch";
+            let page = |url: &str| SourceItem::news(url.to_string(), NEWS_HTML.to_string());
+            let poison = serde_json::Value::String("a\"PAGE-BODY-SECRET".to_string());
+            let producer = ready_producer(&stream, &raw).await?;
+            producer.send("poison", &poison).await?;
+            // Usually stored in the poison record's batch (producer linger).
+            producer.send(same_batch, &page(same_batch)).await?;
+            producer.flush().await?;
+            // Always in a later batch.
+            producer.send(next_batch, &page(next_batch)).await?;
+            producer.flush().await?;
+            // The social topic stays empty, but must be provisioned to open.
+            ready_producer(&stream, &social).await?;
+
+            let topics = ConsumeTopics {
+                raw_pages: &raw,
+                social: &social,
+            };
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 2, SourceFilter::News)
+                    .await?;
+            let urls: Vec<&str> = collected.records.iter().map(|r| r.url.as_str()).collect();
+            let d = &collected.diagnostics;
+            assert!(urls.ends_with(&[next_batch]), "{urls:?} {d:?}");
+            assert!(d[0].contains("offset 0: SmartModule error"), "{d:?}");
+            if urls.len() == 2 {
+                // The second record landed in its own batch.
+                assert_eq!(d.len(), 1, "{d:?}");
+            } else {
+                assert_eq!(urls.len(), 1, "{urls:?}");
+                assert_eq!(d.len(), 2, "{d:?}");
+                assert!(d[1].contains("offset 1: stored in one batch"), "{d:?}");
+            }
+            assert!(d.iter().all(|m| m.ends_with("; skipped")), "{d:?}");
+            assert!(d.iter().all(|m| !m.contains("PAGE-BODY")), "{d:?}");
             Ok(())
         })
         .await
