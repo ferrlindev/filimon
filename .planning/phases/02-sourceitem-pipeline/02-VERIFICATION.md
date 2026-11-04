@@ -30,6 +30,11 @@ covered_files:
 covered_digest: "v4:sha256:5e9a01a761138f8cced1439506fa42b583f0bd167501593b8fa4f7e8d813971a"
 behavior_unverified: 0
 overrides_applied: 0
+overrides:
+  - must_have: "D-09 social side: a social `published` that is valid RFC 3339 passes through unchanged; any other value becomes null with one diagnostic naming the topic and offset"
+    reason: "WR-04 (4c2845e) deliberately normalizes a valid RFC 3339 social `published` to UTC with millisecond precision. This matches README line 242 ('RFC 3339 UTC timestamp or null'), CONTEXT D-09 ('RFC 3339 or null') and the epoch-ms social path. Invalid values still become null with one diagnostic naming the topic and offset. Scope: this accepts only the UTC and millisecond normalization. It does not accept output that is not RFC 3339 at the year limits (gap 3); the Phase 02 gap-closure plans fix that."
+    accepted_by: "ferrlindev"
+    accepted_at: "2026-11-04T10:51:01Z"
 re_verification:
   previous_status: human_needed
   previous_score: 66/66
