@@ -520,6 +520,35 @@ mod tests {
             Some("1970-01-01T00:00:00.000Z")
         );
         assert_eq!(epoch_ms_to_rfc3339(u64::MAX), None);
+
+        // The last millisecond of 9999 converts; the first of 10000 does not.
+        assert_eq!(
+            epoch_ms_to_rfc3339(253_402_300_799_999).as_deref(),
+            Some("9999-12-31T23:59:59.999Z")
+        );
+        assert_eq!(epoch_ms_to_rfc3339(253_402_300_800_000), None);
+        for ms in [1_730_000_000_123, 0, 253_402_300_799_999] {
+            let out = epoch_ms_to_rfc3339(ms).expect("converts");
+            assert!(DateTime::parse_from_rfc3339(&out).is_ok(), "{ms} -> {out:?}");
+        }
+
+        let social_at = |ms: u64| {
+            SourceItem::social(
+                "x".to_string(),
+                "https://r/x".to_string(),
+                None,
+                String::new(),
+                None,
+                Some(ms),
+                "reddit".to_string(),
+                None,
+            )
+        };
+        assert_eq!(social_at(253_402_300_800_000).published, None);
+        assert_eq!(
+            social_at(253_402_300_799_999).published.as_deref(),
+            Some("9999-12-31T23:59:59.999Z")
+        );
     }
 
     #[test]
@@ -541,6 +570,39 @@ mod tests {
         assert_eq!(parse_news_published(Some("yesterday")), None);
         assert_eq!(parse_news_published(Some("")), None);
         assert_eq!(parse_news_published(None), None);
+
+        // A UTC year outside 0000..=9999 gives None on every parse branch:
+        // RFC 3339, RFC 2822, offset-less and date-only.
+        for input in [
+            "9999-12-31T23:00:00-05:00",
+            "0000-01-01T00:30:00+01:00",
+            "Fri, 31 Dec 9999 23:00:00 -0500",
+            "+10000-01-01T00:00:00",
+            "-0001-12-31",
+        ] {
+            assert_eq!(parse_news_published(Some(input)), None, "{input:?}");
+        }
+
+        // The in-range limits still parse, at seconds precision.
+        let limits = [
+            ("9999-12-31T23:59:59Z", "9999-12-31T23:59:59Z"),
+            ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00Z"),
+            ("9999-12-31T23:59:59.999999999Z", "9999-12-31T23:59:59Z"),
+            ("0000-01-01", "0000-01-01T00:00:00Z"),
+            ("9999-12-31", "9999-12-31T00:00:00Z"),
+        ];
+        for (input, expected) in limits {
+            assert_eq!(
+                parse_news_published(Some(input)).as_deref(),
+                Some(expected),
+                "{input:?}"
+            );
+        }
+
+        for input in cases.iter().map(|(i, _)| *i).chain(limits.iter().map(|(i, _)| *i)) {
+            let out = parse_news_published(Some(input)).expect("parses");
+            assert!(DateTime::parse_from_rfc3339(&out).is_ok(), "{input:?} -> {out:?}");
+        }
     }
 
     #[test]
@@ -596,6 +658,16 @@ mod tests {
         assert_eq!(
             unparsed.article.unwrap().published_raw.as_deref(),
             Some("last Tuesday")
+        );
+    }
+
+    #[test]
+    fn from_article_drops_out_of_range_published() {
+        let record = OutputRecord::from_article(article(Some("9999-12-31T23:00:00-05:00"), 0.7));
+        assert_eq!(record.published, None);
+        assert_eq!(
+            record.article.expect("article block").published_raw.as_deref(),
+            Some("9999-12-31T23:00:00-05:00")
         );
     }
 
