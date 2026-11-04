@@ -89,20 +89,64 @@ fn describe_json_error(e: &serde_json::Error) -> String {
     format!("{class} at line {} column {}", e.line(), e.column())
 }
 
-/// What a stream diagnostic says when no module-authored text is left.
+/// What a stream diagnostic says when no known or fluvio-authored text is left.
 const NO_DETAIL: &str = "no detail";
 
-/// Keep only the module-authored start of a `SmartModule` hint.
+/// The message prefixes the filimon `SmartModule`s write before `serde_json`'s
+/// error text (`eyre!("<prefix>: {}", e)`).
+const MODULE_HINT_PREFIXES: &[&str] = &[
+    "Failed to parse RawPage",            // map-preprocess
+    "Failed to serialize bundle",         // map-preprocess
+    "Failed to parse PreprocessedBundle", // map-extract
+    "Failed to serialize article",        // map-extract
+];
+
+/// `serde_json` error phrases a hint may start with after a module prefix
+/// (or alone, for filter-relevance's bare `?`).
+const SERDE_HINT_PHRASES: &[&str] = &[
+    "invalid type",
+    "invalid value",
+    "invalid length",
+    "missing field",
+    "unknown field",
+    "unknown variant",
+    "duplicate field",
+    "expected value",
+    "EOF while parsing",
+    "trailing characters",
+    "key must be a string",
+    "invalid number",
+    "number out of range",
+    "recursion limit exceeded",
+];
+
+/// Describe a `SmartModule`-authored hint by known phrases only.
 ///
-/// fluvio builds a `SmartModule` hint from the module's eyre report. The
-/// filimon modules write a fixed message prefix, such as
-/// `Failed to parse RawPage: `, followed by `serde_json`'s error text, and
-/// eyre adds a location block after a newline. serde puts every
-/// record-controlled piece of its text after a double quote (string values)
-/// or a backtick (variant names, field names, numbers), and a `look_back`
-/// error's record value follows a newline. So the
-/// text before the first double quote, backtick or control character holds
-/// only module-authored text. It is cut to `MAX_DETAIL` characters, and
+/// fluvio builds a `SmartModule` hint from the module's eyre report, which
+/// holds whatever text the module chose, and serde's part of it can carry
+/// record-derived text, quoted or bare (`invalid length 3`). So no text is
+/// copied from the hint: the result is the known module prefix it starts
+/// with (`MODULE_HINT_PREFIXES`), then the known serde phrase that follows
+/// it (`SERDE_HINT_PHRASES`), each only when present, or `NO_DETAIL`. A
+/// module message added later gives `NO_DETAIL` until its prefix is listed.
+fn module_hint_summary(hint: &str) -> String {
+    let (prefix, rest) = match MODULE_HINT_PREFIXES.iter().find(|p| hint.starts_with(**p)) {
+        Some(p) => (Some(*p), hint[p.len()..].strip_prefix(": ").unwrap_or("")),
+        None => (None, hint),
+    };
+    let phrase = SERDE_HINT_PHRASES.iter().find(|p| rest.starts_with(**p)).copied();
+    match (prefix, phrase) {
+        (Some(p), Some(f)) => format!("{p}: {f}"),
+        (Some(known), None) | (None, Some(known)) => known.to_string(),
+        (None, None) => NO_DETAIL.to_string(),
+    }
+}
+
+/// Keep only the start of a fluvio-authored error text.
+///
+/// Used for stream errors that carry no record value (and for failed
+/// reopens). As a second guard, the text is cut before the first double
+/// quote, backtick or control character, then to `MAX_DETAIL` characters;
 /// `NO_DETAIL` stands in when nothing is left.
 fn hint_summary(text: &str) -> String {
     let end = text
@@ -171,16 +215,21 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
 /// Describe a stream error without the record value.
 ///
 /// A chain runtime error carries the whole failing record (page HTML), and
-/// its hint quotes parts of it. The diagnostic keeps the offset and only the
-/// module-authored start of the hint (see `hint_summary`); other errors keep
-/// only the same kind of start of their text. Neither reads the stored record
-/// key or value.
+/// its module-authored hint can quote parts of it. The diagnostic keeps the
+/// offset and only known phrases matched in the hint (see
+/// `module_hint_summary`); a `look_back` error is treated the same way.
+/// Other errors keep only the start of their fluvio-authored text (see
+/// `hint_summary`). None reads the stored record key or value.
 pub fn describe_stream_error(topic: &str, code: &ErrorCode) -> String {
     match code {
         ErrorCode::SmartModuleRuntimeError(e) => format!(
             "{topic} offset {}: SmartModule error: {}",
             e.offset,
-            hint_summary(&e.hint)
+            module_hint_summary(&e.hint)
+        ),
+        ErrorCode::SmartModuleLookBackError(hint) => format!(
+            "{topic}: SmartModule look_back error: {}",
+            module_hint_summary(hint)
         ),
         other => format!("{topic}: stream error: {}", hint_summary(&other.to_string())),
     }
@@ -780,14 +829,14 @@ mod tests {
     #[test]
     fn stream_error_omits_record_value() {
         let code = ErrorCode::SmartModuleRuntimeError(Box::new(SmartModuleTransformRuntimeError {
-            hint: "bad".into(),
+            hint: "Failed to parse RawPage: invalid type: string \"PAGE-BODY\"".into(),
             offset: 7,
             record_value: "PAGE-BODY".into(),
             ..Default::default()
         }));
         let message = describe_stream_error("filimon-raw-pages", &code);
         assert!(message.contains('7'), "{message}");
-        assert!(message.contains("bad"), "{message}");
+        assert!(message.contains("Failed to parse RawPage"), "{message}");
         assert!(!message.contains("PAGE-BODY"), "{message}");
     }
 
@@ -932,7 +981,7 @@ mod tests {
             let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
             assert!(message.contains("offset 11"), "{message:?}");
             assert!(message.contains("SmartModule error"), "{message:?}");
-            assert!(message.contains("Failed to parse RawPage"), "{message:?}");
+            assert!(message.ends_with("SmartModule error: Failed to parse RawPage: invalid type"), "{message:?}");
             assert!(!message.contains("424242"), "{message:?}");
             assert!(!message.contains("Location"), "{message:?}");
             assert_content_free(&message);
@@ -940,9 +989,7 @@ mod tests {
 
         let message =
             describe_stream_error("filimon-raw-pages", &runtime_error("bad\u{1b}[2J tail".into()));
-        assert!(message.contains("bad"), "{message:?}");
-        assert!(!message.contains('\u{1b}'), "{message:?}");
-        assert!(!message.contains("tail"), "{message:?}");
+        assert!(message.ends_with("SmartModule error: no detail"), "{message:?}");
 
         for hint in [String::new(), "\"PAGE-BODY\" first".to_string()] {
             let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
@@ -955,10 +1002,52 @@ mod tests {
     #[test]
     fn hint_detail_truncates_by_chars() {
         for c in ['東', '🦀'] {
-            let hint: String = std::iter::repeat_n(c, 300).collect();
-            let message = describe_stream_error("filimon-raw-pages", &runtime_error(hint));
-            assert_eq!(message.chars().filter(|&m| m == c).count(), 200, "{c}");
+            let text: String = std::iter::repeat_n(c, 300).collect();
+            assert_eq!(hint_summary(&text).chars().filter(|&m| m == c).count(), 200, "{c}");
         }
+    }
+
+    #[test]
+    fn module_hint_prints_only_listed_phrases() {
+        // A future module message that interpolates record content before
+        // any quote must not reach the diagnostic.
+        let cases = [
+            (
+                "Failed to parse PreprocessedBundle https://secret.example/PAGE-BODY: x",
+                "Failed to parse PreprocessedBundle",
+            ),
+            ("Failed to parse page PAGE-BODY: invalid type", "no detail"),
+            ("PAGE-BODY", "no detail"),
+            ("Failed to serialize article: invalid length 3, expected PAGE-BODY", "Failed to serialize article: invalid length"),
+            ("missing field `url` at line 1 column 9", "missing field"),
+            ("invalid type: string \"PAGE-BODY\", expected struct ExtractedArticle", "invalid type"),
+        ];
+        for (hint, want) in cases {
+            assert_eq!(module_hint_summary(hint), want, "{hint:?}");
+        }
+    }
+
+    #[test]
+    fn module_hint_prefixes_match_smartmodule_sources() {
+        // Read-only drift check: every eyre! message in the chain modules
+        // starts with a listed prefix, so none silently becomes "no detail".
+        let sources = [
+            include_str!("../../smartmodules/map-preprocess/src/lib.rs"),
+            include_str!("../../smartmodules/map-extract/src/lib.rs"),
+            include_str!("../../smartmodules/filter-relevance/src/lib.rs"),
+        ];
+        let mut found = 0;
+        for line in sources.iter().flat_map(|s| s.lines()) {
+            let Some((_, msg)) = line.split_once("eyre!(\"") else {
+                continue;
+            };
+            found += 1;
+            assert!(
+                MODULE_HINT_PREFIXES.iter().any(|p| msg.starts_with(&format!("{p}: "))),
+                "unlisted SmartModule message: {line}"
+            );
+        }
+        assert_eq!(found, MODULE_HINT_PREFIXES.len());
     }
 
     #[test]
