@@ -11,7 +11,7 @@ created: "2026-11-03"
 # Phase 2 — Security
 
 > Per-phase security contract: threat register, accepted risks, and audit trail.
-> Register source: `<threat_model>` blocks in 02-01 through 02-06 PLAN.md (authored at plan time). No `## Threat Flags` were raised in any SUMMARY.md.
+> Register source: `<threat_model>` blocks in 02-01 through 02-07 PLAN.md (authored at plan time). No `## Threat Flags` were raised in any SUMMARY.md.
 
 ---
 
@@ -63,6 +63,10 @@ created: "2026-11-03"
 | T-02-25 | Repudiation | `decode_social` published note | low | mitigate | out-of-range `published` keeps the record with null plus one located note (consume.rs:343); test social_published_outside_year_range_becomes_null passes | closed |
 | T-02-26 | Information Disclosure | `decode_social` published note text | low | mitigate | note is fixed text plus topic and offset only (consume.rs:343); test asserts the limit values are absent | closed |
 | T-02-SC (02-06) | Tampering | package installs | high | accept | no packages installed (`chrono::Datelike` from existing chrono 0.4.45); Cargo.toml/Cargo.lock unchanged — see Accepted Risks | closed |
+| T-02-27 | Repudiation | `decode_social` → `collect_records` note path (plan 02-07, WR-12) | low | mitigate | `Incoming::Noted { record, notes }` (consume.rs:72); `decode_social` returns it when notes exist (consume.rs:357); `collect_records` pushes the record before `collected.note(d)` (consume.rs:571-575); no standalone note variant in `enum Incoming` (consume.rs:67-79); tests note_at_budget_boundary_keeps_its_record, merged_stop_never_splits_a_note_from_its_record, cluster social_note_at_budget_boundary_is_written present | closed |
+| T-02-28 | Denial of Service | diagnostic budget in `collect_records` (plan 02-07) | low | mitigate | `Noted` arm does not increment `seen` (consume.rs:571-576); only `Skipped`/`Fatal` count; `diagnostic_budget` and `finish_batch` byte-identical to 98e70f6; tests undecodable_flood_stops_at_diagnostic_budget, fatal_diagnostic_is_kept_past_the_cap present | closed |
+| T-02-29 | Information Disclosure | note text in kept messages, noted ranges, streaming output (plan 02-07) | low | mitigate | notes are fixed text + topic + offset (consume.rs:340-351); `diagnostic_line`/`print_diagnostic` byte-identical to 578c371; single `eprintln!` in consume.rs (consume.rs:916); streaming `Noted` arm prints notes via `print_diagnostic` (consume.rs:933); tests social_published_outside_year_range_becomes_null, social_note_at_budget_boundary_is_written present | closed |
+| T-02-SC (02-07) | Tampering | package installs | high | accept | no packages installed; `git diff 578c371 HEAD -- Cargo.toml Cargo.lock` empty — see Accepted Risks | closed |
 
 *Status: open · closed · open — below high threshold (non-blocking)*
 *Severity: critical > high > medium > low — only open threats at or above workflow.security_block_on count toward threats_open*
@@ -84,6 +88,7 @@ created: "2026-11-03"
 | AR-02-08 | T-02-23 | Range line length bounded by `diagnostic_budget(limit)` (≤ 400 entries at default `--limit 50`), operator-chosen limit, sanitized output | plan 02-05 threat model | 2026-11-04 |
 | AR-02-09 | T-02-SC (02-05) | No package installed; `BTreeMap` is std, Cargo.toml/Cargo.lock unchanged | plan 02-05 threat model | 2026-11-04 |
 | AR-02-10 | T-02-SC (02-06) | No package installed; `chrono::Datelike` from existing chrono 0.4.45 | plan 02-06 threat model | 2026-11-04 |
+| AR-02-11 | T-02-SC (02-07) | No package installed; Cargo.toml/Cargo.lock unchanged against 578c371 | plan 02-07 threat model | 2026-11-04 |
 
 *Accepted risks do not resurface in future audit runs.*
 
@@ -105,7 +110,7 @@ created: "2026-11-03"
 - [x] `threats_open: 0` confirmed
 - [x] `status: verified` set in frontmatter
 
-**Approval:** verified 2026-11-04 (re-audit after gap plans 02-05 and 02-06: 9 new register entries T-02-20..T-02-26 plus two T-02-SC verified at L1 grep depth on 5673a3e; all 32 entries closed)
+**Approval:** verified 2026-11-04 (re-audit after gap plan 02-07 / WR-12: 4 new register entries T-02-27..T-02-29 plus T-02-SC (02-07) verified at L1 grep depth on 5959464; all 36 entries closed. Earlier: re-audit after 02-05/02-06 on 5673a3e, 32 entries closed)
 
 ## Security Audit 2026-11-03
 
@@ -121,4 +126,12 @@ created: "2026-11-03"
 |---|---|
 | Threats found | 32 |
 | Closed | 32 |
+| Open | 0 |
+
+## Security Audit 2026-11-04
+
+| Metric | Count |
+|---|---|
+| Threats found | 36 |
+| Closed | 36 |
 | Open | 0 |
