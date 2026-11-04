@@ -37,7 +37,7 @@ findings:
     title: "A failed reopen reports the rejected record as \"skipped\" right before the branch ends (carried forward, unchanged)"
   - id: WR-12
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "A budget stop can fall between a social note and its record, so a note describes a record that was never written"
   - id: WR-07
     severity: warning
@@ -115,9 +115,9 @@ findings:
     severity: info
     disposition: open
     title: "Already-defended-elsewhere — empty-parent guard before `create_dir_all`"
-open: 21
+open: 20
 total: 28
-recorded: 2026-11-04T13:34:46.261Z
+recorded: 2026-11-04T13:35:03.272Z
 ---
 
 # Phase 02: Code Review Disposition
@@ -132,7 +132,7 @@ recorded: 2026-11-04T13:34:46.261Z
 | IN-13 | info | open | - |
 | IN-10 | info | open | - |
 | IN-11 | info | open | - |
-| WR-12 | warning | open | - (not in the current review) |
+| WR-12 | warning | fixed | gap plan 02-07 (commits d39e9a5, 972c4cc, 08452d7, eadd9b2; merged 8a85020); re-review 0607347 confirms resolved (not in the current review) |
 | WR-07 | warning | open | - (not in the current review) |
 | WR-09 | warning | open | - (not in the current review) |
 | WR-10 | warning | open | - (not in the current review) |
