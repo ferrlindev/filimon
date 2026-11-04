@@ -18,7 +18,7 @@ use fluvio::dataplane::link::ErrorCode;
 use futures_util::{Stream, StreamExt, future};
 
 use crate::models::{
-    ExtractedArticle, NamedEntity, OutputRecord, SourceItem, SourceType, is_rfc3339,
+    ExtractedArticle, NamedEntity, OutputRecord, SourceItem, SourceType, rfc3339_to_utc,
 };
 use crate::cli::SourceFilter;
 use crate::output;
@@ -134,8 +134,9 @@ pub fn decode_news(topic: &str, offset: i64, value: &[u8]) -> Incoming {
 /// Decode one value from the social topic.
 ///
 /// Every record read here is labelled social (topic of origin), whatever
-/// `source_type` it claims; a claimed `news` adds a diagnostic. A `published`
-/// that is not RFC 3339 becomes null with a diagnostic. A value that is not a
+/// `source_type` it claims; a claimed `news` adds a diagnostic. An RFC 3339
+/// `published` is converted to UTC; any other value becomes null with a
+/// diagnostic. A value that is not a
 /// `SourceItem` becomes one diagnostic, which carries only the JSON error
 /// class and position. No diagnostic includes the value.
 pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
@@ -155,11 +156,13 @@ pub fn decode_social(topic: &str, offset: i64, value: &[u8]) -> Vec<Incoming> {
             "{topic} offset {offset}: record claims source_type news; labelled social by topic of origin"
         )));
     }
-    if item.published.as_deref().is_some_and(|p| !is_rfc3339(p)) {
-        item.published = None;
-        out.push(Incoming::Diagnostic(format!(
-            "{topic} offset {offset}: published is not RFC 3339; set to null"
-        )));
+    if let Some(published) = item.published.take() {
+        item.published = rfc3339_to_utc(&published);
+        if item.published.is_none() {
+            out.push(Incoming::Diagnostic(format!(
+                "{topic} offset {offset}: published is not RFC 3339; set to null"
+            )));
+        }
     }
     out.push(Incoming::Record(OutputRecord::from_social(item)));
     out
@@ -1322,6 +1325,16 @@ mod tests {
         ));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].published.as_deref(), Some("2024-10-27T03:33:20.123Z"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // An offset is converted to UTC, as the output contract states.
+        let (records, diagnostics) = split(decode_social(
+            "filimon-social-items",
+            5,
+            &item("2024-05-01T10:00:00+01:00"),
+        ));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].published.as_deref(), Some("2024-05-01T09:00:00.000Z"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 

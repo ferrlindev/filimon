@@ -199,9 +199,12 @@ pub fn epoch_ms_to_rfc3339(ms: u64) -> Option<String> {
         .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
-/// Whether `s` is a valid RFC 3339 timestamp.
-pub fn is_rfc3339(s: &str) -> bool {
-    DateTime::parse_from_rfc3339(s).is_ok()
+/// An RFC 3339 timestamp converted to UTC with millisecond precision, or
+/// None when `s` is not RFC 3339.
+pub fn rfc3339_to_utc(s: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 /// Best-effort parse of a news date string to RFC 3339 UTC.
@@ -644,11 +647,17 @@ mod tests {
     }
 
     #[test]
-    fn is_rfc3339_accepts_only_rfc3339() {
-        assert!(is_rfc3339("2024-10-27T03:33:20.123Z"));
-        assert!(is_rfc3339("2024-05-01T10:00:00+01:00"));
-        assert!(!is_rfc3339("yesterday"));
-        assert!(!is_rfc3339("2024-05-01"));
-        assert!(!is_rfc3339(""));
+    fn rfc3339_to_utc_normalizes_only_rfc3339() {
+        assert_eq!(
+            rfc3339_to_utc("2024-10-27T03:33:20.123Z").as_deref(),
+            Some("2024-10-27T03:33:20.123Z")
+        );
+        assert_eq!(
+            rfc3339_to_utc("2024-05-01T10:00:00+01:00").as_deref(),
+            Some("2024-05-01T09:00:00.000Z")
+        );
+        assert_eq!(rfc3339_to_utc("yesterday"), None);
+        assert_eq!(rfc3339_to_utc("2024-05-01"), None);
+        assert_eq!(rfc3339_to_utc(""), None);
     }
 }
