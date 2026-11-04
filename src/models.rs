@@ -659,5 +659,58 @@ mod tests {
         assert_eq!(rfc3339_to_utc("yesterday"), None);
         assert_eq!(rfc3339_to_utc("2024-05-01"), None);
         assert_eq!(rfc3339_to_utc(""), None);
+
+        // Valid RFC 3339 whose UTC year falls outside 0000..=9999 gives None.
+        assert_eq!(rfc3339_to_utc("9999-12-31T23:00:00-05:00"), None);
+        assert_eq!(rfc3339_to_utc("0000-01-01T00:30:00+01:00"), None);
+
+        // The in-range limits still convert, cut to milliseconds.
+        let limits = [
+            ("9999-12-31T23:59:59Z", "9999-12-31T23:59:59.000Z"),
+            ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00.000Z"),
+            ("9999-12-31T23:59:59.999999999Z", "9999-12-31T23:59:59.999Z"),
+        ];
+        for (input, expected) in limits {
+            assert_eq!(rfc3339_to_utc(input).as_deref(), Some(expected), "{input:?}");
+        }
+
+        for input in [
+            "2024-10-27T03:33:20.123Z",
+            "2024-05-01T10:00:00+01:00",
+            "9999-12-31T23:59:59Z",
+            "0000-01-01T00:00:00Z",
+            "9999-12-31T23:59:59.999999999Z",
+        ] {
+            let out = rfc3339_to_utc(input).expect("converts");
+            assert!(DateTime::parse_from_rfc3339(&out).is_ok(), "{input:?} -> {out:?}");
+        }
+    }
+
+    /// Pins why `utc_rfc3339` guards the year: chrono writes a UTC year
+    /// outside 0000..=9999 with a sign and five or more digits, which its own
+    /// RFC 3339 parser rejects.
+    #[test]
+    fn chrono_writes_out_of_range_years_with_sign() {
+        let after = DateTime::<Utc>::from_timestamp_millis(253_402_300_800_000)
+            .expect("in chrono's range");
+        let late = DateTime::parse_from_rfc3339("9999-12-31T23:00:00-05:00")
+            .expect("valid RFC 3339")
+            .with_timezone(&Utc);
+        let early = DateTime::parse_from_rfc3339("0000-01-01T00:30:00+01:00")
+            .expect("valid RFC 3339")
+            .with_timezone(&Utc);
+        let cases = [
+            (after, "+10000-01-01T00:00:00.000Z"),
+            (late, "+10000-01-01T04:00:00.000Z"),
+            (early, "-0001-12-31T23:30:00.000Z"),
+        ];
+        for (utc, expected) in cases {
+            let formatted = utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+            assert_eq!(formatted, expected);
+            assert!(
+                DateTime::parse_from_rfc3339(&formatted).is_err(),
+                "{formatted:?} parsed as RFC 3339"
+            );
+        }
     }
 }
