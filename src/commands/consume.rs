@@ -64,6 +64,29 @@ pub struct Collected {
     pub diagnostics: Vec<String>,
     /// Whether a branch ended on a stream error.
     pub failed: bool,
+    /// Diagnostics counted but not kept, past `MAX_DIAGNOSTICS`.
+    pub suppressed: usize,
+}
+
+/// Most diagnostics a batch run keeps; later ones are only counted. Fatal
+/// diagnostics are always kept.
+const MAX_DIAGNOSTICS: usize = 100;
+
+/// Most diagnostics a batch run for `limit` records reads before it stops:
+/// ten per wanted record, and never fewer than `MAX_DIAGNOSTICS`.
+fn diagnostic_budget(limit: usize) -> usize {
+    limit.saturating_mul(10).max(MAX_DIAGNOSTICS)
+}
+
+impl Collected {
+    /// Keep `message`, or only count it once `MAX_DIAGNOSTICS` are kept.
+    fn note(&mut self, message: String, fatal: bool) {
+        if fatal || self.diagnostics.len() < MAX_DIAGNOSTICS {
+            self.diagnostics.push(message);
+        } else {
+            self.suppressed += 1;
+        }
+    }
 }
 
 /// Keep at most `MAX_DETAIL` characters of an error message.
@@ -384,24 +407,39 @@ where
 
 /// Collect up to `limit` records, in arrival order.
 ///
-/// Stops when the stream ends or nothing arrives within `idle`. Diagnostics
-/// are kept separately and do not count toward `limit`; a fatal one also
-/// marks the run failed.
+/// Stops when the stream ends, nothing arrives within `idle`, or
+/// `diagnostic_budget(limit)` diagnostics have arrived, so a topic full of
+/// undecodable values cannot keep a run going. Diagnostics are kept
+/// separately (at most `MAX_DIAGNOSTICS`, see `Collected::note`) and do not
+/// count toward `limit`; a fatal one also marks the run failed.
 pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
     mut stream: S,
     limit: usize,
     idle: Duration,
 ) -> Collected {
+    let budget = diagnostic_budget(limit);
     let mut collected = Collected::default();
+    let mut seen = 0_usize;
     while collected.records.len() < limit {
         match tokio::time::timeout(idle, stream.next()).await {
             Ok(Some(Incoming::Record(record))) => collected.records.push(record),
-            Ok(Some(Incoming::Diagnostic(message))) => collected.diagnostics.push(message),
+            Ok(Some(Incoming::Diagnostic(message))) => {
+                seen += 1;
+                collected.note(message, false);
+            }
             Ok(Some(Incoming::Fatal(message))) => {
+                seen += 1;
                 collected.failed = true;
-                collected.diagnostics.push(message);
+                collected.note(message, true);
             }
             Ok(None) | Err(_) => break,
+        }
+        if seen >= budget {
+            collected.note(
+                format!("stopped after {seen} diagnostics before {limit} records arrived"),
+                true,
+            );
+            break;
         }
     }
     collected
@@ -653,10 +691,14 @@ async fn consume_batch(
         mut records,
         diagnostics,
         failed,
+        suppressed,
     } = collect_from_topics(stream, topics, offset, limit, source).await?;
 
     for message in &diagnostics {
         print_diagnostic(message);
+    }
+    if suppressed > 0 {
+        print_diagnostic(&format!("{suppressed} more diagnostics not shown"));
     }
 
     for message in enrich(&mut records, ner.map(|engine| engine as &dyn EntityDetector)) {
@@ -795,6 +837,20 @@ mod tests {
                 Incoming::Record(r) => records.push(r),
                 Incoming::Diagnostic(d) => diagnostics.push(d),
                 Incoming::Fatal(d) => panic!("a decode gave a fatal item: {d:?}"),
+            }
+        }
+        (records, diagnostics)
+    }
+
+    /// Records, and every diagnostic with whether it was fatal.
+    fn split_all(items: Vec<Incoming>) -> (Vec<OutputRecord>, Vec<(String, bool)>) {
+        let mut records = Vec::new();
+        let mut diagnostics = Vec::new();
+        for item in items {
+            match item {
+                Incoming::Record(r) => records.push(r),
+                Incoming::Diagnostic(d) => diagnostics.push((d, false)),
+                Incoming::Fatal(d) => diagnostics.push((d, true)),
             }
         }
         (records, diagnostics)
@@ -1162,15 +1218,17 @@ mod tests {
             calls.set(calls.get() + 1);
             future::ready(Ok(news_items(vec![Err(runtime_error_at(next))])))
         };
-        let collected =
-            collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
+        // Read the branch directly: collect_records has its own budget.
+        let items: Vec<Incoming> = news_incoming(first, "raw", reopen).collect().await;
         assert_eq!(calls.get(), MAX_REOPENS);
-        assert!(collected.records.is_empty());
-        assert!(collected.failed);
-        // One per rejected record, then the closing line.
-        assert_eq!(collected.diagnostics.len(), MAX_REOPENS + 2);
-        let last = collected.diagnostics.last().expect("closing line");
+        let (records, diagnostics) = split_all(items);
+        assert!(records.is_empty());
+        // One per rejected record, then the closing line, which is fatal.
+        assert_eq!(diagnostics.len(), MAX_REOPENS + 2);
+        let (last, fatal) = diagnostics.last().expect("closing line");
+        assert!(*fatal);
         assert!(last.contains("stopped after skipping"), "{last:?}");
+        assert!(diagnostics[..=MAX_REOPENS].iter().all(|(_, f)| !f));
     }
 
     #[tokio::test]
@@ -1201,6 +1259,36 @@ mod tests {
         let clean = vec![record("a"), Incoming::Diagnostic("skipped".into())];
         let collected = collect_records(iter(clean), 10, Duration::from_secs(1)).await;
         assert!(!collected.failed);
+    }
+
+    #[tokio::test]
+    async fn undecodable_flood_stops_at_diagnostic_budget() {
+        // An endless stream of bad values never yields a record.
+        let bad = futures_util::stream::repeat_with(|| Incoming::Diagnostic("bad".into()));
+        let collected = collect_records(bad, 1, Duration::from_secs(1)).await;
+        assert!(collected.records.is_empty());
+        assert!(!collected.failed);
+        let budget = diagnostic_budget(1);
+        assert_eq!(collected.diagnostics.len(), MAX_DIAGNOSTICS + 1);
+        assert_eq!(collected.suppressed, budget - MAX_DIAGNOSTICS);
+        let last = collected.diagnostics.last().expect("stop line");
+        assert!(last.contains(&format!("stopped after {budget} diagnostics")), "{last:?}");
+
+        let bad = futures_util::stream::repeat_with(|| Incoming::Diagnostic("bad".into()));
+        let collected = collect_records(bad, 50, Duration::from_secs(1)).await;
+        assert_eq!(collected.diagnostics.len() + collected.suppressed, 500 + 1);
+    }
+
+    #[tokio::test]
+    async fn fatal_diagnostic_is_kept_past_the_cap() {
+        let mut items: Vec<Incoming> =
+            (0..MAX_DIAGNOSTICS + 5).map(|_| Incoming::Diagnostic("bad".into())).collect();
+        items.push(Incoming::Fatal("ended".into()));
+        let collected = collect_records(iter(items), 1000, Duration::from_secs(1)).await;
+        assert!(collected.failed);
+        assert_eq!(collected.suppressed, 5);
+        assert_eq!(collected.diagnostics.len(), MAX_DIAGNOSTICS + 1);
+        assert_eq!(collected.diagnostics.last().map(String::as_str), Some("ended"));
     }
 
     #[test]
