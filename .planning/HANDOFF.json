@@ -1,0 +1,46 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-11-04T13:42:55.493Z",
+  "phase": "02",
+  "phase_name": "SourceItem Pipeline",
+  "phase_dir": ".planning/phases/02-sourceitem-pipeline",
+  "plan": 7,
+  "task": 2,
+  "total_tasks": 2,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "02-07 T1 (tracer): stop charging social notes to the diagnostic budget", "status": "done", "commit": "972c4cc"},
+    {"id": 2, "name": "02-07 T2: carry a social record and its notes as one Incoming::Noted item", "status": "done", "commit": "eadd9b2"}
+  ],
+  "remaining_tasks": [
+    {"id": 3, "name": "Phase 02 UAT: 3 pending human checks in 02-UAT.md, then phase completion via /gsd-verify-work 02", "status": "not_started"}
+  ],
+  "blockers": [
+    {"description": "Phase 02 verification status is human_needed (111/111 must-haves verified); the phase cannot be marked complete until the 3 UAT items pass", "type": "human_action", "workaround": "none"}
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {"action": "Install models/gliner_small-v2.1/onnx/model.onnx and tokenizer.json, then run `fili consume --from-beginning --enrich-ner --limit 500`; expect `NER: ✓ GLiNER loaded`, non-empty entities for t3_ner and the news fixture, no html", "context": "02-UAT.md test 1 (live GLiNER NER)", "blocking": true},
+    {"action": "Run `fili produce https://www.bbc.co.uk/news --depth 2` then `fili consume --limit 50`; expect platform bbc.co.uk, id == url, article block, published RFC 3339 or null", "context": "02-UAT.md test 2 (live crawl)", "blocking": true},
+    {"action": "Confirm the README mermaid diagram renders on GitHub", "context": "02-UAT.md test 3", "blocking": true}
+  ],
+  "decisions": [
+    {"decision": "Applied both WR-12 fixes: notes outside the diagnostic budget (T1) and Incoming::Noted { record, notes } so no stop can split a note from its record (T2)", "rationale": "The one-line budget fix alone leaves the merged-stream split open because futures-util stream::select alternates sides on each poll", "phase": "02"},
+    {"decision": "WR-12 recorded as fixed in 02-REVIEW-DISPOSITION.md (re-review 0607347 confirms resolved); remaining 20/28 findings left open", "rationale": "Plan 02-07 fixed WR-12 outside REVIEW-FIX.md; other findings were out of gap scope", "phase": "02"},
+    {"decision": "Existing 02-UAT.md kept as-is instead of regenerating it", "rationale": "It already lists the same 3 pending human checks the verifier reported", "phase": "02"}
+  ],
+  "uncommitted_files": [
+    " M .planning/config.json",
+    "?? .agents/",
+    "?? .bg-shell/",
+    "?? .claude/",
+    "?? .cursor/",
+    "?? .gsd-path/",
+    "?? .planning/state.json",
+    "?? AGENTS.md",
+    "?? WORKFLOW.md",
+    "?? test_config_panic.json"
+  ],
+  "next_action": "Run the 3 manual UAT checks, then `/gsd-verify-work 02` to record results and mark Phase 02 complete",
+  "context_notes": "Gap-only execution of phase 02 finished: 02-07 merged (8a85020), post-merge cargo build/test green (134 passed), security SECURED (36/36 closed), nyquist compliant, code review issues_found (0 critical, 2 warning, 6 info; WR-12 resolved; new IN-14, IN-15), regression gate green, verifier human_needed (b95315a). REQUIREMENTS.md lines for PIPE-01/PIPE-02 are stale (unchecked / Gaps Found) and should be updated at phase completion. All uncommitted files predate this session's work."
+}
