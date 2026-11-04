@@ -982,6 +982,22 @@ mod tests {
         serde_json::to_vec(value).expect("serializable")
     }
 
+    /// A social value with id `t3_edge`, the given claimed `source_type`, and
+    /// a `published` key only when one is given.
+    fn edge_social(source_type: &str, published: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "source_type": source_type,
+            "platform": "reddit",
+            "id": "t3_edge",
+            "url": "https://www.reddit.com/r/test/comments/edge",
+            "text": "hi"
+        });
+        if let Some(published) = published {
+            value["published"] = serde_json::Value::String(published.to_string());
+        }
+        value
+    }
+
     fn split(items: Vec<Incoming>) -> (Vec<OutputRecord>, Vec<String>) {
         let mut records = Vec::new();
         let mut diagnostics = Vec::new();
@@ -1598,6 +1614,93 @@ mod tests {
                 raw.skipped.ranges
             );
         }
+    }
+
+    #[tokio::test]
+    async fn note_at_budget_boundary_keeps_its_record() {
+        const SOCIAL: &str = "filimon-social-items";
+        const OUT_OF_RANGE: &str = "9999-12-31T23:00:00-05:00";
+        // `n` skipped social items at offsets 0..n, then the value at offset n.
+        async fn run(n: i64, limit: usize, value: &serde_json::Value) -> Collected {
+            let mut items: Vec<Incoming> = (0..n).map(|offset| skipped(SOCIAL, offset)).collect();
+            items.extend(decode_social(SOCIAL, n, &json(value)));
+            collect_records(iter(items), limit, Duration::from_secs(1)).await
+        }
+        fn assert_no_stop(collected: &Collected) {
+            assert!(
+                collected.diagnostics.iter().all(|m| !m.contains("stopped after")),
+                "{:?}",
+                collected.diagnostics
+            );
+        }
+        fn assert_offsets_in_order(collected: &Collected, upto: usize) {
+            for (i, message) in collected.diagnostics[..upto].iter().enumerate() {
+                assert!(message.contains(&format!("{SOCIAL} offset {i}:")), "{message:?}");
+            }
+        }
+        assert_eq!(diagnostic_budget(1) - 1, 99);
+
+        // A: the 100th diagnostic is the published note of a record that fills the limit.
+        let collected = run(99, 1, &edge_social("social", Some(OUT_OF_RANGE))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        let record = &collected.records[0];
+        assert_eq!(record.id, "t3_edge");
+        assert_eq!(record.source_type, SourceType::Social);
+        assert_eq!(record.published, None);
+        assert!(!collected.failed);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        assert_offsets_in_order(&collected, 99);
+        let last = &collected.diagnostics[99];
+        assert!(last.contains(&format!("{SOCIAL} offset 99:")), "{last:?}");
+        assert!(last.contains("set to null"), "{last:?}");
+        assert_no_stop(&collected);
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+
+        // B: the claims-news note, with an in-range published converted to UTC.
+        let collected =
+            run(99, 1, &edge_social("news", Some("2024-05-01T10:00:00+01:00"))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        let record = &collected.records[0];
+        assert_eq!(record.source_type, SourceType::Social);
+        assert_eq!(record.published.as_deref(), Some("2024-05-01T09:00:00.000Z"));
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        let last = &collected.diagnostics[99];
+        assert!(last.contains("claims source_type news"), "{last:?}");
+        assert_no_stop(&collected);
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+
+        // C: two notes; the first is the 100th message, the second is named by range.
+        let collected = run(99, 1, &edge_social("news", Some(OUT_OF_RANGE))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        assert_eq!(collected.records[0].published, None);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        let last = &collected.diagnostics[99];
+        assert!(last.contains("claims source_type news"), "{last:?}");
+        assert_no_stop(&collected);
+        let social = &collected.unshown[SOCIAL];
+        assert_eq!(social.noted.ranges, [(99, 99)]);
+        assert_eq!(social.noted.count, 1);
+        assert_eq!(social.skipped, OffsetRanges::default());
+
+        // D: limit 50; the note of the record at offset 499 is past the cap.
+        let collected = run(499, 50, &edge_social("social", Some(OUT_OF_RANGE))).await;
+        assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+        assert_eq!(collected.records[0].published, None);
+        assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+        assert_offsets_in_order(&collected, 100);
+        assert_no_stop(&collected);
+        let social = &collected.unshown[SOCIAL];
+        assert_eq!(social.skipped.ranges, [(100, 498)]);
+        assert_eq!(social.skipped.count, 399);
+        assert_eq!(social.noted.ranges, [(499, 499)]);
+        assert_eq!(social.noted.count, 1);
+        assert_eq!(
+            unshown_lines(&collected.unshown),
+            [
+                "filimon-social-items: 399 more skipped record(s), details not shown, offsets 100-498",
+                "filimon-social-items: 1 more record diagnostic(s), details not shown, offsets 499",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2445,6 +2548,50 @@ mod tests {
                 let line = diagnostic_line(message);
                 assert!(!line.chars().any(char::is_control), "{line:?}");
             }
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with the filimon SmartModules loaded"]
+    async fn social_note_at_budget_boundary_is_written() -> miette::Result<()> {
+        with_scratch_topics(|raw, social| async move {
+            let stream = FluvioStream::connect().await?;
+
+            // 99 undecodable values, then a social item whose published is
+            // out of range: its note is the 100th diagnostic (the budget for limit 1).
+            let bad = serde_json::Value::String("PAGE-BODY".to_string());
+            let producer = ready_producer(&stream, &social).await?;
+            for _ in 0..99 {
+                producer.send("bad", &bad).await?;
+            }
+            producer
+                .send("t3_edge", &edge_social("social", Some("9999-12-31T23:00:00-05:00")))
+                .await?;
+            producer.flush().await?;
+
+            let topics = ConsumeTopics {
+                raw_pages: &raw,
+                social: &social,
+            };
+            let collected =
+                collect_from_topics(&stream, &topics, Offset::beginning(), 1, SourceFilter::Social)
+                    .await?;
+            assert_eq!(collected.records.len(), 1, "{:?}", collected.diagnostics);
+            let record = &collected.records[0];
+            assert_eq!(record.id, "t3_edge");
+            assert_eq!(record.published, None);
+            assert!(!collected.failed);
+            assert_eq!(collected.diagnostics.len(), 100, "{:?}", collected.diagnostics);
+            let last = &collected.diagnostics[99];
+            assert!(last.contains(&format!("{social} offset 99:")), "{last:?}");
+            assert!(last.contains("set to null"), "{last:?}");
+            for message in &collected.diagnostics {
+                assert!(!message.contains("stopped after"), "{message:?}");
+                assert!(!message.contains("PAGE-BODY"), "{message:?}");
+            }
+            assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
             Ok(())
         })
         .await
