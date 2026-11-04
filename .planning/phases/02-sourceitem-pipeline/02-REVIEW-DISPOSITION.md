@@ -3,14 +3,38 @@ phase: 02
 review: 02-REVIEW.md
 titles: json
 findings:
+  - id: WR-12
+    severity: warning
+    disposition: open
+    title: "A budget stop can fall between a social note and its record, so a note describes a record that was never written"
+  - id: WR-08
+    severity: warning
+    disposition: open
+    title: "`MAX_REOPENS` counts over the whole run, and each record left in a rejected batch costs one reopen (carried forward, unchanged)"
+  - id: WR-11
+    severity: warning
+    disposition: open
+    title: "Already-defended-elsewhere: second `check_ner_mode` inside `consume::run` (carried forward, unchanged)"
+  - id: IN-12
+    severity: info
+    disposition: open
+    title: "Fatal and budget-stop lines use up the record-diagnostic message cap"
+  - id: IN-13
+    severity: info
+    disposition: open
+    title: "The reopen-limit closing line says it skipped 100 records, but 101 are reported as skipped"
+  - id: IN-10
+    severity: info
+    disposition: open
+    title: "SmartModule prefix drift test is narrow and brittle (carried forward, unchanged)"
+  - id: IN-11
+    severity: info
+    disposition: open
+    title: "A failed reopen reports the rejected record as \"skipped\" right before the branch ends (carried forward, unchanged)"
   - id: WR-07
     severity: warning
     disposition: open
     title: "Diagnostic-budget stop counts as a clean run, so a run that got only errors overwrites the last good output with `[]` and exits 0"
-  - id: WR-08
-    severity: warning
-    disposition: open
-    title: "`MAX_REOPENS` counts over the whole run, and each record left in a rejected batch costs one reopen"
   - id: WR-09
     severity: warning
     disposition: open
@@ -19,22 +43,10 @@ findings:
     severity: warning
     disposition: open
     title: "`save_json` writes through a predictable temp path that follows symlinks"
-  - id: WR-11
-    severity: warning
-    disposition: open
-    title: "Already-defended-elsewhere: second `check_ner_mode` inside `consume::run`"
   - id: IN-09
     severity: info
     disposition: open
     title: "Atomic `save_json` changes the output file's identity and does not make the rename durable"
-  - id: IN-10
-    severity: info
-    disposition: open
-    title: "SmartModule prefix drift test is narrow and brittle"
-  - id: IN-11
-    severity: info
-    disposition: open
-    title: "A failed reopen reports the rejected record as \"skipped\" right before the branch ends"
   - id: WR-01
     severity: warning
     disposition: fixed
@@ -95,23 +107,26 @@ findings:
     severity: info
     disposition: open
     title: "Already-defended-elsewhere — empty-parent guard before `create_dir_all`"
-open: 16
-total: 23
-recorded: 2026-11-04T10:33:26.560Z
+open: 19
+total: 26
+recorded: 2026-11-04T12:20:45.056Z
 ---
 
 # Phase 02: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-07 | warning | open | - |
+| WR-12 | warning | open | - |
 | WR-08 | warning | open | - |
-| WR-09 | warning | open | - |
-| WR-10 | warning | open | - |
 | WR-11 | warning | open | - |
-| IN-09 | info | open | - |
+| IN-12 | info | open | - |
+| IN-13 | info | open | - |
 | IN-10 | info | open | - |
 | IN-11 | info | open | - |
+| WR-07 | warning | open | - (not in the current review) |
+| WR-09 | warning | open | - (not in the current review) |
+| WR-10 | warning | open | - (not in the current review) |
+| IN-09 | info | open | - (not in the current review) |
 | WR-01 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
 | WR-02 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
 | WR-03 | warning | fixed | 02-REVIEW-FIX.md (not in the current review) |
