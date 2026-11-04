@@ -70,6 +70,7 @@ async fn main() -> miette::Result<()> {
             source,
             ref output,
         } => {
+            commands::consume::check_ner_mode(enrich_ner, limit)?;
             let ner = if enrich_ner {
                 load_ner_engine(&cli.tokenizer, &cli.model)
             } else {

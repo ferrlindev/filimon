@@ -514,6 +514,17 @@ pub async fn collect_from_topics(
     Ok(collect_records(merged, limit, IDLE_TIMEOUT).await)
 }
 
+/// Reject `--enrich-ner` in streaming mode (`--limit 0`), which never runs NER.
+pub fn check_ner_mode(enrich_ner: bool, limit: usize) -> miette::Result<()> {
+    if enrich_ner && limit == 0 {
+        return Err(miette::miette!(
+            help = "add --limit N to enrich a batch of N records",
+            "--enrich-ner works only in batch mode (--limit N); streaming mode (--limit 0) prints records without NER"
+        ));
+    }
+    Ok(())
+}
+
 /// Consume news and social records from Fluvio.
 ///
 /// # Arguments
@@ -529,6 +540,7 @@ pub async fn run(
     output: &Path,
     ner: Option<&NerEngine>,
 ) -> miette::Result<()> {
+    check_ner_mode(ner.is_some(), limit)?;
     println!("[Consume] Connecting to Fluvio cluster...");
     let stream = FluvioStream::connect().await?;
 
@@ -1126,6 +1138,14 @@ mod tests {
         let path = dir.path().join("out.json");
         finish_batch(&[], false, &path).expect("clean run");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "[]");
+    }
+
+    #[test]
+    fn enrich_ner_is_rejected_in_streaming_mode() {
+        let err = check_ner_mode(true, 0).expect_err("streaming with NER");
+        assert!(err.to_string().contains("--enrich-ner"), "{err}");
+        assert!(check_ner_mode(true, 5).is_ok());
+        assert!(check_ner_mode(false, 0).is_ok());
     }
 
     #[test]
