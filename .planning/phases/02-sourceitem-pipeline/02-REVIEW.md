@@ -1,164 +1,110 @@
 ---
 phase: 02-sourceitem-pipeline
-reviewed: 2026-11-04T10:31:47Z
+reviewed: 2026-11-04T12:19:37Z
 depth: standard
-files_reviewed: 4
+files_reviewed: 2
 files_reviewed_list:
   - src/commands/consume.rs
-  - src/main.rs
   - src/models.rs
-  - src/output.rs
 findings:
   critical: 0
-  warning: 5
-  info: 3
-  total: 8
+  warning: 3
+  info: 4
+  total: 7
   necessity: 1
 status: issues_found
 ---
 
-# Phase 2: Code Review Report (incremental re-review after review-fix iteration 1)
+# Phase 2: Code Review Report (re-review after gap-closure plans 02-05 and 02-06)
 
-**Reviewed:** 2026-11-04T10:31:47Z
+**Reviewed:** 2026-11-04T12:19:37Z
 **Depth:** standard
-**Files Reviewed:** 4
+**Files Reviewed:** 2
 **Status:** issues_found
 
 ## Summary
 
-Scope: diff `16e529d..HEAD` (HEAD `085efcc`) over `src/commands/consume.rs`, `src/main.rs`, `src/models.rs` and `src/output.rs`. These are the six review-fix commits 308e775 (WR-01), 9382d43 (WR-02), ec72c90 (WR-03), 4c2845e (WR-04), fc99d4e (WR-05) and 7330aa6 (WR-06).
+Scope: `src/commands/consume.rs` and `src/models.rs` at HEAD `4799bbd`, diff base `6d61d72`. The source commits are 66075b0..1e09a35 (02-05: located record diagnostics and exact per-topic offset ranges past `MAX_DIAGNOSTICS`) and cd7f8e8..74ce6c3 (02-06: the `utc_rfc3339` year guard). As instructed, WR-07 (a budget stop does not mark the run failed) is out of scope under plan 02-05 and is not raised again. The `fluvio/` checkout was read but not modified.
 
 Evidence:
-- `cargo test -p filimon --offline`: 125 passed, 0 failed, 6 ignored. The cluster tests were not run in this pass.
-- Read fluvio sources in `fluvio/`. `SmartModuleTransformRuntimeError::new` sets `offset = base_offset + offset_delta`, so the offset is absolute (`crates/fluvio-protocol/src/link/smartmodule.rs:32`). The chain keeps record offset deltas between modules. `process_batch` runs the chain over whole stored batches and stops at the first error (`crates/fluvio-spu/src/smartengine/batch.rs:41-135`). The client drops records below the requested start offset (`crates/fluvio/src/consumer/mod.rs:636`), so a reopen inside a batch does not deliver duplicates. These facts support the WR-01 design.
-- Ran chrono 0.4.45 (the locked version) with the exact `rfc3339_to_utc` body. `9999-12-31T23:00:00-05:00` gives `+10000-01-01T04:00:00.000Z`, and `0000-01-01T00:30:00+01:00` gives `-0001-12-31T23:30:00.000Z` (see WR-09).
+- `cargo test -p filimon --offline`: 132 passed, 0 failed, 7 ignored. The cluster tests were not run.
+- `fluvio/crates/fluvio-spu/src/smartengine/batch.rs:39-135`: `process_batch` returns the successes before an error together with that error. So the records before a rejected offset in the same batch are still delivered. The `news_incoming` in-batch reasoning (consume.rs:407-411) still holds.
+- The only `eprintln!` in consume.rs is at line 900, inside `print_diagnostic`. Every `unshown_lines` line passes through it (consume.rs:830-832). Range lines are built only from the topic map key, a count and integer offsets, so content-freedom (CR-01) holds.
+- `src/output.rs` is unchanged since 98e70f6. That file is not in scope, so WR-10 and IN-09 stay as recorded.
 
-Five new findings are warnings. WR-07 shows that the WR-06 budget creates a new way to get the WR-02 failure: when every item is a diagnostic, a batch run exits 0 and overwrites the last good output with `[]`. For `--limit` 1 to 10, the budget also makes the MAX_REOPENS failure unreachable. WR-08: the reopen cap counts over the whole run and charges one reopen for every record in a rejected batch, so a long streaming run loses its news branch for good. WR-09: valid RFC 3339 input can produce output that is not RFC 3339. WR-10: `save_json` writes through a temp path that is easy to predict and follows symlinks.
+02-06 is sound. All three date paths (`rfc3339_to_utc`, `epoch_ms_to_rfc3339`, `parse_news_published`) go through `utc_rfc3339` (models.rs:199-245). The 0000 and 9999 boundaries are tested on both sides, and every in-range output is re-parsed as RFC 3339. 02-05 locates every skip path: `decode_news` (consume.rs:292), `decode_social` (315) and every `news_incoming` skip (460-475). One new warning: a social `Note` counts toward the diagnostic budget and arrives before its `Record`. A budget stop can therefore fall between the two, so a note (kept, or named in a "noted" range) describes a record that was never written. This breaks the documented invariant "noted names records that were written" (WR-12). WR-08 and WR-11 are unchanged and carried forward.
 
 ### Prior findings in these files
 
 | Prior ID | Status | Evidence |
 |---|---|---|
-| WR-01: one poison record halts the news branch | **Resolved** (residual limits in WR-08) | `news_incoming` (consume.rs:302-367) reopens at `e.offset + 1`. When a reopened stream fails again before its start offset, it steps one offset at a time through the rejected batch. This matches the SPU's whole-batch processing and the client's start-offset filter, both cited above. |
-| WR-02: success exit and output overwrite on stream failure | **Resolved for stream errors** (budget bypass in WR-07) | `Incoming::Fatal` → `Collected::failed` (consume.rs:430-434). `finish_batch` skips the write when the run failed with no records (720-726). `consume_stream` returns `Err` (771-773). `save_json` now writes a temp file and renames it (output.rs:25-42). |
-| WR-03: `--enrich-ner` ignored in streaming mode | **Resolved** | `check_ner_mode` runs at main.rs:73, before the model loads. A second call at consume.rs:633 is redundant (WR-11). |
-| WR-04: social `published` not normalized to UTC | **Resolved** (edge case in WR-09) | `rfc3339_to_utc` (models.rs:202-208) is used at consume.rs:226-232. Tested with a `+01:00` input. |
-| WR-05: hint content-freedom rests on a convention | **Resolved** | `module_hint_summary` (consume.rs:155-166) returns only `&'static` list entries or `NO_DETAIL` and never copies hint text. `SmartModuleLookBackError` takes the same path (253-256). Content-freedom no longer depends on how the modules word their messages. The drift test only affects how useful the diagnostics are (IN-10). |
-| WR-06: diagnostics do not bound a `--limit` run | **Resolved** (side effect in WR-07) | `diagnostic_budget` limits the reads, and `MAX_DIAGNOSTICS` limits the memory (consume.rs:71-90, 415-446). Suppressed diagnostics are counted and printed (700-702). |
-| IN-01: local decode diagnostics drop safe detail; `hint_summary` over-truncates fluvio errors | **Open** (unchanged) | `describe_json_error` consume.rs:104-113 is unchanged, and the `other` arm still uses `hint_summary` (257). |
-| IN-02: bidi/format characters pass the diagnostic choke point | **Open** (unchanged) | `diagnostic_line` consume.rs:741-743 calls `sanitize_for_terminal`, which is unchanged (output.rs:49-57). |
-| IN-03: single-digit offset assertions | **Open** (unchanged) | consume.rs:894 `contains('7')`, :921 `contains('9')`, :1403 `contains('5')`, :1418 `contains('9')`, :1495 `contains('3')`. |
-| IN-05: `sanitize_for_terminal` keeps Unicode format characters | **Open** (unchanged) | output.rs:49-57 |
-| IN-06: `parse_news_published` misses offset-less forms | **Open** (unchanged) | models.rs, not touched by the fix commits |
-| IN-07: `SourceItem::social` reinterprets JSON-scalar `raw` strings | **Open** (unchanged) | models.rs, not touched by the fix commits |
-| IN-08: empty-parent guard before `create_dir_all` | **Open** (unchanged) | output.rs:19-23 |
-| CR-01 | **Resolved** (as previously recorded) | No regression: every diagnostic still passes through `print_diagnostic` (consume.rs:697-706, 764-768), and every new message is built only from fixed text, offsets, topic names and list entries. |
-
-IN-04 (docker-compose) is not in this file scope and stays as recorded.
+| WR-07: budget stop is a clean run | **Open, out of scope (plan 02-05)** | `collect_records` consume.rs:568-572 still does not set `failed`. `finish_batch` 850-868 is unchanged. |
+| WR-08: `MAX_REOPENS` counts over the whole run | **Open** (carried below) | consume.rs:438-439, 467, 476: `reopens` is never reset and goes up on in-batch steps too. |
+| WR-09: `rfc3339_to_utc` can emit non-RFC 3339 | **Resolved** by 02-06 | `utc_rfc3339` models.rs:199-204 is used at 213, 220 and 244. Tests at models.rs:514-554, 556-608, 735-801 and consume.rs:1917-1956. |
+| WR-10: predictable temp path in `save_json` | Not in scope (output.rs) | output.rs is unchanged since 98e70f6. |
+| WR-11: second `check_ner_mode` in `run` | **Open** (carried below) | consume.rs:763. |
+| IN-03: single-digit offset assertions | **Open** | consume.rs:1077 `contains('9')`, 1894 `contains('3')`. The new 02-05 and 02-06 tests use full `"{topic} offset {n}:"` prefixes. |
+| IN-06 / IN-07 (models.rs) | **Open** (unchanged) | models.rs:228-245 and 185-187. |
+| IN-09 | Not in scope (output.rs) | |
+| IN-10: brittle prefix drift test | **Open** (carried below) | consume.rs:1246-1267. |
+| IN-11: failed reopen still says "skipped" | **Open** (carried below) | consume.rs:475-489. |
+| CR-01 | **Resolved**, no regression | See the evidence above. |
 
 ## Narrative Findings (AI reviewer)
 
 ## Warnings
 
-### WR-07: Diagnostic-budget stop counts as a clean run, so a run that got only errors overwrites the last good output with `[]` and exits 0
+### WR-12: A budget stop can fall between a social note and its record, so a note describes a record that was never written
 
-**File:** `src/commands/consume.rs:437-443, 720-737` (with `263`, `77-79`)
-**Issue:** When `seen >= budget`, `collect_records` adds a "stopped after" note but leaves `collected.failed` false. `finish_batch(&[], false, path)` then calls `save_json` with an empty slice, replaces the prior `wise_output.json` with `[]`, prints a run summary, and returns `Ok(())`. The test `undecodable_flood_stops_at_diagnostic_budget` asserts `!collected.failed`, and the fix report confirms this is intended. This is the same overwrite-and-exit-0 failure WR-02 fixed, reached a different way:
-- A social topic full of undecodable values gives `[]` and exit 0, so the last good file is lost.
-- News: for any `limit <= 10` the budget is 100. The news branch emits one `Diagnostic` per reopen. After `MAX_REOPENS` (100) reopens it emits a 101st `Diagnostic`, then the `Fatal` closing line. The collector stops at the 100th diagnostic, so it never sees the `Fatal`. With `--limit 1..10`, a news topic with 100 or more rejected records therefore never fails the run. It always exits 0 with `[]` written. The fix report's note that `news_branch_reopens_at_most_max_times` must "read the branch directly, because the collector's budget would stop it first" describes this unreachability.
-**Fix:** Treat a budget stop as a failure when it produced no records, and make the budget leave room for the reopen cap:
+**File:** `src/commands/consume.rs:326-348, 553-573` (docs at 70-71, 127-129)
+**Issue:** `decode_social` returns `[Note, ..., Record]`. `social_incoming` flattens these into separate stream items, and `merge_incoming` can interleave news items between them. `collect_records` counts every `Note` toward `seen` (557-560) and runs the budget check after each item (568-572). So the run can stop right after a `Note`, before its `Record` arrives. Trace with `--limit 1` (budget 100): 99 undecodable social values, then a value with `"published":"yesterday"` at offset 99. The `Note` brings `seen` to 100 and is kept as the 100th message (`offset 99: published is not an RFC 3339 time ...; set to null`). The loop then breaks, and the record is never collected. With `--limit 50` and the stop at item 500, the offset goes into `unshown[topic].noted` and prints as "more record diagnostic(s)". Both outcomes contradict `Incoming::Note` ("a record that still gives an output record", line 70) and `Unshown::noted` ("records that were written", line 128), and break the 02-05 truth that notes concern written records. The operator sees a published value nulled on a record that is missing from the file, and nothing marks that record as unread. None of the tests feeds a `Note` into the budget boundary.
+**Fix:** Notes cannot make a run unbounded: at most two arrive per record, and records are bounded by `limit`. So do not charge them to the budget:
 ```rust
-fn diagnostic_budget(limit: usize) -> usize {
-    limit.saturating_mul(10).max(MAX_DIAGNOSTICS).max(MAX_REOPENS + 2)
-}
-// in collect_records, at the budget stop:
-if seen >= budget {
-    collected.exhausted = true; // new field
-    collected.note(format!(...), true);
-    break;
-}
-// in finish_batch:
-if (failed || exhausted) && records.is_empty() { return Err(...not written...) }
+Ok(Some(Incoming::Note(d))) => collected.note(d), // no `seen += 1`
 ```
-Add a test: an endless `Diagnostic` stream into `finish_batch` must leave a seeded file unchanged and return `Err`.
+Alternatively, carry notes with their record (`Incoming::Record(OutputRecord, Vec<RecordDiagnostic>)`) so they cannot be separated. Add a test: 99 `skipped(...)` items, then `noted("t", 99)` and a record, collected with limit 1. It must yield the record and no dangling note.
 
-### WR-08: `MAX_REOPENS` counts over the whole run, and each record left in a rejected batch costs one reopen
+### WR-08: `MAX_REOPENS` counts over the whole run, and each record left in a rejected batch costs one reopen (carried forward, unchanged)
 
-**File:** `src/commands/consume.rs:261-263, 333-351`
-**Issue:** `b.reopens` only goes up. It does not reset when a later record is delivered, so the cap counts rejected records over the branch's whole lifetime, not consecutive ones. In streaming mode (`--limit 0`, a long-running process on an open topic), the 101st rejected record ends the news branch for good, even if days of good records came in between. The process keeps running and prints only social records. `consume_stream` returns `Err` only after both branches end, so in practice the operator gets one stderr line and a silent news outage. Second, the in-batch case (`e.offset < start`, lines 334-341) moves forward one offset per reopen. Each step opens a new consumer stream and uses one unit of the cap. A single poison record followed by 100 or more records in the same stored batch ends the branch, whatever happens in later batches. The SPU feeds the chain whole batches (`fluvio-spu/src/smartengine/batch.rs:52-71`). The cluster test (`good_news_after_poison_record_is_delivered`) only covers a batch with at most one record after the poison.
-**Fix:** Count consecutive rejections, not total ones, and do not charge the in-batch steps to the cap:
-```rust
-Ok(incoming) => {
-    if matches!(incoming, Incoming::Record(_)) { b.reopens = 0; }
-    return Some((incoming, b));
-}
-...
-let in_batch = matches!(b.start, Some(start) if e.offset < start);
-if !in_batch { b.reopens += 1; }
-```
-A rejected batch has a finite size, so the in-batch walk still ends. If the network cost of the walk matters, you can bound it separately, for example with a larger per-batch cap. Add unit tests for these cases: 101 rejected records with good records between them must not end the branch, and 150 in-batch steps after a single rejection must not end it.
+**File:** `src/commands/consume.rs:438-439, 467-476`
+**Issue:** The code is the same as in the previous review. `b.reopens` is never reset when a record is delivered (line 439), and the in-batch step (449-456) charges the cap once per offset (476). A streaming run that sees 101 rejected records over its whole lifetime loses the news branch for good. So does a single poison record followed by 100 or more records in the same stored batch. Since 02-05, each in-batch step is also reported as a separate `Skipped` record, so the cap now also limits how many in-batch records get named before the branch ends.
+**Fix:** As before: reset `b.reopens = 0` on `Ok(Incoming::Record(_))`, and do not count the in-batch steps (`Some(start) if e.offset < start`) toward `MAX_REOPENS`, or give them their own larger per-batch cap. Add unit tests for both cases.
 
-### WR-09: `rfc3339_to_utc` can turn valid RFC 3339 input into output that is not RFC 3339
+### WR-11: Already-defended-elsewhere: second `check_ner_mode` inside `consume::run` (carried forward, unchanged)
 
-**File:** `src/models.rs:202-208` (used at `src/commands/consume.rs:226-232`)
-**Issue:** After converting to UTC, the year can fall outside `0000..=9999`. chrono's `write_rfc3339` then writes a signed, five-digit year (`chrono-0.4.45/src/format/formatting.rs:511-518`). Reproduced with the locked chrono version:
-- `9999-12-31T23:00:00-05:00` → `+10000-01-01T04:00:00.000Z`
-- `0000-01-01T00:30:00+01:00` → `-0001-12-31T23:30:00.000Z`
-
-`filimon-social-items` is fed by external plugins. Such a value passes as a "valid" timestamp without a diagnostic and breaks the documented "RFC 3339 (UTC)" output contract for any downstream parser. The existing `epoch_ms_to_rfc3339` (models.rs:196-200) has the same exposure for very large epoch values.
-**Fix:**
-```rust
-pub fn rfc3339_to_utc(s: &str) -> Option<String> {
-    let utc = DateTime::parse_from_rfc3339(s).ok()?.with_timezone(&Utc);
-    (0..=9999).contains(&utc.year())
-        .then(|| utc.to_rfc3339_opts(SecondsFormat::Millis, true))
-}
-```
-Do the same in `epoch_ms_to_rfc3339`. Add both boundary inputs to `rfc3339_to_utc_normalizes_only_rfc3339`, expecting `None`.
-
-### WR-10: `save_json` writes through a predictable temp path that follows symlinks
-
-**File:** `src/output.rs:28-35`
-**Issue:** The temp path is `<dir>/.<name>.tmp-<pid>`, which is easy to predict, and it is opened with `File::create`. That call follows symlinks and truncates an existing target. `--output` accepts any path, and `src/cli.rs:193` even uses `/tmp/x.json` as its example. In a shared writable directory, another local user can create `/tmp/.x.json.tmp-<pid>` as a symlink to a file the victim owns. The run then truncates that file and fills it with JSON, and `rename` moves the symlink, not the victim's file. macOS has no `protected_symlinks` setting to block this. A stale temp file left by a killed run is also silently reused. `tempfile` is already a normal dependency (Cargo.toml:27).
-**Fix:**
-```rust
-let dir = match path.parent() { Some(p) if !p.as_os_str().is_empty() => p, _ => Path::new(".") };
-let mut tmp = tempfile::NamedTempFile::new_in(dir)?;   // O_EXCL, random name
-tmp.write_all(json.as_bytes())?;
-tmp.as_file().sync_all()?;
-tmp.persist(path).map_err(|e| e.error)?;               // rename; temp removed on drop if this fails
-```
-The two existing `save_json` tests still apply. The leftover-temp check needs no change, because `NamedTempFile` removes the file when it is dropped.
-
-### WR-11: Already-defended-elsewhere: second `check_ner_mode` inside `consume::run`
-
-**File:** `src/commands/consume.rs:633`
+**File:** `src/commands/consume.rs:763`
 **Category:** necessity
-**Issue:** The rejected state (`ner.is_some() && limit == 0`) cannot reach `run`. The crate is binary-only (Cargo.toml:14-16, no `[lib]`). The only caller is `main.rs:79` (`run_consume`, re-exported at `src/commands/mod.rs:5`). `main.rs:73` already returns `Err` for `enrich_ner && limit == 0`, and `ner` is `Some` only when `enrich_ner` is true (main.rs:74-78). The inner check also tests a different predicate (`ner.is_some()`, not the flag), so the two checks do not even guard the same thing.
-**Fix:** Remove the call at consume.rs:633, or move the only check into `run` and drop the one in `main`. Then `run` would need the flag rather than `Option<&NerEngine>`, and the model load would have to happen after the check.
+**Issue:** The code is unchanged from the previous review. The crate is binary-only, and `main.rs` already rejects `--enrich-ner` with `--limit 0` before the model loads. `ner` is `Some` only when that flag is set. So the state `ner.is_some() && limit == 0` cannot reach `run`.
+**Fix:** Remove the call at consume.rs:763, or keep a single check in `run` and pass it the flag.
 
 ## Info
 
-### IN-09: Atomic `save_json` changes the output file's identity and does not make the rename durable
+### IN-12: Fatal and budget-stop lines use up the record-diagnostic message cap
 
-**File:** `src/output.rs:32-42`
-**Issue:** The rename (a) replaces an output path that is a symlink with a regular file instead of writing through the link, (b) resets permissions to `0666 & ~umask`, so a file the operator had made `0600` becomes world-readable under a default umask, and (c) does not `fsync` the parent directory. After a crash, the rename can be lost even though the data was synced. None of this is documented in the new doc comment.
-**Fix:** Copy the old file's permissions to the temp file before the rename (`std::fs::metadata(path).map(|m| m.permissions())`), then `File::open(dir)?.sync_all()` after the rename. Document that a symlinked output path is replaced, or resolve it with `std::fs::canonicalize` first.
+**File:** `src/commands/consume.rs:149-152, 164-187`
+**Issue:** `skip` and `note` compare `self.diagnostics.len()` against `MAX_DIAGNOSTICS`. `diagnostics` also holds the messages from `keep_always` (fatal lines). Each fatal line kept before the cap is reached therefore cuts one record diagnostic from the "100 kept messages", and pushes that record into the range line. For example, if the social branch fails at once and news then floods, only 99 news messages are kept. No record goes unnamed, but the behavior contradicts the doc on `MAX_DIAGNOSTICS` ("Most record diagnostics a batch run keeps as messages") and the 02-05 statement that "a flood keeps exactly MAX_DIAGNOSTICS + 1 messages".
+**Fix:** Keep a separate `kept_records: usize` counter and compare that counter against `MAX_DIAGNOSTICS`. Or reword the doc to "most diagnostic messages, fatal ones included".
 
-### IN-10: SmartModule prefix drift test is narrow and brittle
+### IN-13: The reopen-limit closing line says it skipped 100 records, but 101 are reported as skipped
 
-**File:** `src/commands/consume.rs:1087-1107`
-**Issue:** The test only finds `eyre!("` with the literal on the same line. It misses `bail!`, `ensure!`, `.wrap_err(...)`, `.context(...)`, an `eyre!(` whose literal starts on the next line, and bare `?` sites like filter-relevance:43. It also asserts `found == MODULE_HINT_PREFIXES.len()`. A second call site that reuses an existing prefix would fail the test even though it is covered, and removing one call site while adding an unlisted one in a macro the test misses would still pass. Since WR-05, this test only protects how useful the diagnostics are, not content-freedom, so this is Info.
-**Fix:** Match on a multi-line regex over `eyre!|bail!|ensure!|wrap_err|context`, and assert set inclusion (every found prefix is listed) rather than equal counts.
+**File:** `src/commands/consume.rs:467-473`
+**Issue:** When the limit is reached, the 101st rejected record is now sent as `Incoming::Skipped` (line 468). In batch mode past the cap, it is counted in "N more skipped record(s)". The test at consume.rs:1685 confirms this: skipped offsets run `0..=MAX_REOPENS`. The closing fatal line still says `stopped after skipping {MAX_REOPENS} records`, which is one fewer than the run reported.
+**Fix:** Word the closing line as `stopped after {MAX_REOPENS} reopens; {MAX_REOPENS + 1} records rejected`, or count the records actually sent.
 
-### IN-11: A failed reopen reports the rejected record as "skipped" right before the branch ends
+### IN-10: SmartModule prefix drift test is narrow and brittle (carried forward, unchanged)
 
-**File:** `src/commands/consume.rs:357-365`
-**Issue:** When `(b.reopen)(next)` fails, the branch still yields `"{message}; skipped"` and then the fatal "could not reopen" line. No later read moves past the record, so "skipped" suggests the stream went on when it did not. The MAX_REOPENS path (344-350) correctly leaves out the suffix.
-**Fix:** Yield `Incoming::Diagnostic(message)` without the `; skipped` suffix in the `Err(err)` arm, as the MAX_REOPENS path does.
+**File:** `src/commands/consume.rs:1246-1267`
+**Issue:** The test only matches `eyre!("` with the literal on the same line, and it asserts an exact count. The details are unchanged from the previous review.
+**Fix:** Match `eyre!|bail!|ensure!|wrap_err|context` across lines, and assert set inclusion rather than equal counts.
+
+### IN-11: A failed reopen reports the rejected record as "skipped" right before the branch ends (carried forward, unchanged)
+
+**File:** `src/commands/consume.rs:475-489`
+**Issue:** `"{message}; skipped"` is built before `(b.reopen)(next)` runs. If the reopen fails, the next line is the fatal "could not reopen". No later read moves past the record.
+**Fix:** In the `Err(err)` arm, send the message without the `; skipped` suffix, as the reopen-limit path does.
 
 ---
 
-_Reviewed: 2026-11-04T10:31:47Z_
+_Reviewed: 2026-11-04T12:19:37Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
