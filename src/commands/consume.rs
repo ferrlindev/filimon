@@ -68,6 +68,8 @@ pub enum Incoming {
     Diagnostic(String),
     /// The record at this topic and offset gives no output record.
     Skipped(RecordDiagnostic),
+    /// A diagnostic about a record that still gives an output record.
+    Note(RecordDiagnostic),
     Fatal(String),
 }
 
@@ -125,6 +127,7 @@ impl std::fmt::Display for OffsetRanges {
 #[derive(Debug, Default)]
 pub struct Unshown {
     pub skipped: OffsetRanges,
+    pub noted: OffsetRanges,
 }
 
 /// What a batch run collected.
@@ -521,6 +524,10 @@ pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
                 seen += 1;
                 collected.skip(d);
             }
+            Ok(Some(Incoming::Note(d))) => {
+                seen += 1;
+                collected.note(d.message, false);
+            }
             Ok(Some(Incoming::Fatal(message))) => {
                 seen += 1;
                 collected.failed = true;
@@ -878,6 +885,7 @@ async fn consume_stream(
             Incoming::Record(record) => output::print_summary(&record),
             Incoming::Diagnostic(message) => print_diagnostic(&message),
             Incoming::Skipped(d) => print_diagnostic(&d.message),
+            Incoming::Note(d) => print_diagnostic(&d.message),
             Incoming::Fatal(message) => {
                 failed = true;
                 print_diagnostic(&message);
@@ -952,7 +960,7 @@ mod tests {
             match item {
                 Incoming::Record(r) => records.push(r),
                 Incoming::Diagnostic(d) => diagnostics.push(d),
-                Incoming::Skipped(d) => diagnostics.push(d.message),
+                Incoming::Skipped(d) | Incoming::Note(d) => diagnostics.push(d.message),
                 Incoming::Fatal(d) => panic!("a decode gave a fatal item: {d:?}"),
             }
         }
@@ -967,7 +975,7 @@ mod tests {
             match item {
                 Incoming::Record(r) => records.push(r),
                 Incoming::Diagnostic(d) => diagnostics.push((d, false)),
-                Incoming::Skipped(d) => diagnostics.push((d.message, false)),
+                Incoming::Skipped(d) | Incoming::Note(d) => diagnostics.push((d.message, false)),
                 Incoming::Fatal(d) => diagnostics.push((d, true)),
             }
         }
@@ -1366,15 +1374,16 @@ mod tests {
     async fn fatal_item_marks_collection_failed() {
         let items = vec![
             record("a"),
-            Incoming::Diagnostic("skipped".into()),
+            noted("t", 0),
+            skipped("t", 1),
             Incoming::Fatal("ended".into()),
         ];
         let collected = collect_records(iter(items), 10, Duration::from_secs(1)).await;
         assert!(collected.failed);
         assert_eq!(collected.records.len(), 1);
-        assert_eq!(collected.diagnostics, ["skipped", "ended"]);
+        assert_eq!(collected.diagnostics, ["t offset 0: note", "t offset 1: bad", "ended"]);
 
-        let clean = vec![record("a"), Incoming::Diagnostic("skipped".into())];
+        let clean = vec![record("a"), noted("t", 0), skipped("t", 1)];
         let collected = collect_records(iter(clean), 10, Duration::from_secs(1)).await;
         assert!(!collected.failed);
     }
@@ -1385,6 +1394,15 @@ mod tests {
             topic: topic.to_string(),
             offset,
             message: format!("{topic} offset {offset}: bad"),
+        })
+    }
+
+    /// A located diagnostic for a record that is still written.
+    fn noted(topic: &str, offset: i64) -> Incoming {
+        Incoming::Note(RecordDiagnostic {
+            topic: topic.to_string(),
+            offset,
+            message: format!("{topic} offset {offset}: note"),
         })
     }
 
@@ -1463,14 +1481,177 @@ mod tests {
 
     #[tokio::test]
     async fn fatal_diagnostic_is_kept_past_the_cap() {
-        let mut items: Vec<Incoming> =
-            (0..MAX_DIAGNOSTICS + 5).map(|_| Incoming::Diagnostic("bad".into())).collect();
+        assert_eq!(MAX_DIAGNOSTICS, 100);
+        let mut items: Vec<Incoming> = (0..105).map(|offset| skipped("t", offset)).collect();
         items.push(Incoming::Fatal("ended".into()));
         let collected = collect_records(iter(items), 1000, Duration::from_secs(1)).await;
         assert!(collected.failed);
-        assert_eq!(collected.suppressed, 5);
         assert_eq!(collected.diagnostics.len(), MAX_DIAGNOSTICS + 1);
         assert_eq!(collected.diagnostics.last().map(String::as_str), Some("ended"));
+        let t = &collected.unshown["t"];
+        assert_eq!(t.skipped.ranges, [(100, 104)]);
+        assert_eq!(t.skipped.count, 5);
+    }
+
+    #[tokio::test]
+    async fn cap_boundary_moves_only_later_offsets_into_ranges() {
+        const TOPIC: &str = "filimon-social-items";
+        assert_eq!(MAX_DIAGNOSTICS, 100);
+
+        let exactly: Vec<Incoming> = (0..100).map(|offset| skipped(TOPIC, offset)).collect();
+        let collected = collect_records(iter(exactly), 50, Duration::from_secs(1)).await;
+        assert_eq!(collected.diagnostics.len(), MAX_DIAGNOSTICS);
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+        assert!(unshown_lines(&collected.unshown).is_empty());
+
+        let one_more: Vec<Incoming> = (0..101).map(|offset| skipped(TOPIC, offset)).collect();
+        let collected = collect_records(iter(one_more), 50, Duration::from_secs(1)).await;
+        assert_eq!(collected.diagnostics.len(), MAX_DIAGNOSTICS);
+        assert_eq!(collected.unshown[TOPIC].skipped.ranges, [(100, 100)]);
+        assert_eq!(
+            unshown_lines(&collected.unshown),
+            ["filimon-social-items: 1 more skipped record(s), details not shown, offsets 100"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unshown_ranges_never_cover_written_records() {
+        const RAW: &str = "filimon-raw-pages";
+        const SOCIAL: &str = "filimon-social-items";
+        // Fill the message cap first, so everything after is named by range.
+        let mut items: Vec<Incoming> = (0..100).map(|offset| skipped(RAW, offset)).collect();
+        items.extend([
+            skipped(RAW, 100),
+            skipped(RAW, 101),
+            record("written-at-raw-102"),
+            skipped(RAW, 103),
+            skipped(SOCIAL, 100),
+            skipped(RAW, 104),
+            noted(RAW, 105),
+            record("written-at-raw-105"),
+            noted(RAW, 105),
+            skipped(SOCIAL, 101),
+            skipped(RAW, 107),
+        ]);
+        let collected = collect_records(iter(items), 50, Duration::from_secs(1)).await;
+        assert_eq!(collected.records.len(), 2);
+        assert!(!collected.failed);
+        assert_eq!(collected.diagnostics.len(), MAX_DIAGNOSTICS);
+
+        let raw = &collected.unshown[RAW];
+        assert_eq!(raw.skipped.ranges, [(100, 101), (103, 104), (107, 107)]);
+        assert_eq!(raw.skipped.count, 5);
+        assert_eq!(raw.noted.ranges, [(105, 105)]);
+        assert_eq!(raw.noted.count, 2);
+        let social = &collected.unshown[SOCIAL];
+        assert_eq!(social.skipped.ranges, [(100, 101)]);
+        assert_eq!(social.skipped.count, 2);
+        assert_eq!(social.noted, OffsetRanges::default());
+
+        assert_eq!(
+            unshown_lines(&collected.unshown),
+            [
+                "filimon-raw-pages: 5 more skipped record(s), details not shown, offsets 100-101, 103-104, 107",
+                "filimon-raw-pages: 2 more record diagnostic(s), details not shown, offsets 105",
+                "filimon-social-items: 2 more skipped record(s), details not shown, offsets 100-101",
+            ]
+        );
+        // The written records at raw offsets 102 and 105 lie in no skipped range.
+        for written in [102, 105] {
+            assert!(
+                raw.skipped.ranges.iter().all(|&(start, end)| !(start..=end).contains(&written)),
+                "{written} in {:?}",
+                raw.skipped.ranges
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn located_diagnostics_match_their_message() {
+        fn located(item: &Incoming) -> Option<&RecordDiagnostic> {
+            match item {
+                Incoming::Skipped(d) | Incoming::Note(d) => Some(d),
+                _ => None,
+            }
+        }
+        fn skipped_offsets(items: &[Incoming]) -> Vec<i64> {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Incoming::Skipped(d) => Some(d.offset),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn assert_located(items: &[Incoming]) {
+            for d in items.iter().filter_map(located) {
+                let prefix = format!("{} offset {}:", d.topic, d.offset);
+                assert!(d.message.starts_with(&prefix), "{d:?}");
+            }
+        }
+
+        let news = [decode_news("filimon-raw-pages", 42, b"not json")];
+        assert!(
+            matches!(&news, [Incoming::Skipped(d)] if d.topic == "filimon-raw-pages" && d.offset == 42),
+            "decode_news must give a located Skipped item"
+        );
+        assert_located(&news);
+
+        let social = decode_social("filimon-social-items", 7, b"not json");
+        assert!(
+            matches!(social.as_slice(), [Incoming::Skipped(d)] if d.topic == "filimon-social-items" && d.offset == 7),
+            "decode_social must give a located Skipped item"
+        );
+        assert_located(&social);
+
+        let claims_news = json(&serde_json::json!({
+            "source_type": "news",
+            "platform": "reddit",
+            "id": "t3_claim",
+            "url": "https://www.reddit.com/r/test/comments/claim",
+            "text": "hi"
+        }));
+        let yesterday = json(&serde_json::json!({
+            "source_type": "social",
+            "platform": "reddit",
+            "id": "t3_date",
+            "url": "https://www.reddit.com/r/test/comments/date",
+            "text": "hi",
+            "published": "yesterday"
+        }));
+        for (offset, value) in [(8, claims_news), (9, yesterday)] {
+            let items = decode_social("filimon-social-items", offset, &value);
+            assert!(
+                matches!(items.as_slice(), [Incoming::Note(d), Incoming::Record(_)] if d.topic == "filimon-social-items" && d.offset == offset),
+                "decode_social must give one located Note and the record (offset {offset})"
+            );
+            assert_located(&items);
+        }
+
+        // In-batch steps: the start offset is the skipped record's offset.
+        let first = news_items(vec![Err(runtime_error_at(0))]);
+        let reopen = |next: i64| {
+            let items = if next < 3 {
+                vec![Err(runtime_error_at(0))]
+            } else {
+                vec![Ok(record("n3"))]
+            };
+            future::ready(Ok(news_items(items)))
+        };
+        let items: Vec<Incoming> = news_incoming(first, "raw", reopen).collect().await;
+        assert_eq!(skipped_offsets(&items), [0, 1, 2]);
+        assert!(items.iter().filter_map(located).all(|d| d.topic == "raw"));
+        assert_located(&items);
+
+        // The reopen limit: every rejected record, then the fatal closing line.
+        let first = news_items(vec![Err(runtime_error_at(0))]);
+        let reopen = |next: i64| future::ready(Ok(news_items(vec![Err(runtime_error_at(next))])));
+        let items: Vec<Incoming> = news_incoming(first, "raw", reopen).collect().await;
+        let last = i64::try_from(MAX_REOPENS).expect("small limit");
+        assert_eq!(skipped_offsets(&items), (0..=last).collect::<Vec<i64>>());
+        assert_eq!(items.len(), MAX_REOPENS + 2);
+        assert!(matches!(items.last(), Some(Incoming::Fatal(_))));
+        assert_located(&items);
     }
 
     #[test]
@@ -1538,6 +1719,8 @@ mod tests {
         let collected = collect_records(stream, 10, Duration::from_secs(1)).await;
         assert!(collected.records.is_empty());
         assert!(collected.diagnostics.is_empty());
+        assert!(collected.unshown.is_empty(), "{:?}", collected.unshown);
+        assert!(unshown_lines(&collected.unshown).is_empty());
     }
 
     // ── Social decode and the merged stream ──────────────────────────────────
