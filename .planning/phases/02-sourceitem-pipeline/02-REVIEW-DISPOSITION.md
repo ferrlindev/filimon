@@ -21,11 +21,11 @@ findings:
     title: "Social `published` validated but not normalized to UTC (carried forward, open)"
   - id: WR-05
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Content-freedom of stream diagnostics depends on an unenforced cross-crate message convention"
   - id: WR-06
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Undecodable records do not count toward `--limit`, so a batch run is unbounded"
   - id: IN-01
     severity: info
@@ -63,9 +63,9 @@ findings:
     severity: info
     disposition: open
     title: "Already-defended-elsewhere — empty-parent guard before `create_dir_all`"
-open: 15
+open: 12
 total: 15
-recorded: 2026-11-03T22:02:57.092Z
+recorded: 2026-11-04T10:21:31.273Z
 ---
 
 # Phase 02: Code Review Disposition
@@ -76,12 +76,12 @@ recorded: 2026-11-03T22:02:57.092Z
 | WR-02 | warning | open | - |
 | WR-03 | warning | open | - |
 | WR-04 | warning | open | - |
-| WR-05 | warning | open | - |
-| WR-06 | warning | open | - |
+| WR-05 | warning | fixed | 02-REVIEW-FIX.md |
+| WR-06 | warning | fixed | 02-REVIEW-FIX.md |
 | IN-01 | info | open | - |
 | IN-02 | info | open | - |
 | IN-03 | info | open | - |
-| CR-01 | critical | fixed | gap plan 02-04 (commits 1e895e0, e406c7a); incremental re-review 16e529d confirms all three parts resolved |
+| CR-01 | critical | fixed | gap plan 02-04 (commits 1e895e0, e406c7a); incremental re-review 16e529d confirms all three parts resolved (not in the current review) |
 | IN-04 | info | open | - (not in the current review) |
 | IN-05 | info | open | - (not in the current review) |
 | IN-06 | info | open | - (not in the current review) |
