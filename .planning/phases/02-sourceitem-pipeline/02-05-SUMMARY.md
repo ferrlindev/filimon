@@ -189,3 +189,8 @@ None. No external service configuration is required.
 ---
 *Phase: 02-sourceitem-pipeline*
 *Completed: 2026-11-04*
+
+## Self-Check: PASSED
+
+- FOUND: src/commands/consume.rs, .planning/phases/02-sourceitem-pipeline/02-05-SUMMARY.md
+- FOUND commits on branch: 66075b0, 7c8db6d, e294591, 1e09a35, bf51757
