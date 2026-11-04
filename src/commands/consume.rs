@@ -48,17 +48,22 @@ impl Default for ConsumeTopics<'_> {
     }
 }
 
-/// One item from a consumed stream: a record, or a diagnostic for stderr.
+/// One item from a consumed stream: a record, a diagnostic for stderr, or
+/// the diagnostic of a stream error that ended its branch.
 pub enum Incoming {
     Record(OutputRecord),
     Diagnostic(String),
+    Fatal(String),
 }
 
 /// What a batch run collected.
 #[derive(Default)]
 pub struct Collected {
     pub records: Vec<OutputRecord>,
+    /// Every diagnostic, fatal ones included, in arrival order.
     pub diagnostics: Vec<String>,
+    /// Whether a branch ended on a stream error.
+    pub failed: bool,
 }
 
 /// Keep at most `MAX_DETAIL` characters of an error message.
@@ -218,7 +223,7 @@ struct NewsBranch<S, F> {
 /// skipped and the next reopen starts one further on.
 ///
 /// Any other stream error, a failed reopen or the reopen limit gives a
-/// diagnostic and ends the branch.
+/// fatal diagnostic (`Incoming::Fatal`) and ends the branch.
 fn news_incoming<S, F, Fut>(
     first: S,
     topic: &str,
@@ -240,7 +245,7 @@ where
     Box::pin(futures_util::stream::unfold(branch, |mut b| async move {
         if let Some(message) = b.closing.take() {
             b.stream = None;
-            return Some((Incoming::Diagnostic(message), b));
+            return Some((Incoming::Fatal(message), b));
         }
         let code = match b.stream.as_mut()?.next().await? {
             Ok(incoming) => return Some((incoming, b)),
@@ -248,7 +253,7 @@ where
         };
         b.stream = None;
         let ErrorCode::SmartModuleRuntimeError(e) = &code else {
-            return Some((Incoming::Diagnostic(describe_stream_error(&b.topic, &code)), b));
+            return Some((Incoming::Fatal(describe_stream_error(&b.topic, &code)), b));
         };
         let (message, next) = match b.start {
             Some(start) if e.offset < start => (
@@ -305,7 +310,7 @@ where
                 Ok(record) => decode_social(&topic, record.offset(), record.value()),
                 Err(code) => {
                     *failed = true;
-                    vec![Incoming::Diagnostic(describe_stream_error(&topic, &code))]
+                    vec![Incoming::Fatal(describe_stream_error(&topic, &code))]
                 }
             };
             future::ready(Some(futures_util::stream::iter(items)))
@@ -328,7 +333,8 @@ where
 /// Collect up to `limit` records, in arrival order.
 ///
 /// Stops when the stream ends or nothing arrives within `idle`. Diagnostics
-/// are kept separately and do not count toward `limit`.
+/// are kept separately and do not count toward `limit`; a fatal one also
+/// marks the run failed.
 pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
     mut stream: S,
     limit: usize,
@@ -339,6 +345,10 @@ pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
         match tokio::time::timeout(idle, stream.next()).await {
             Ok(Some(Incoming::Record(record))) => collected.records.push(record),
             Ok(Some(Incoming::Diagnostic(message))) => collected.diagnostics.push(message),
+            Ok(Some(Incoming::Fatal(message))) => {
+                collected.failed = true;
+                collected.diagnostics.push(message);
+            }
             Ok(None) | Err(_) => break,
         }
     }
@@ -578,6 +588,7 @@ async fn consume_batch(
     let Collected {
         mut records,
         diagnostics,
+        failed,
     } = collect_from_topics(stream, topics, offset, limit, source).await?;
 
     for message in &diagnostics {
@@ -592,9 +603,31 @@ async fn consume_batch(
         output::print_summary(record);
     }
 
-    output::save_json(&records, path)
+    finish_batch(&records, failed, path)
+}
+
+/// Write the batch file, then report a failed stream as an error.
+///
+/// When a stream failed before any record arrived the file is not written,
+/// so the last good output survives. Records read before a failure are
+/// written, and the run still fails.
+fn finish_batch(records: &[OutputRecord], failed: bool, path: &Path) -> miette::Result<()> {
+    if failed && records.is_empty() {
+        return Err(miette::miette!(
+            "a stream failed before any record arrived; {} was not written",
+            path.display()
+        ));
+    }
+    output::save_json(records, path)
         .map_err(|e| miette::miette!("Failed to write {}: {e}", path.display()))?;
     output::print_run_summary(records.len(), &path.display().to_string());
+    if failed {
+        return Err(miette::miette!(
+            "a stream failed; {} holds the {} records read before it",
+            path.display(),
+            records.len()
+        ));
+    }
     Ok(())
 }
 
@@ -618,11 +651,19 @@ async fn consume_stream(
     let mut incoming = open_incoming(stream, topics, offset, source).await?;
     println!("[Consume] Press Ctrl+C to stop.\n");
 
+    let mut failed = false;
     while let Some(item) = incoming.next().await {
         match item {
             Incoming::Record(record) => output::print_summary(&record),
             Incoming::Diagnostic(message) => print_diagnostic(&message),
+            Incoming::Fatal(message) => {
+                failed = true;
+                print_diagnostic(&message);
+            }
         }
+    }
+    if failed {
+        return Err(miette::miette!("consume stopped: a stream ended on an error"));
     }
     Ok(())
 }
@@ -689,6 +730,7 @@ mod tests {
             match item {
                 Incoming::Record(r) => records.push(r),
                 Incoming::Diagnostic(d) => diagnostics.push(d),
+                Incoming::Fatal(d) => panic!("a decode gave a fatal item: {d:?}"),
             }
         }
         (records, diagnostics)
@@ -952,6 +994,7 @@ mod tests {
         assert_eq!(*calls.borrow(), [2]);
         let ids: Vec<&str> = collected.records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["n0", "n2"]);
+        assert!(!collected.failed, "a skipped record is not a failed stream");
         assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
         let message = &collected.diagnostics[0];
         assert!(message.contains("raw offset 1"), "{message:?}");
@@ -979,6 +1022,7 @@ mod tests {
         assert_eq!(*calls.borrow(), [1, 2, 3]);
         let ids: Vec<&str> = collected.records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["n3"]);
+        assert!(!collected.failed);
         let d = &collected.diagnostics;
         assert_eq!(d.len(), 3, "{d:?}");
         assert!(d[0].contains("raw offset 0: SmartModule error"), "{d:?}");
@@ -1002,6 +1046,7 @@ mod tests {
         let collected =
             collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
         assert!(collected.records.is_empty(), "{:?}", collected.records);
+        assert!(collected.failed);
         assert_eq!(collected.diagnostics.len(), 1, "{:?}", collected.diagnostics);
     }
 
@@ -1017,6 +1062,7 @@ mod tests {
             collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
         assert_eq!(calls.get(), MAX_REOPENS);
         assert!(collected.records.is_empty());
+        assert!(collected.failed);
         // One per rejected record, then the closing line.
         assert_eq!(collected.diagnostics.len(), MAX_REOPENS + 2);
         let last = collected.diagnostics.last().expect("closing line");
@@ -1030,9 +1076,56 @@ mod tests {
         let collected =
             collect_records(news_incoming(first, "raw", reopen), 10, Duration::from_secs(1)).await;
         assert!(collected.records.is_empty());
+        assert!(collected.failed);
         let d = &collected.diagnostics;
         assert_eq!(d.len(), 2, "{d:?}");
         assert!(d[1].contains("could not reopen at offset 5"), "{d:?}");
+    }
+
+    #[tokio::test]
+    async fn fatal_item_marks_collection_failed() {
+        let items = vec![
+            record("a"),
+            Incoming::Diagnostic("skipped".into()),
+            Incoming::Fatal("ended".into()),
+        ];
+        let collected = collect_records(iter(items), 10, Duration::from_secs(1)).await;
+        assert!(collected.failed);
+        assert_eq!(collected.records.len(), 1);
+        assert_eq!(collected.diagnostics, ["skipped", "ended"]);
+
+        let clean = vec![record("a"), Incoming::Diagnostic("skipped".into())];
+        let collected = collect_records(iter(clean), 10, Duration::from_secs(1)).await;
+        assert!(!collected.failed);
+    }
+
+    #[test]
+    fn failed_batch_with_no_records_keeps_previous_output() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("out.json");
+        std::fs::write(&path, "[\"last good\"]").expect("seed file");
+        let err = finish_batch(&[], true, &path).expect_err("failed run");
+        assert!(err.to_string().contains("not written"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "[\"last good\"]");
+    }
+
+    #[test]
+    fn failed_batch_with_records_writes_them_and_fails() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("out.json");
+        let records = vec![OutputRecord::from_article(article("https://example.com/a"))];
+        assert!(finish_batch(&records, true, &path).is_err());
+        let text = std::fs::read_to_string(&path).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value.as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn clean_empty_batch_writes_empty_array() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("out.json");
+        finish_batch(&[], false, &path).expect("clean run");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "[]");
     }
 
     #[test]

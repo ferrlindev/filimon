@@ -12,6 +12,9 @@ use std::io::Write;
 use std::path::Path;
 
 /// Serialize records to a pretty-printed JSON array, creating parent directories.
+///
+/// The array is written to a temporary file next to `path` and then renamed
+/// over it, so an interrupted or failed write leaves the previous file whole.
 pub fn save_json(records: &[OutputRecord], path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -19,9 +22,24 @@ pub fn save_json(records: &[OutputRecord], path: &Path) -> std::io::Result<()> {
         }
     }
     let json = serde_json::to_string_pretty(records).map_err(std::io::Error::other)?;
-    let mut f = File::create(path)?;
-    f.write_all(json.as_bytes())?;
-    Ok(())
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "output path has no file name")
+    })?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let written = File::create(&tmp).and_then(|mut f| {
+        f.write_all(json.as_bytes())?;
+        f.sync_all()
+    });
+    match written.and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Make record text safe to print on a terminal.
@@ -174,5 +192,39 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(value.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn save_json_replaces_file_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.json");
+        std::fs::write(&path, "old").unwrap();
+        save_json(&[sample()], &path).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["out.json"], "{names:?}");
+    }
+
+    #[test]
+    fn failed_save_json_keeps_previous_file() {
+        let dir = TempDir::new().unwrap();
+        // A directory at the target path makes the final rename fail.
+        let path = dir.path().join("out.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "x").unwrap();
+        assert!(save_json(&[sample()], &path).is_err());
+
+        assert!(path.join("keep").exists());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["out.json"], "{names:?}");
     }
 }
