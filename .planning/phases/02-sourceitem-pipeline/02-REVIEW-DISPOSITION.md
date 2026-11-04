@@ -5,19 +5,19 @@ titles: json
 findings:
   - id: WR-01
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "One poison record permanently halts the news branch (carried forward, open)"
   - id: WR-02
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Consume exits 0 and overwrites prior output when streams fail (carried forward, open)"
   - id: WR-03
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "`--enrich-ner` silently ignored in streaming mode (carried forward, open)"
   - id: WR-04
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Social `published` validated but not normalized to UTC (carried forward, open)"
   - id: WR-05
     severity: warning
@@ -72,10 +72,10 @@ recorded: 2026-11-04T10:21:31.273Z
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-01 | warning | open | - |
-| WR-02 | warning | open | - |
-| WR-03 | warning | open | - |
-| WR-04 | warning | open | - |
+| WR-01 | warning | fixed | 02-REVIEW-FIX.md (commit 308e775; title differs from review by its carried-forward suffix) |
+| WR-02 | warning | fixed | 02-REVIEW-FIX.md (commit 9382d43; title differs from review by its carried-forward suffix) |
+| WR-03 | warning | fixed | 02-REVIEW-FIX.md (commit ec72c90; title differs from review by its carried-forward suffix) |
+| WR-04 | warning | fixed | 02-REVIEW-FIX.md (commit 4c2845e; title differs from review by its carried-forward suffix) |
 | WR-05 | warning | fixed | 02-REVIEW-FIX.md |
 | WR-06 | warning | fixed | 02-REVIEW-FIX.md |
 | IN-01 | info | open | - |
