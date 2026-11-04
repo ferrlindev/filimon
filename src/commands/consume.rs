@@ -533,12 +533,15 @@ where
 /// Collect up to `limit` records, in arrival order.
 ///
 /// Stops when the stream ends, nothing arrives within `idle`, or
-/// `diagnostic_budget(limit)` diagnostics have arrived, so a topic full of
-/// undecodable values cannot keep a run going. Diagnostics are kept
-/// separately and do not count toward `limit`: at most `MAX_DIAGNOSTICS`
-/// record diagnostics keep their message, and past that each keeps only its
-/// topic and offset (see `Collected::skip` and `Collected::note`). A fatal one
-/// is always kept and also marks the run failed.
+/// `diagnostic_budget(limit)` skipped and fatal items have arrived, so a
+/// topic full of undecodable values cannot keep a run going. A note does not
+/// count toward that budget: it comes with a record, a record has at most two
+/// notes, and records are bounded by `limit`, so notes cannot keep a run
+/// going. Diagnostics are kept separately and do not count toward `limit`: at
+/// most `MAX_DIAGNOSTICS` record diagnostics keep their message, and past that
+/// each keeps only its topic and offset (see `Collected::skip` and
+/// `Collected::note`). A fatal one is always kept and also marks the run
+/// failed.
 pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
     mut stream: S,
     limit: usize,
@@ -554,10 +557,7 @@ pub async fn collect_records<S: Stream<Item = Incoming> + Unpin>(
                 seen += 1;
                 collected.skip(d);
             }
-            Ok(Some(Incoming::Note(d))) => {
-                seen += 1;
-                collected.note(d);
-            }
+            Ok(Some(Incoming::Note(d))) => collected.note(d),
             Ok(Some(Incoming::Fatal(message))) => {
                 seen += 1;
                 collected.failed = true;
