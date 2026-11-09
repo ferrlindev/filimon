@@ -2,16 +2,17 @@
 // plugins/host/testing.rs - Shared test helpers (cfg(test) only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::subscriber::DefaultGuard;
 
 use super::cursor::CursorStore;
 use super::engine::{PollError, PollResponse, WitItem};
@@ -88,12 +89,27 @@ pub fn load_test_registry(path: &Path) -> LoadedRegistry {
     })
 }
 
-#[derive(Clone)]
-struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+type CaptureBuf = Arc<Mutex<Vec<u8>>>;
 
-impl Write for SharedBuf {
+thread_local! {
+    /// The buffer that receives this thread's tracing output, set while a
+    /// `LogCapture` guard is live on the thread. `None` discards the output.
+    static THREAD_CAPTURE: RefCell<Option<CaptureBuf>> = const { RefCell::new(None) };
+}
+
+/// The writer of the process-wide capture subscriber: appends each write to
+/// the capture buffer of the writing thread, or drops it when that thread has
+/// none. `fmt` formats and writes an event on the thread that emitted it, so
+/// the routing key is the emitting thread.
+struct ThreadRoutedWriter;
+
+impl Write for ThreadRoutedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        let _ = THREAD_CAPTURE.try_with(|slot| {
+            if let Some(target) = slot.borrow().as_ref() {
+                target.lock().expect("log buffer").extend_from_slice(buf);
+            }
+        });
         Ok(buf.len())
     }
 
@@ -102,24 +118,73 @@ impl Write for SharedBuf {
     }
 }
 
-/// Captures `tracing` output into a string. The default subscriber is
-/// thread-local, so tests using it stay on the current-thread runtime.
-pub struct LogCapture {
-    buf: Arc<Mutex<Vec<u8>>>,
-}
-
-impl LogCapture {
-    pub fn start() -> (Self, DefaultGuard) {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let writer = SharedBuf(Arc::clone(&buf));
+/// Installs, once per process, the one subscriber every test thread shares.
+///
+/// A per-test `tracing::subscriber::set_default` cannot be made reliable under
+/// the parallel test runner. `tracing` caches an `Interest` per callsite, and
+/// with a single live scoped dispatcher it computes that interest from the
+/// registering thread's own default (`tracing-core`'s `has_just_one` path). A
+/// sibling test thread with no subscriber that reaches a callsite first caches
+/// `never` for it, and the capturing thread's events from that callsite are
+/// then silently dropped until some unrelated `set_default` rebuilds the cache.
+/// `rebuild_interest_cache` right after `set_default` does not help, because
+/// the callsite may register after it.
+///
+/// One global dispatcher at `TRACE` is every thread's fallback, so every
+/// callsite's interest is always or sometimes, never `never`; which buffer
+/// (if any) an event lands in is decided at write time, per thread.
+fn install_capture_subscriber() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
             .with_target(true)
-            .with_writer(move || writer.clone())
+            .with_writer(|| ThreadRoutedWriter)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (Self { buf }, guard)
+        tracing::subscriber::set_global_default(subscriber).expect(
+            "LogCapture needs to own the process-wide tracing subscriber, \
+             but another one is already installed",
+        );
+    });
+}
+
+/// Captures `tracing` output emitted on the current thread into a string.
+///
+/// Capture is per thread: tests using it stay on the current-thread runtime,
+/// and output from other threads (or from tasks on other threads) is not seen.
+pub struct LogCapture {
+    buf: CaptureBuf,
+}
+
+/// Ends the capture on the thread that started it when dropped, restoring
+/// the capture (if any) that was live before it. Not `Send`: it must be
+/// dropped on the thread that created it.
+#[must_use = "dropping the guard ends the capture"]
+pub struct CaptureGuard {
+    previous: Option<CaptureBuf>,
+    _same_thread: PhantomData<*const ()>,
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = THREAD_CAPTURE.try_with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+impl LogCapture {
+    pub fn start() -> (Self, CaptureGuard) {
+        install_capture_subscriber();
+        let buf: CaptureBuf = Arc::new(Mutex::new(Vec::new()));
+        let previous = THREAD_CAPTURE.with(|slot| slot.replace(Some(Arc::clone(&buf))));
+        (
+            Self { buf },
+            CaptureGuard {
+                previous,
+                _same_thread: PhantomData,
+            },
+        )
     }
 
     pub fn text(&self) -> String {
@@ -372,4 +437,78 @@ pub(crate) async fn run_for<F: InstanceFactory, S: ItemSink>(
     tokio::time::sleep(duration).await;
     token.cancel();
     handle.await.expect("plugin task")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
+    fn probe(who: &str) {
+        tracing::warn!(plugin = %who, "log-capture-probe");
+    }
+
+    /// The scheduler flake: a callsite first reached by a thread that has no
+    /// capture must still deliver events to a thread that does.
+    #[test]
+    fn capture_sees_a_callsite_first_registered_by_a_thread_without_one() {
+        let (logs, _guard) = LogCapture::start();
+        std::thread::spawn(|| probe("uncaptured"))
+            .join()
+            .expect("probe thread");
+        probe("captured");
+
+        let text = logs.text();
+        assert!(text.contains("plugin=captured"), "{text:?}");
+        assert!(!text.contains("plugin=uncaptured"), "{text:?}");
+    }
+
+    #[test]
+    fn concurrent_captures_only_see_their_own_threads_output() {
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|who| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let (logs, _guard) = LogCapture::start();
+                    barrier.wait();
+                    probe(who);
+                    barrier.wait();
+                    logs.text()
+                })
+            })
+            .collect();
+        let texts: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().expect("capture thread"))
+            .collect();
+
+        assert!(texts[0].contains("plugin=one") && !texts[0].contains("plugin=two"));
+        assert!(texts[1].contains("plugin=two") && !texts[1].contains("plugin=one"));
+    }
+
+    #[test]
+    fn nested_capture_restores_the_outer_one_and_no_capture_discards() {
+        probe("before");
+        let (outer, outer_guard) = LogCapture::start();
+        probe("outer-1");
+        {
+            let (inner, _inner_guard) = LogCapture::start();
+            probe("inner");
+            assert!(inner.text().contains("plugin=inner"));
+            assert!(!inner.text().contains("plugin=outer-1"));
+        }
+        probe("outer-2");
+        drop(outer_guard);
+        probe("after");
+
+        let text = outer.text();
+        assert!(text.contains("plugin=outer-1"), "{text:?}");
+        assert!(text.contains("plugin=outer-2"), "{text:?}");
+        for absent in ["plugin=inner", "plugin=before", "plugin=after"] {
+            assert!(!text.contains(absent), "{text:?}");
+        }
+    }
 }

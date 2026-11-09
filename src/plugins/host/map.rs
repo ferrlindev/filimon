@@ -364,13 +364,6 @@ mod tests {
     #[test]
     fn drop_warning_names_plugin_index_and_reason_but_not_content() {
         let (capture, _guard) = LogCapture::start();
-        // Sibling tests hit the same `warn!` callsite on threads with no
-        // subscriber, and whichever thread reaches it first caches its interest
-        // ("never" when that thread has no subscriber). Reach it once here so it
-        // is certainly registered, then recompute the cached interest against
-        // this thread's subscriber; a registered callsite is never re-registered.
-        let _ = map_items("warmup", vec![wit("", "https://e.invalid/")]);
-        tracing::callsite::rebuild_interest_cache();
         let mut bad = wit("   ", "https://secret.invalid/SECRET-URL-456");
         bad.text = "SECRET-TEXT-123".to_string();
         bad.title = Some("SECRET-TITLE".to_string());
