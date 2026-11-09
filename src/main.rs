@@ -49,11 +49,40 @@ fn criteria(item: &str) -> Result<String, check::ItemError> {
     }
 }
 
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+/// Default log directive: plugin-host events only, so existing commands' output
+/// is unchanged. Derived from the crate name so it cannot drift (the binary
+/// crate is `fili`, so event targets are `fili::plugins::...`).
+fn default_log_directive() -> String {
+    format!("{}::plugins=info", env!("CARGO_CRATE_NAME"))
+}
+
+/// Build the log filter: a valid non-blank `RUST_LOG` value replaces the
+/// default; None, blank or unparsable input falls back to the default.
+fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    rust_log
+        .map(str::trim)
+        .filter(|directives| !directives.is_empty())
+        .and_then(|directives| tracing_subscriber::EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(default_log_directive()))
+}
+
+/// Install the stderr subscriber. Logs never go to stdout; a subscriber that is
+/// already installed is left in place.
+fn init_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 // ── Entry Point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
     let cli = Cli::parse();
+    init_logging();
 
     println!("╔═══════════════════════════════════════════════╗");
     println!("║  filimon · Fluvio streaming news extractor    ║");
@@ -360,4 +389,68 @@ async fn run_file(paths: &[PathBuf]) -> miette::Result<()> {
         total_produced, TOPIC_RAW_PAGES
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    /// A `Write` handle that appends to a shared buffer, for capturing events.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedBuf {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("buffer lock")).into_owned()
+        }
+    }
+
+    #[test]
+    fn default_filter_passes_plugin_events_and_blocks_others() {
+        assert_eq!(env!("CARGO_CRATE_NAME"), "fili");
+        assert_eq!(default_log_directive(), "fili::plugins=info");
+        assert_eq!(log_filter(None).to_string(), "fili::plugins=info");
+
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(log_filter(None))
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "fili::plugins::host::scheduler", "plugin-target-message");
+            tracing::info!(target: "fili::streaming", "other-target-message");
+        });
+
+        let out = buf.contents();
+        assert!(out.contains("plugin-target-message"), "captured: {out}");
+        assert!(!out.contains("other-target-message"), "captured: {out}");
+    }
+
+    #[test]
+    fn rust_log_overrides_default() {
+        assert_eq!(log_filter(Some("debug")).to_string(), "debug");
+    }
+
+    #[test]
+    fn invalid_or_blank_rust_log_falls_back_to_default() {
+        let default = log_filter(None).to_string();
+        for input in ["", "   ", "fili=nonsense"] {
+            assert_eq!(log_filter(Some(input)).to_string(), default, "input {input:?}");
+        }
+    }
 }
