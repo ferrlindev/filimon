@@ -12,8 +12,15 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
 - `stub-fetcher/`: a minimal plugin for the `fetcher` world. `fetch` logs the
   request URL and returns a canned `200` JSON response. It never calls
   `outbound-http`.
+- `fault-source/`: a fault-injection plugin for the `source` world and a
+  Phase 3 test fixture, not a registry example. Its `[settings]` `mode`
+  selects `ok`, `rate-limited`, `transient`, `auth-required`, `fatal`,
+  `config`, `init-fatal`, `trap` or `spin`. Optional `retry_after_secs`
+  (used by `rate-limited`) and `after_polls` (polls up to that count behave as
+  `ok`) refine it. The `trap` and `spin` modes deliberately misbehave, so
+  never reference it from a plugin registry such as `examples/plugins/`.
 
-Both stubs double as test fixtures for the Phase 3 host.
+Both stubs and the fault source double as test fixtures for the Phase 3 host.
 
 These crates are not members of the root filimon workspace. Each has its own
 empty `[workspace]` table, its own `Cargo.lock`, and its own toolchain pin.
@@ -41,6 +48,7 @@ From the repository root:
 ```sh
 (cd plugins/stub-source && cargo component build --release)
 (cd plugins/stub-fetcher && cargo component build --release)
+(cd plugins/fault-source && cargo component build --release)
 ```
 
 The build must run from the crate directory, which the subshells handle:
@@ -50,6 +58,7 @@ components land at:
 
 - `plugins/stub-source/target/wasm32-unknown-unknown/release/stub_source.wasm`
 - `plugins/stub-fetcher/target/wasm32-unknown-unknown/release/stub_fetcher.wasm`
+- `plugins/fault-source/target/wasm32-unknown-unknown/release/fault_source.wasm`
 
 ## Conformance check
 
