@@ -24,6 +24,9 @@ wise_output.json
 .DS_Store
 Thumbs.db
 
+# ── Plugin host cursor state (written next to a registry) ──────────────────────
+.fili-state/
+
 # ── Docker ─────────────────────────────────────────────────────────────────────
 docker-compose.override.yaml
 docker-compose.override.yml
