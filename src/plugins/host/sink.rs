@@ -16,7 +16,9 @@ use tracing::debug;
 use crate::models::SourceItem;
 use crate::streaming::{FluvioStream, TOPIC_SOCIAL_ITEMS, TypedProducer};
 
-/// Longest the host waits for one `send_batch` before treating it as failed.
+/// Longest `FluvioSink` spends sending and flushing one batch, counted from the
+/// moment it holds the producer lock (time spent waiting for the lock is not
+/// counted), before it treats the batch as failed.
 pub const SINK_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// One record bound for the sink: its message key and the item.
@@ -35,6 +37,10 @@ pub struct SinkError(pub String);
 pub trait ItemSink: Send + Sync + 'static {
     /// Sends and flushes `records`. `Ok` means they are delivered, so the
     /// caller may persist the cursor.
+    ///
+    /// An implementation that can block on I/O bounds its own wait and returns
+    /// an `Err` when that bound expires: the caller does not cancel the future,
+    /// because dropping it mid-flight would skip the implementation's cleanup.
     fn send_batch(
         &self,
         plugin: &str,
@@ -73,23 +79,56 @@ impl ItemSink for FluvioSink {
     /// attributed to another plugin's batch. Fluvio 0.50.1 keeps returning a
     /// stored producer error until it is cleared, so every failure clears it
     /// before returning and a later batch can succeed.
+    ///
+    /// The `SINK_TIMEOUT` bound lives here, not in the caller, and starts after
+    /// the lock is held: a slow flush by another plugin does not count against
+    /// this batch, and an expiry still runs `clear_errors` because the future is
+    /// never dropped mid-flight.
     async fn send_batch(&self, plugin: &str, records: Vec<SinkRecord>) -> Result<(), SinkError> {
         let count = records.len();
         let producer = self.producer.lock().await;
 
-        for record in &records {
-            if let Err(e) = producer.send(&record.key, &record.item).await {
-                producer.clear_errors().await;
-                return Err(SinkError(e.to_string()));
-            }
-        }
-        if let Err(e) = producer.flush().await {
-            producer.clear_errors().await;
-            return Err(SinkError(e.to_string()));
-        }
+        send_bounded(
+            SINK_TIMEOUT,
+            async {
+                for record in &records {
+                    producer
+                        .send(&record.key, &record.item)
+                        .await
+                        .map_err(|e| SinkError(e.to_string()))?;
+                }
+                producer
+                    .flush()
+                    .await
+                    .map_err(|e| SinkError(e.to_string()))
+            },
+            producer.clear_errors(),
+        )
+        .await?;
 
         debug!(plugin = %plugin, count, "sent plugin items");
         Ok(())
+    }
+}
+
+/// Runs `work` for at most `limit`. On a failure or an expiry it awaits `clear`
+/// (the producer's `clear_errors`) before returning, so a stored error cannot
+/// poison the next batch. An expiry is reported as `send timed out`.
+async fn send_bounded<W, C>(limit: Duration, work: W, clear: C) -> Result<(), SinkError>
+where
+    W: Future<Output = Result<(), SinkError>>,
+    C: Future<Output = ()>,
+{
+    match tokio::time::timeout(limit, work).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            clear.await;
+            Err(error)
+        }
+        Err(_) => {
+            clear.await;
+            Err(SinkError("send timed out".to_string()))
+        }
     }
 }
 
@@ -228,6 +267,52 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn send_bounded_clears_errors_when_the_timeout_expires() {
+        let cleared = std::sync::atomic::AtomicBool::new(false);
+        let result = send_bounded(
+            Duration::from_secs(60),
+            std::future::pending::<Result<(), SinkError>>(),
+            async { cleared.store(true, std::sync::atomic::Ordering::SeqCst) },
+        )
+        .await;
+
+        let error = result.expect_err("a stuck send times out");
+        assert_eq!(error.0, "send timed out");
+        assert!(cleared.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_bounded_clears_errors_on_a_failure_and_keeps_its_text() {
+        let cleared = std::sync::atomic::AtomicBool::new(false);
+        let result = send_bounded(
+            Duration::from_secs(60),
+            async { Err(SinkError("broker down".to_string())) },
+            async { cleared.store(true, std::sync::atomic::Ordering::SeqCst) },
+        )
+        .await;
+
+        assert_eq!(result.expect_err("fails").0, "broker down");
+        assert!(cleared.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_bounded_does_not_clear_on_success_and_work_may_take_until_the_limit() {
+        let cleared = std::sync::atomic::AtomicBool::new(false);
+        let result = send_bounded(
+            Duration::from_secs(60),
+            async {
+                tokio::time::sleep(Duration::from_secs(59)).await;
+                Ok(())
+            },
+            async { cleared.store(true, std::sync::atomic::Ordering::SeqCst) },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(!cleared.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[test]
     fn fluvio_sink_is_an_item_sink() {
         assert_item_sink::<FluvioSink>();
@@ -287,6 +372,40 @@ mod tests {
                     serde_json::from_slice(got.value()).expect("value is a SourceItem");
                 assert_eq!(item, expected.item);
             }
+            Ok::<(), miette::Report>(())
+        })
+        .catch_unwind()
+        .await;
+        let deleted = delete_topic(&topic).await;
+        match body {
+            Ok(outcome) => {
+                outcome?;
+                deleted
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// A failed batch clears the producer's sticky error, so the next batch on
+    /// the same sink succeeds. The failure here is a record over the broker's
+    /// request limit, which is what `MAX_RECORD_BYTES` exists to prevent. The
+    /// timeout expiry path (a stuck broker) needs a cluster that stops
+    /// responding and is covered only by the `send_bounded` unit tests.
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with topic creation rights"]
+    async fn live_fluvio_sink_recovers_after_a_failed_batch() -> miette::Result<()> {
+        let topic = scratch_topic("sink-clear").await?;
+        let body = std::panic::AssertUnwindSafe(async {
+            let sink = ready_sink(&topic).await?;
+
+            let mut huge = record("huge");
+            huge.item.text = "a".repeat(2_000_000);
+            let failed = sink.send_batch("p", vec![huge]).await;
+            assert!(failed.is_err(), "a 2 MB record must be refused");
+
+            sink.send_batch("p", vec![record("after")])
+                .await
+                .map_err(|e| miette::miette!("batch after the failure: {e}"))?;
             Ok::<(), miette::Report>(())
         })
         .catch_unwind()

@@ -24,7 +24,7 @@ use super::cursor::CursorStore;
 use super::engine::{PollError, clean_guest_text};
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
-use super::sink::{ItemSink, SINK_TIMEOUT, SinkRecord};
+use super::sink::{ItemSink, SinkRecord};
 use crate::plugins::config::{HostConfig, LoadedSource};
 use crate::plugins::secrets::ResolvedSecrets;
 
@@ -208,8 +208,12 @@ fn disable(report: &mut PluginReport, plugin: &str, reason: String) {
     report.disabled = Some(reason);
 }
 
-/// Sends one poll's records, bounded by `SINK_TIMEOUT`. Returns the number of
-/// records sent, or a host-side failure text (never blamed on the plugin).
+/// Sends one poll's records. Returns the number of records sent, or a host-side
+/// failure text (never blamed on the plugin).
+///
+/// There is no timeout here: the sink bounds its own wait (`SINK_TIMEOUT` in
+/// `FluvioSink`) so that a slow send cleans up after itself. Dropping the future
+/// from outside would skip that cleanup.
 async fn send_records<S: ItemSink>(
     sink: &S,
     plugin: &str,
@@ -219,10 +223,9 @@ async fn send_records<S: ItemSink>(
         return Ok(0);
     }
     let count = records.len() as u64;
-    match tokio::time::timeout(SINK_TIMEOUT, sink.send_batch(plugin, records)).await {
-        Ok(Ok(())) => Ok(count),
-        Ok(Err(e)) => Err(clean_guest_text(&e.to_string(), REPORT_TEXT_CLIP)),
-        Err(_) => Err("send timed out".to_string()),
+    match sink.send_batch(plugin, records).await {
+        Ok(()) => Ok(count),
+        Err(e) => Err(clean_guest_text(&e.to_string(), REPORT_TEXT_CLIP)),
     }
 }
 
