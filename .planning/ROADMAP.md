@@ -13,7 +13,7 @@ This milestone adds a WASM/WIT source-plugin system to `fili`, so social platfor
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Plugin Contract & Configuration** - Versioned WIT package (`source` + `fetcher` worlds) plus the `filimon.toml` registry, per-plugin TOML, and `.env` secret loading with clear errors (completed 2026-11-03)
-- [ ] **Phase 2: SourceItem Pipeline** - Unified `SourceItem` envelope; news stays on the WISE chain, social items pass through, and the consumer NER-enriches both into one JSON output
+- [x] **Phase 2: SourceItem Pipeline** - Unified `SourceItem` envelope; news stays on the WISE chain, social items pass through, and the consumer NER-enriches both into one JSON output (completed 2026-11-09)
 - [ ] **Phase 3: Component Host Runtime** - `fili` loads registry-listed components, polls them on schedule, persists cursors, isolates failures, and produces `SourceItem`s to Fluvio
 - [ ] **Phase 4: Plugin CLI** - `fili plugins list | check | run-once` and a run command that polls all enabled sources
 - [ ] **Phase 5: Fetcher Layer** - Plugin HTTP routed through a configurable fetcher component, a host-enforced allowlist and timeout, a default TLS-validating fetcher, and an optional crawler hook
@@ -56,7 +56,7 @@ Plans:
   2. `fili produce <url>` and `fili file <paths>` still yield extracted articles at the consumer through `map-preprocess → map-extract → filter-relevance`. The news path does not regress.
   3. A social `SourceItem` produced to Fluvio reaches the consumer without any social-specific filtering, even when its text would fall below the news relevance threshold.
   4. In the consumer's existing NER mode (`--enrich-ner` with `--limit`), NER runs on social item text, and social and news records go to the same JSON output, each labelled with source type and platform.
-**Plans:** 7/7 plans executed
+**Plans:** 7/7 plans complete
 
 Plans:
 **Wave 1**
@@ -154,7 +154,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
-| 2. SourceItem Pipeline | 7/7 | In Progress | - |
+| 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
 | 3. Component Host Runtime | 0/TBD | Not started | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |

@@ -1,7 +1,7 @@
 ---
 phase: 02-sourceitem-pipeline
 verified: 2026-11-04T13:55:00Z
-status: human_needed
+status: passed
 score: 111/111 must-haves verified (93/93 truths incl. 1 override, 18/18 prohibitions)
 covered_files:
   - .planning/phases/02-sourceitem-pipeline/02-01-PLAN.md
@@ -259,3 +259,10 @@ The phase goal is achieved in code, tests and the live cluster. The remaining it
 
 _Verified: 2026-11-04T13:55:00Z_
 _Verifier: Claude (gsd-verifier)_
+
+## Acknowledged Gaps
+
+Acknowledged by the user at `/gsd-verify-work 02` completion (2026-11-09). The open-items scan (`audit-open`) found two deferred items. Neither touches PIPE-01..PIPE-04, and plan 02-03 scoped both out on purpose. They stay open in `deferred-items.md`.
+
+- **docker-compose.yml `OUTPUT_PATH`:** the `filimon` service sets it, but `fili consume` reads the output path only from `--output`. The default resolves to the same path by accident. Fix: drop the env var, or have clap read it with `env = "OUTPUT_PATH"`.
+- **docker-compose.yml `filimon-stream-processor`:** it runs `stream --stage all --from-beginning`, and `fili` has no `stream` subcommand. This predates Phase 2.

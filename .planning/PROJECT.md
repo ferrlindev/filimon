@@ -22,6 +22,7 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - ✓ Consumer reads `articles` topic, optionally enriches with GLiNER NER (batch/`--limit` mode), writes JSON — existing
 - ✓ WIT package `filimon:plugin@0.1.0` defining `source` (exports init/poll; imports fetch, log) and `fetcher` worlds; stub crates build components from the WIT alone — Phase 1
 - ✓ `filimon.toml` registry + per-plugin TOML load into typed config; `.env` secrets resolved per plugin alias only; errors name plugin and field/key — Phase 1
+- ✓ Unified `SourceItem` envelope covers news pages and social posts; news stays on the WISE SmartModule chain, social items pass straight through to the consumer, and both land NER-enriched in the same JSON output — Phase 2
 
 ### Active
 
@@ -30,7 +31,6 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - [ ] Host-driven polling: host calls `poll(cursor)` on a schedule, persists the returned cursor, produces items to Fluvio
 - [ ] Host passes each plugin's resolved settings and secrets into `init` (loading/validation done in Phase 1; delivery needs the Phase 3 host)
 - [ ] Generic host-managed OAuth (PKCE + local callback): `fili auth login <plugin>`, token storage and refresh on the host; plugin TOML declares endpoints/scopes; plugin receives only access tokens via WIT
-- [ ] Unified `SourceItem` envelope covering news pages and social posts; each source type routed to an appropriate SmartModule chain; all paths converge on the same NER-enriched JSON output
 - [ ] Reference Reddit plugin (official Reddit API) as a separately built `.wasm` component
 - [ ] Reference YouTube plugin (official YouTube Data API) as a separately built `.wasm` component
 - [ ] Fetcher plugins: a second WIT world (`fetcher`) so the HTTP client is itself a supplied WASM component; source plugins' fetch and (optionally) the news crawler route through the configured fetcher; default HTTP fetcher shipped; host still enforces allowlist/timeout
@@ -78,10 +78,12 @@ A user-supplied WASM component, written only against filimon's published WIT con
 | Explicit registry (`filimon.toml`) | Nothing runs unless listed; predictable and auditable | — Pending |
 | Keys in `.env`, settings in per-plugin TOML | Separates secrets from shareable config | — Pending |
 | Generic host-managed OAuth (PKCE) | Written once, reused by any plugin; refresh tokens stay on host | — Pending |
-| Unified `SourceItem` envelope, per-type SmartModule chains | Social posts aren't HTML; still converge on same enriched output | — Pending |
+| Unified `SourceItem` envelope, per-type SmartModule chains | Social posts aren't HTML; still converge on same enriched output | ✓ Good — Phase 2: news keeps the WISE chain, social items skip it (D-01 leaves the SmartModules unchanged), both reach one NER-enriched output |
 | Ship Reddit + YouTube; defer X | X read access requires paid app tier regardless of user login | — Pending |
 | Leave existing `fluvio-wise` gaps alone | Keep milestone focused on plugin system | — Pending |
 | Fetcher is itself a WASM plugin (`fetcher` world) | Lets a future headless-browser fetcher (remote CDP) be supplied for crawling without host changes | — Pending |
+| Consumer diagnostics never carry record content, and all stderr writes go through one choke point | Record values are untrusted (page content, social text) and reach a terminal; control bytes and content must not leak | ✓ Good — Phase 2 (02-02, 02-04) |
+| An out-of-range `published` becomes null with a located note; the record is still written, and a record and its notes stay one item | A bad timestamp must not lose a record, and a note must never name a record that was not written | ✓ Good — Phase 2 (02-06, 02-07) |
 | Social items pass through (no social SmartModule chain in v1) | Keep v1 minimal; filtering deferred to v2 | — Pending |
 | Reddit: subreddits + user feed; YouTube: channel uploads + user subscriptions | User-selected v1 feeds; search/comments deferred | — Pending |
 | Skip project-level research | User decision at init; per-phase research remains enabled | — Pending |
@@ -107,4 +109,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-11-03 after Phase 1*
+*Last updated: 2026-11-09 after Phase 2*

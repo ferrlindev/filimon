@@ -1,43 +1,43 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 02
-current_phase_name: SourceItem Pipeline
-status: executing
-stopped_at: Phase 2 context gathered
-last_updated: "2026-11-04T13:12:45.566Z"
-last_activity: 2026-11-04
-last_activity_desc: Phase 02 execution started
-state_head: 5c1dcb225516345353e9891856b8b298684a14a1
+current_phase: 3
+current_phase_name: Component Host Runtime
+status: planning
+stopped_at: Phase 02 complete, ready to plan Phase 3
+last_updated: "2026-11-09T06:55:53.858Z"
+last_activity: 2026-11-09
+last_activity_desc: Phase 02 complete, transitioned to Phase 3
+state_head: bcbb3f34ad55f421281db5d6a8721a3b9d5e6df5
 progress:
   total_phases: 8
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 13
-  completed_plans: 12
-  percent: 13
+  completed_plans: 13
+  percent: 25
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-11-03)
+See: .planning/PROJECT.md (updated 2026-11-09)
 
 **Core value:** A user-supplied WASM component, written only against filimon's published WIT contract and listed in the registry, can stream items from a social platform into Fluvio and come out the other end as enriched records alongside news articles.
-**Current focus:** Phase 02 — SourceItem Pipeline
+**Current focus:** Phase 03 — Component Host Runtime
 
 ## Current Position
 
-Phase: 02 (SourceItem Pipeline) — EXECUTING
-Plan: 7 of 7
-Status: Executing Phase 02
-Last activity: 2026-11-04 — Phase 02 execution started
+Phase: 3 — Component Host Runtime
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-11-09 — Phase 02 complete, transitioned to Phase 3
 
-Progress: [█░░░░░░░░░] 13%
+Progress: [███░░░░░░░] 25%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
+- Total plans completed: 13
 - Average duration: -
 - Total execution time: 0.0 hours
 
@@ -46,6 +46,7 @@ Progress: [█░░░░░░░░░] 13%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01 | 6 | - | - |
+| 02 | 7 | - | - |
 
 **Recent Trend:**
 - Last 5 plans: -
@@ -66,6 +67,9 @@ Recent decisions affecting current work:
 - [Phase 1]: WIT package `filimon:plugin@0.1.0` is the contract; only `access-token: option<string>` crosses into `poll` (no refresh token, no TLS-weakening switch).
 - [Phase 1]: `.env` parsed by a hand-written literal-or-reject parser (dotenvy removed, CR-01); values never expanded.
 - [Phase 1]: UAT 3/3 passed; SECURITY.md verified with threats_open: 0 (6 accepted low-severity risks logged).
+- [Phase 2]: Every record is a `SourceItem`. News keeps the WISE SmartModule chain; social items pass straight through to the consumer (D-01 leaves the SmartModules unchanged); both land in one NER-enriched JSON output.
+- [Phase 2]: Consumer diagnostics never carry record content and all stderr goes through `print_diagnostic`. A social record and its notes travel as one `Incoming::Noted` item, so no stop can separate them.
+- [Phase 2]: UAT 3/3 passed; SECURITY.md verified with threats_open: 0 (36/36 threats closed).
 
 ### Pending Todos
 
@@ -77,6 +81,7 @@ None yet.
 - [Phase 3]: Phase 1 builds and documents plugins for `wasm32-unknown-unknown` (no WASI imports). Phase 3 research must decide whether the host accepts wasip1-built components, which carry `wasi:*` imports: reject them with a clear error, or link a locked-down WASI context (01-RESEARCH.md A1, Open Question 4).
 - [Phase 7]: Reddit's API needs OAuth even for read-only subreddit access. Research must settle whether RDDT-01 uses app-only credentials (CONF-02 secrets) or the Phase 6 PKCE login.
 - [Phase 2/8]: Consumer NER only runs in batch/`--limit` mode (an existing gap, out of scope). PIPE-04 and TEST-04 are verified in that mode.
+- [Phase 2]: Two docker-compose.yml items stay open in `phases/02-sourceitem-pipeline/deferred-items.md` (acknowledged at phase close): the `OUTPUT_PATH` env var that `fili` never reads, and the `filimon-stream-processor` service that runs a `stream` subcommand `fili` doesn't have. 20 of 28 code-review findings are also still open (see 02-REVIEW-DISPOSITION.md); none block a later phase.
 - [Brownfield]: Build on the uncommitted `fluvio-wise` work. Do not fix its known gaps, and never modify the `fluvio/` reference checkout.
 - [Research flags]: Phase 1 (WIT/`cargo component` toolchain versions), Phase 3 (wasmtime component-model host), Phase 5 (host-mediated component-to-component fetch), Phase 6 (Reddit/Google PKCE loopback specifics), Phase 7 (Reddit UA/rate-limit rules, YouTube quota costs).
 
@@ -90,6 +95,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-03T18:59:28.920Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-sourceitem-pipeline/02-CONTEXT.md
+Last session: 2026-11-09T06:56:31.763Z
+Stopped at: Phase 02 complete, ready to plan Phase 3
+Resume file: None
