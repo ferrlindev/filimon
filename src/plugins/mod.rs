@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod error;
+pub mod host;
 pub mod secrets;
 
 // ── Sample Registry Tests ─────────────────────────────────────────────────────
