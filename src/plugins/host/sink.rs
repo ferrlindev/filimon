@@ -271,7 +271,7 @@ mod tests {
     async fn send_bounded_clears_errors_when_the_timeout_expires() {
         let cleared = std::sync::atomic::AtomicBool::new(false);
         let result = send_bounded(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             std::future::pending::<Result<(), SinkError>>(),
             async { cleared.store(true, std::sync::atomic::Ordering::SeqCst) },
         )
@@ -286,7 +286,7 @@ mod tests {
     async fn send_bounded_clears_errors_on_a_failure_and_keeps_its_text() {
         let cleared = std::sync::atomic::AtomicBool::new(false);
         let result = send_bounded(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             async { Err(SinkError("broker down".to_string())) },
             async { cleared.store(true, std::sync::atomic::Ordering::SeqCst) },
         )
@@ -300,7 +300,7 @@ mod tests {
     async fn send_bounded_does_not_clear_on_success_and_work_may_take_until_the_limit() {
         let cleared = std::sync::atomic::AtomicBool::new(false);
         let result = send_bounded(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             async {
                 tokio::time::sleep(Duration::from_secs(59)).await;
                 Ok(())
