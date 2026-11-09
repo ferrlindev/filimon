@@ -304,7 +304,7 @@ async fn wasm_rate_limited_is_backed_off_with_retry_after_not_disabled() {
     );
 
     let sink = Arc::new(VecSink::default());
-    let report = run_host(host, sink, Duration::from_secs(60)).await;
+    let report = run_host(host, sink, Duration::from_mins(1)).await;
 
     // retry-after 25 against steps 10, 20, 40 gives waits 25, 25, 40: polls
     // land at 0, 25 and 50 s.
