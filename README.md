@@ -52,7 +52,8 @@ flowchart LR
 
 ### Prerequisites
 
-- Rust 1.85.0 (required for SmartModule WASM compilation)
+- Rust 1.96.0 for the `fili` binary and the plugin host (pinned by the root `rust-toolchain.toml`, installed automatically by rustup)
+- Rust 1.85.0 for the SmartModules (pinned by each `smartmodules/*/rust-toolchain.toml`)
 - Fluvio CLI 0.18.1+
 - Docker (optional, for containerized deployment)
 
@@ -94,20 +95,21 @@ fluvio version
 smdk version
 ```
 
-### 2. Install Rust 1.85 and WASM targets
+### 2. Install Rust toolchains and WASM targets
 
 ```bash
-# Install Rust 1.85 (required for SmartModule compilation)
+# Rust 1.85.0 builds the SmartModules
 rustup install 1.85.0
 rustup target add wasm32-unknown-unknown --toolchain 1.85.0
 rustup target add wasm32-wasip1 --toolchain 1.85.0
 
-# Set as default for this project
-cd filimon
-rustup override set 1.85.0
+# Rust 1.96.0 builds the fili binary and the plugin host
+rustup install 1.96.0
 ```
 
-> **Note**: Rust 1.96+ has a known linker issue (`undefined symbol: copy_records`) with fluvio-smartmodule 0.50.1. Use Rust 1.85.0 for SmartModule compilation.
+No repository-wide `rustup override` is needed. The root `rust-toolchain.toml` selects 1.96.0, and each `smartmodules/*/rust-toolchain.toml` selects 1.85.0 for that directory.
+
+> **Note**: Rust 1.96+ cannot link SmartModules: the build fails with `undefined symbol: copy_records` with fluvio-smartmodule 0.50.1. Build SmartModules from inside their own directory with `smdk build` so the nested 1.85.0 pin applies.
 
 ### 3. Start Fluvio Cluster
 
@@ -439,11 +441,14 @@ filimon/
 
 ### SmartModule build fails with "undefined symbol: copy_records"
 
-Use Rust 1.85.0:
+Build the SmartModule from inside its own directory, so its nested `rust-toolchain.toml` (Rust 1.85.0) applies:
 ```bash
 rustup install 1.85.0
-rustup override set 1.85.0
+cd smartmodules/filter-relevance
+smdk build
 ```
+
+Do not run `rustup override set` in the repository root. A root override would also pin the `fili` host crate below the Rust version the wasmtime dependency requires.
 
 ### Fluvio cluster won't start
 

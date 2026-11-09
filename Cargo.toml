@@ -2,7 +2,7 @@
 name = "filimon"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [lints.rust]
 unsafe_code = "warn"
@@ -40,6 +40,11 @@ fluvio = "0.50"
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WebAssembly plugin host (Phase 3)
+wasmtime = { version = "48", default-features = false, features = ["component-model", "cranelift", "runtime", "async", "std", "parallel-compilation"] }
+base64 = "0.22"
+tokio-util = "0.7"
 
 [dev-dependencies]
 # test-util enables paused time (`#[tokio::test(start_paused = true)]`).
