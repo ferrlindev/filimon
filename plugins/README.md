@@ -214,7 +214,19 @@ starts it arrives in Phase 4, which also reads `--state-dir`.
   way, except that `fatal` and `config` still disable.
 - A failure of the item sink (for example the Fluvio broker is down) is the
   host's problem, not the plugin's. It uses the same backoff, keeps the
-  instance and polls again from the same cursor.
+  instance and polls again from the same cursor. The sink gives one batch 60 s
+  to send and flush, counted from the moment it holds the producer. On expiry
+  it clears the producer's stored error and reports `send timed out`, with no
+  cursor write.
+- Each instance has a fixed 64 MiB memory ceiling. A guest that tries to grow
+  past it traps, and the host treats that like any other trap: the instance is
+  discarded and rebuilt after the backoff window. The process and the other
+  plugins are not affected. The same store also caps a component at a few
+  core instances, tables and memories.
+- A `next-cursor` over 4096 bytes is a plugin fault: nothing from that poll is
+  sent, the cursor is not written, and the plugin is disabled with a `fatal`
+  error that names the size and the cap (the same instance and cursor would
+  reproduce it).
 - A panic inside one plugin's host task is caught and reported for that plugin
   only (`plugin task panicked`).
 - Every other plugin and the process keep running. Log lines go to stderr and
@@ -240,10 +252,16 @@ starts it arrives in Phase 4, which also reads `--state-dir`.
 
 ### Items
 
-- The host drops an item with an empty id, an empty or unparsable url, or a
-  serialized record over 1,000,000 bytes. The warning names the plugin, the item
-  index and a fixed reason, never the item's content. A dropped item does not
-  fail the poll or hold back the cursor.
+- The host drops an item with an empty id, an empty or unparsable url, a
+  message key (`<platform>:<id>`) over 512 bytes, or a record over 1,000,000
+  bytes. The record size is the serialized item plus its key, because Fluvio
+  sizes the whole record. The warning names the plugin, the item index and a
+  fixed reason, never the item's content. A dropped item does not fail the poll
+  or hold back the cursor.
+- The host takes at most 1000 items from one poll. Later items are dropped and
+  counted, with one warning per poll that carries the count and the fixed
+  reason `too-many-items`. The cursor still advances, so the dropped items are
+  not retried: a plugin should page its own results to stay under the cap.
 - An empty `platform` falls back to the plugin's registry name.
 - Items go to the `filimon-social-items` topic (created by hand, as the root
   README describes) with the key `<platform>:<id>`, in the order the plugin
@@ -260,7 +278,10 @@ of control characters and clipped.
 
 ### Known limits
 
-- No per-plugin CPU or memory limits (v2 HOST-06).
+- Fixed safety caps only: 64 MiB of memory per instance, 1000 items per poll
+  and 4096 cursor bytes. Configurable per-plugin CPU and memory limits stay
+  deferred (v2 HOST-06), and there is no CPU limit at all. A guest can still
+  log without a rate limit.
 - A guest that loops forever is never terminated while the host runs. It does
   not block other plugins or shutdown: cancelling the host returns within
   seconds because the stuck call is dropped. But the spinning plugin itself

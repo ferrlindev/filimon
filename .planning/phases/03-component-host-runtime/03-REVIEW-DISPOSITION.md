@@ -5,15 +5,15 @@ titles: json
 findings:
   - id: WR-01
     severity: warning
-    disposition: open
-    title: "No resource limits on guest-controlled memory, item count, cursor size or log volume"
+    disposition: fixed
+    title: "No resource limits on guest-controlled memory, item count, cursor size or log volume (fixed caps added: 64 MiB memory, 1000 items, 4096 cursor bytes; log rate limit and configurable per-plugin limits remain v2 HOST-06)"
   - id: WR-02
     severity: warning
     disposition: open
     title: "Epoch ticker thread spawn failure is silently swallowed, which removes the anti-wedge guarantee"
   - id: WR-03
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Record key is guest-controlled, unbounded and not counted in the size cap; one bad record wedges the plugin in a duplicate-producing retry loop"
   - id: WR-04
     severity: warning
@@ -25,7 +25,7 @@ findings:
     title: "Guest-chosen `platform` can impersonate another plugin or platform, and the key encoding is ambiguous"
   - id: WR-06
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "`send_batch` is not cancellation-safe when the sink timeout drops it mid-flight"
   - id: WR-07
     severity: warning
@@ -51,4 +51,4 @@ findings:
 
 # Phase 3 code-review disposition
 
-One row per finding in `03-REVIEW.md`, all `open`: the review was advisory and no finding has been triaged yet. Update `disposition` in the frontmatter as each is fixed, deferred or declined.
+One row per finding in `03-REVIEW.md`, WR-01, WR-03 and WR-06 are `fixed`; every other row is `open` (not yet triaged). Update `disposition` in the frontmatter as each is fixed, deferred or declined.
