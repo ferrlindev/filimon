@@ -6,6 +6,7 @@
 // fires. Phase 4 owns the CLI surface; nothing here adds a subcommand.
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub mod backoff;
 pub mod cursor;
 pub mod engine;
 pub mod error;
