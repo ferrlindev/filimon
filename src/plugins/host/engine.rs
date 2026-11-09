@@ -30,6 +30,24 @@ pub mod source_world {
     });
 }
 
+/// Generated bindings for the `fetcher` world. The `types` and `log`
+/// interfaces are shared with the `source` world, so their host impls on
+/// `HostState` are written once.
+#[allow(clippy::all, clippy::pedantic)]
+pub mod fetcher_world {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "fetcher",
+        imports: { default: async | trappable },
+        exports: { default: async },
+        with: {
+            "filimon:plugin/types": super::source_world::filimon::plugin::types,
+            "filimon:plugin/log": super::source_world::filimon::plugin::log,
+        },
+    });
+}
+
+pub use fetcher_world::{Fetcher, FetcherPre};
 pub use source_world::filimon::plugin::types::{Item as WitItem, PollError, PollResponse};
 pub use source_world::{Source, SourcePre};
 
@@ -110,6 +128,16 @@ impl fetch::Host for HostState {
     }
 }
 
+impl fetcher_world::filimon::plugin::outbound_http::Host for HostState {
+    /// Interim answer until the Phase 5 fetcher layer exists: no real HTTP.
+    async fn send(
+        &mut self,
+        _request: types::Request,
+    ) -> wasmtime::Result<Result<types::Response, types::FetchError>> {
+        Ok(Err(types::FetchError::NotConfigured))
+    }
+}
+
 // ── Epoch Ticker ──────────────────────────────────────────────────────────────
 
 /// Advances the engine epoch every `EPOCH_TICK` on a dedicated OS thread. It
@@ -148,10 +176,11 @@ impl Drop for EpochTicker {
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
-/// The shared wasmtime engine, the source-world linker and the epoch ticker.
+/// The shared wasmtime engine, the per-world linkers and the epoch ticker.
 pub struct HostEngine {
     engine: Engine,
     source_linker: Linker<HostState>,
+    fetcher_linker: Linker<HostState>,
     _ticker: EpochTicker,
 }
 
@@ -169,10 +198,16 @@ impl HostEngine {
         let mut source_linker: Linker<HostState> = Linker::new(&engine);
         Source::add_to_linker::<HostState, HasSelf<HostState>>(&mut source_linker, |state| state)?;
 
+        let mut fetcher_linker: Linker<HostState> = Linker::new(&engine);
+        Fetcher::add_to_linker::<HostState, HasSelf<HostState>>(&mut fetcher_linker, |state| {
+            state
+        })?;
+
         let ticker = EpochTicker::start(engine.clone());
         Ok(Self {
             engine,
             source_linker,
+            fetcher_linker,
             _ticker: ticker,
         })
     }
@@ -185,6 +220,11 @@ impl HostEngine {
     #[must_use]
     pub fn source_linker(&self) -> &Linker<HostState> {
         &self.source_linker
+    }
+
+    #[must_use]
+    pub fn fetcher_linker(&self) -> &Linker<HostState> {
+        &self.fetcher_linker
     }
 }
 
