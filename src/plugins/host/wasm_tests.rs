@@ -83,3 +83,56 @@ async fn wasm_tracer_stub_polls_and_persists_cursor() {
     assert!(captured.contains("plugin=stub"), "{captured}");
     assert!(captured.contains(GREETING), "{captured}");
 }
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_restart_resumes_from_persisted_cursor() {
+    use base64::Engine as _;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let registry_path = write_registry(tmp.path(), &[stub_source(60)]);
+    let registry = load_test_registry(&registry_path);
+    let state_dir = tmp.path().join(".fili-state");
+
+    // Run 1: polls land at t=0, 60 and 120.
+    {
+        let host = Host::load(
+            &registry,
+            HostOptions {
+                state_dir: state_dir.clone(),
+            },
+        )
+        .expect("host loads");
+        let sink = Arc::new(VecSink::default());
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(host.run(Arc::clone(&sink), token.clone()));
+        tokio::time::sleep(Duration::from_secs(150)).await;
+        token.cancel();
+        let report = handle.await.expect("host task");
+
+        let ids: Vec<String> = sink.records().into_iter().map(|r| r.item.id).collect();
+        assert_eq!(ids, vec!["stub-0", "stub-1", "stub-2"]);
+        assert_eq!(report.plugins["stub"].polls, 3);
+        assert_eq!(report.plugins["stub"].disabled, None);
+
+        let text = std::fs::read_to_string(state_dir.join("stub.json")).expect("state file");
+        let state: serde_json::Value = serde_json::from_str(&text).expect("state json");
+        let cursor = base64::engine::general_purpose::STANDARD
+            .decode(state["cursor"].as_str().expect("cursor is a string"))
+            .expect("cursor is base64");
+        assert_eq!(cursor, vec![3]);
+    }
+
+    // Run 2: a fresh host on the same state directory resumes at stub-3.
+    let host = Host::load(&registry, HostOptions { state_dir }).expect("host reloads");
+    let sink = Arc::new(VecSink::default());
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(host.run(Arc::clone(&sink), token.clone()));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    token.cancel();
+    let report = handle.await.expect("host task");
+
+    let records = sink.records();
+    assert_eq!(records.first().map(|r| r.item.id.as_str()), Some("stub-3"));
+    assert_eq!(report.plugins["stub"].polls, 1);
+}
