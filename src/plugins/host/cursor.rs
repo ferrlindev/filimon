@@ -6,15 +6,18 @@
 // the plugin's opaque bytes. Writes are atomic: a same-directory temp file is
 // synced and renamed over the target. A missing file is a first poll; an
 // unreadable or corrupt file is an error the scheduler turns into a disabled
-// plugin, and it is never reset automatically.
+// plugin, and it is never reset automatically. The store holds an exclusive
+// lock on `<state_dir>/.lock` so two fili processes cannot share a directory.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
+use super::engine::clean_guest_text;
 use super::error::HostError;
 
 /// Version written into every state file.
@@ -29,24 +32,50 @@ struct StateFile {
     cursor: Option<String>,
 }
 
-/// Reads and writes the cursor state files in one directory.
+/// Name of the lock file inside the state directory.
+const LOCK_FILE: &str = ".lock";
+
+/// Reads and writes the cursor state files in one directory, and holds the
+/// directory's single-instance lock until dropped.
 #[derive(Debug)]
 pub struct CursorStore {
     dir: PathBuf,
+    /// Held only for its lock: dropping the store closes the file and frees it.
+    _lock: File,
 }
 
 impl CursorStore {
-    /// Opens the store, creating the directory when needed.
+    /// Opens the store, creating the directory when needed, and takes the
+    /// directory's exclusive lock (RESEARCH A8).
     ///
     /// # Errors
-    /// Returns `HostError::StateDir` when the directory cannot be created.
+    /// Returns `HostError::StateDirLocked` when another process holds the
+    /// lock, and `HostError::StateDir` when the directory or lock file cannot
+    /// be created.
     pub fn open(dir: &Path) -> Result<Self, HostError> {
-        std::fs::create_dir_all(dir).map_err(|e| HostError::StateDir {
+        let state_dir_error = |e: &std::io::Error| HostError::StateDir {
             path: dir.display().to_string(),
             reason: e.to_string(),
-        })?;
+        };
+        std::fs::create_dir_all(dir).map_err(|e| state_dir_error(&e))?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(LOCK_FILE))
+            .map_err(|e| state_dir_error(&e))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(HostError::StateDirLocked {
+                    path: dir.display().to_string(),
+                });
+            }
+            Err(TryLockError::Error(e)) => return Err(state_dir_error(&e)),
+        }
         Ok(Self {
             dir: dir.to_path_buf(),
+            _lock: lock,
         })
     }
 
@@ -60,9 +89,13 @@ impl CursorStore {
     /// Reads the stored cursor. `Ok(None)` means a first poll: no file, or a
     /// file whose cursor is null.
     ///
+    /// Never writes, renames or deletes: a bad file stays as the operator
+    /// left it (D-08).
+    ///
     /// # Errors
     /// `CursorUnreadable` for an io failure other than a missing file,
-    /// `CursorCorrupt` for invalid JSON or base64.
+    /// `CursorCorrupt` for invalid JSON or base64, a `plugin` that is not
+    /// `alias`, or a `version` newer than this host understands.
     pub fn read(&self, alias: &str) -> Result<Option<Vec<u8>>, HostError> {
         let path = self.path_for(alias);
         let bytes = match std::fs::read(&path) {
@@ -83,6 +116,18 @@ impl CursorStore {
         };
         let state: StateFile =
             serde_json::from_slice(&bytes).map_err(|_| corrupt("not a valid state file"))?;
+        if state.version > STATE_VERSION {
+            return Err(corrupt(&format!(
+                "unsupported state file version {}",
+                state.version
+            )));
+        }
+        if state.plugin != alias {
+            return Err(corrupt(&format!(
+                "file belongs to plugin `{}`",
+                clean_guest_text(&state.plugin, 64)
+            )));
+        }
         match state.cursor {
             None => Ok(None),
             Some(encoded) => STANDARD
@@ -113,6 +158,11 @@ impl CursorStore {
         serde_json::to_writer(&mut temp, &state).map_err(|e| fail(e.to_string()))?;
         temp.as_file().sync_all().map_err(|e| fail(e.to_string()))?;
         temp.persist(&path).map_err(|e| fail(e.error.to_string()))?;
+        // Best effort: make the rename itself durable. Some platforms cannot
+        // open a directory, and the data is already safe in the file.
+        if let Ok(dir) = File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 }
