@@ -164,6 +164,136 @@ unusable, and every bad line is listed. Keep fili's `.env` separate from
 A value that holds `'` together with `$` or a backslash cannot be written in
 `.env`. Set it in the process environment instead, which overrides `.env`.
 
+## Host behavior
+
+The component host (`src/plugins/host/`) loads plugins from the registry, polls
+each enabled source on its own task, turns what they return into `SourceItem`
+records, produces those to Fluvio and remembers where each plugin stopped. It is
+a library in this phase: `Host::load` and `Host::run`. The `fili` command that
+starts it arrives in Phase 4, which also reads `--state-dir`.
+
+### Loading
+
+- Only components listed in the registry and enabled are opened. Nothing is
+  discovered by scanning a directory, so a `.wasm` file that is not in
+  `filimon.toml` is never read.
+- A component that imports anything outside the `filimon:plugin/` package is
+  rejected before it runs, with an error that names the imports. A WASI build
+  (the `cargo component` default target) is the usual cause. The host links no
+  WASI at all. Build for `wasm32-unknown-unknown` as described above.
+- A component that does not fit the world it was loaded as (a fetcher loaded as
+  a source, say) is rejected with a `wrong world` error.
+- One bad component never stops the others. Load failures are listed in the
+  host report and the remaining plugins run.
+
+### Polling and backoff
+
+- A plugin is polled immediately when the host starts. After that the wait is a
+  fixed delay: `poll_interval_secs` after the previous cycle (poll, send and
+  cursor write) finished.
+- After a `transient`, `rate-limited` or `auth-required` error, or a trap, the
+  plugin waits `initial_secs * multiplier^n` (`n` is the number of consecutive
+  failures so far), never more than `max_secs`. `[host.backoff]` sets these
+  values for each plugin; the defaults are 60 s, 3600 s and 2.0.
+- A `rate-limited` error that carries a retry-after waits the larger of the
+  retry-after and the current step, still capped at `max_secs`.
+- One successful poll resets the backoff completely. After a backoff window the
+  plugin is polled again and then returns to its normal interval.
+- There is no jitter. The backoff window is not compared with the poll
+  interval, so it can be shorter than `poll_interval_secs` (a locked decision,
+  D-02).
+
+### Failures
+
+- `fatal` and `config` errors, from `init` or from `poll`, disable that plugin
+  until `fili` restarts. The host logs the plugin name and the reason at error
+  level (`plugin disabled until fili restarts`).
+- A trap (or any wasmtime-level failure) discards the instance. After the
+  backoff window the host builds a new instance and calls `init` again, so a
+  plugin's in-memory state starts over. A failed `init` is handled the same
+  way, except that `fatal` and `config` still disable.
+- A failure of the item sink (for example the Fluvio broker is down) is the
+  host's problem, not the plugin's. It uses the same backoff, keeps the
+  instance and polls again from the same cursor.
+- A panic inside one plugin's host task is caught and reported for that plugin
+  only (`plugin task panicked`).
+- Every other plugin and the process keep running. Log lines go to stderr and
+  carry a `plugin` field. The default filter is `fili::plugins=info`, and
+  `RUST_LOG` replaces it when it holds a valid, non-blank value.
+
+### Cursor state
+
+- Each plugin has one file, `<state dir>/<alias>.json`, with `version`,
+  `plugin` and `cursor` (base64, or null).
+- The state directory is `.fili-state/` next to the registry file. Override it
+  with `--state-dir <path>` or the `FILI_STATE_DIR` environment variable.
+- The file is written atomically (temporary file, then rename). The cursor is
+  written only after the items of that poll were produced and flushed, so
+  delivery is at-least-once: a crash between the send and the write replays the
+  last batch on the next start. There is no dedupe in this phase.
+- A missing file means a first poll. A corrupt or unreadable file, a file that
+  names another plugin, or a file with a newer version disables only that
+  plugin, with an error that names the file. The host never rewrites or deletes
+  it. To reset a plugin's cursor, stop `fili` and delete its file.
+- A `.lock` file in the state directory is held for the host's lifetime, so two
+  `fili` processes cannot share one state directory.
+
+### Items
+
+- The host drops an item with an empty id, an empty or unparsable url, or a
+  serialized record over 1,000,000 bytes. The warning names the plugin, the item
+  index and a fixed reason, never the item's content. A dropped item does not
+  fail the poll or hold back the cursor.
+- An empty `platform` falls back to the plugin's registry name.
+- Items go to the `filimon-social-items` topic (created by hand, as the root
+  README describes) with the key `<platform>:<id>`, in the order the plugin
+  returned them. The key assumes a single-partition topic. A missing topic is
+  reported with the `fluvio topic create` command.
+
+### Interim imports
+
+Until the fetcher and OAuth phases land, the `fetch` import returns
+`not-configured` for every request, and `poll` receives no access token (`none`).
+A source that needs HTTP or a token cannot get far yet. The guest `log` import
+is live: guest log lines become host log events with a `plugin` field, cleaned
+of control characters and clipped.
+
+### Known limits
+
+- No per-plugin CPU or memory limits (v2 HOST-06).
+- A guest that loops forever is never terminated while the host runs. It does
+  not block other plugins or shutdown: cancelling the host returns within
+  seconds because the stuck call is dropped. But the spinning plugin itself
+  stays stuck inside its poll and is never polled again.
+- No dedupe across polls (v2 HOST-07). A plugin that returns the same item twice
+  produces it twice, and a replay after a crash can duplicate the last batch.
+- `timeout_secs` and `allowlist` are read from the registry but only enforced
+  when real fetch routing lands, not yet.
+- The last poll's status is not persisted. The state file is versioned and
+  tolerant of unknown keys so Phase 4 can add it.
+
+### Running the host tests
+
+From the repository root. A group that cannot run is not a pass: report it as
+not run.
+
+```sh
+# 1. No wasm, no cluster.
+cargo test -p filimon plugins::host
+
+# 2. Real components. Needs the three fixtures built with the build lines above.
+cargo test -p filimon -- --ignored wasm_
+
+# 3. Real cluster. Needs a local Fluvio cluster; uses scratch topics only.
+cargo test -p filimon -- --ignored live_
+```
+
+The live group creates its own `filimon-test-...` topics and deletes them, also
+when a test fails. It never touches `filimon-social-items` or the other real
+topics. Group 3 also needs the `stub-source` fixture. Each group filter is a
+single substring on purpose: libtest ORs several filters, so adding a path
+filter beside `wasm_` or `live_` would run the other group as well.
+
 ## Contract version
 
 The contract is `filimon:plugin@0.1.0`. It stays at 0.x until the Reddit and
