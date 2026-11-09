@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Plugin Contract & Configuration** - Versioned WIT package (`source` + `fetcher` worlds) plus the `filimon.toml` registry, per-plugin TOML, and `.env` secret loading with clear errors (completed 2026-11-03)
 - [x] **Phase 2: SourceItem Pipeline** - Unified `SourceItem` envelope; news stays on the WISE chain, social items pass through, and the consumer NER-enriches both into one JSON output (completed 2026-11-09)
-- [ ] **Phase 3: Component Host Runtime** - `fili` loads registry-listed components, polls them on schedule, persists cursors, isolates failures, and produces `SourceItem`s to Fluvio
+- [x] **Phase 3: Component Host Runtime** - `fili` loads registry-listed components, polls them on schedule, persists cursors, isolates failures, and produces `SourceItem`s to Fluvio (completed 2026-11-10)
 - [ ] **Phase 4: Plugin CLI** - `fili plugins list | check | run-once` and a run command that polls all enabled sources
 - [ ] **Phase 5: Fetcher Layer** - Plugin HTTP routed through a configurable fetcher component, a host-enforced allowlist and timeout, a default TLS-validating fetcher, and an optional crawler hook
 - [ ] **Phase 6: Host-Managed OAuth** - `fili auth login | status | logout` with PKCE, host-side token storage and refresh, and only access tokens passed to plugins
@@ -87,7 +87,7 @@ Plans:
   2. A test source component is polled at the interval set in its TOML, and its items appear in a Fluvio topic as `SourceItem` records. After the host is stopped and restarted, polling resumes from the last persisted cursor instead of starting over.
   3. When a component returns an error or reports rate limiting (HTTP 429), the host backs it off using the backoff settings in that plugin's TOML and polls it again after the backoff window.
   4. A component that traps or errors is logged with its plugin name and backed off, while the other plugins keep polling and the `fili` process stays up.
-**Plans:** 10/10 plans executed
+**Plans:** 10/10 plans complete
 
 Plans:
 **Wave 1**
@@ -178,7 +178,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 |-------|----------------|--------|-----------|
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
-| 3. Component Host Runtime | 10/10 | In Progress | - |
+| 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
 | 4. Plugin CLI | 0/TBD | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |

@@ -15,11 +15,11 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Plugin Host
 
-- [ ] **HOST-01**: `fili` loads source and fetcher components listed in an explicit registry (`filimon.toml`); nothing unlisted is loaded
-- [ ] **HOST-02**: `fili` polls each enabled source plugin on its configured interval, persists the returned cursor, and resumes from it after restart
-- [ ] **HOST-03**: Per-plugin TOML sets poll interval and backoff on errors / HTTP 429
-- [ ] **HOST-04**: Items returned by plugins are produced to Fluvio as `SourceItem` records
-- [ ] **HOST-05**: A plugin that traps or returns an error is logged and backed off without crashing `fili` or stopping other plugins
+- [x] **HOST-01**: `fili` loads source and fetcher components listed in an explicit registry (`filimon.toml`); nothing unlisted is loaded
+- [x] **HOST-02**: `fili` polls each enabled source plugin on its configured interval, persists the returned cursor, and resumes from it after restart
+- [x] **HOST-03**: Per-plugin TOML sets poll interval and backoff on errors / HTTP 429
+- [x] **HOST-04**: Items returned by plugins are produced to Fluvio as `SourceItem` records
+- [x] **HOST-05**: A plugin that traps or returns an error is logged and backed off without crashing `fili` or stopping other plugins
 
 ### Fetchers
 
@@ -129,11 +129,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | WIT-01 | Phase 1 | Complete |
 | WIT-02 | Phase 1 | Complete |
 | WIT-03 | Phase 8 | Pending |
-| HOST-01 | Phase 3 | Pending |
-| HOST-02 | Phase 3 | Pending |
-| HOST-03 | Phase 3 | Pending |
-| HOST-04 | Phase 3 | Pending |
-| HOST-05 | Phase 3 | Pending |
+| HOST-01 | Phase 3 | Complete |
+| HOST-02 | Phase 3 | Complete |
+| HOST-03 | Phase 3 | Complete |
+| HOST-04 | Phase 3 | Complete |
+| HOST-05 | Phase 3 | Complete |
 | FETCH-01 | Phase 5 | Pending |
 | FETCH-02 | Phase 5 | Pending |
 | FETCH-03 | Phase 5 | Pending |
