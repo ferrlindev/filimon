@@ -163,4 +163,169 @@ mod tests {
             "{text}"
         );
     }
+
+    /// Writes `body` as `alias`'s state file.
+    fn put(store: &CursorStore, alias: &str, body: &str) {
+        std::fs::write(store.path_for(alias), body).expect("write state file");
+    }
+
+    #[test]
+    fn null_cursor_reads_as_first_poll() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        put(&store, "a", r#"{"version":1,"plugin":"a","cursor":null}"#);
+        assert_eq!(store.read("a").expect("read"), None);
+    }
+
+    #[test]
+    fn empty_cursor_bytes_round_trip_as_some_empty() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        store.write("a", Some(&[])).expect("write");
+        let read = store.read("a").expect("read");
+        assert_eq!(read, Some(vec![]));
+        assert_ne!(read, None);
+    }
+
+    #[test]
+    fn bad_base64_is_corrupt() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        put(&store, "a", r#"{"version":1,"plugin":"a","cursor":"!!!"}"#);
+        let error = store.read("a").expect_err("corrupt");
+        assert!(matches!(error, HostError::CursorCorrupt { .. }), "{error}");
+    }
+
+    #[test]
+    fn plugin_mismatch_is_corrupt() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        put(&store, "a", r#"{"version":1,"plugin":"b","cursor":"AQ=="}"#);
+        let error = store.read("a").expect_err("mismatch");
+        assert!(matches!(error, HostError::CursorCorrupt { .. }), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("plugin `a`"), "{text}");
+        assert!(
+            text.contains(&store.path_for("a").display().to_string()),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn future_version_is_corrupt() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        let body = r#"{"version":2,"plugin":"a","cursor":"AQ=="}"#;
+        put(&store, "a", body);
+        let error = store.read("a").expect_err("future version");
+        assert!(matches!(error, HostError::CursorCorrupt { .. }), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("version 2"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(store.path_for("a")).expect("file"),
+            body,
+            "a bad file is never repaired"
+        );
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        put(
+            &store,
+            "a",
+            r#"{"version":1,"plugin":"a","cursor":"AQ==","last_poll":"x"}"#,
+        );
+        assert_eq!(store.read("a").expect("read"), Some(vec![1]));
+    }
+
+    #[test]
+    fn unreadable_path_is_unreadable_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        std::fs::create_dir(store.path_for("a")).expect("dir named a.json");
+        let error = store.read("a").expect_err("unreadable");
+        assert!(
+            matches!(error, HostError::CursorUnreadable { .. }),
+            "{error}"
+        );
+        assert!(store.path_for("a").is_dir(), "the path is left as it was");
+    }
+
+    #[test]
+    fn second_open_of_same_dir_is_locked_and_released_on_drop() {
+        let dir = TempDir::new().expect("tempdir");
+        let first = CursorStore::open(dir.path()).expect("first open");
+        let error = CursorStore::open(dir.path()).expect_err("second open is locked");
+        assert!(matches!(error, HostError::StateDirLocked { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&dir.path().display().to_string()),
+            "{error}"
+        );
+        drop(first);
+        CursorStore::open(dir.path()).expect("open after the first store dropped");
+    }
+
+    #[test]
+    fn write_leaves_no_temp_files_behind() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        store.write("a", Some(&[1])).expect("write a");
+        store.write("b", Some(&[2])).expect("write b");
+        store.write("a", Some(&[3])).expect("rewrite a");
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![".lock", "a.json", "b.json"]);
+    }
+
+    #[test]
+    fn equal_cursor_rewrite_is_idempotent() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        store.write("a", Some(&[7, 8])).expect("first write");
+        let first = std::fs::read(store.path_for("a")).expect("bytes");
+        store.write("a", Some(&[7, 8])).expect("second write");
+        let second = std::fs::read(store.path_for("a")).expect("bytes");
+        assert_eq!(first, second);
+        assert_eq!(store.read("a").expect("read"), Some(vec![7, 8]));
+    }
+
+    #[test]
+    fn state_file_has_exactly_version_plugin_cursor_keys() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        store.write("a", Some(&[1])).expect("write");
+        let text = std::fs::read_to_string(store.path_for("a")).expect("file");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["cursor", "plugin", "version"]);
+    }
+
+    #[test]
+    fn write_into_missing_directory_is_a_cursor_write_error_naming_plugin_and_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let store = CursorStore::open(&state).expect("open");
+        std::fs::remove_dir_all(&state).expect("remove state dir");
+        let error = store.write("a", Some(&[1])).expect_err("no directory");
+        assert!(matches!(error, HostError::CursorWrite { .. }), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("plugin `a`"), "{text}");
+        assert!(
+            text.contains(&store.path_for("a").display().to_string()),
+            "{text}"
+        );
+    }
 }

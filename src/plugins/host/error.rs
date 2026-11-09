@@ -24,6 +24,14 @@ pub enum HostError {
     )]
     StateDir { path: String, reason: String },
 
+    /// Another process holds the lock on the cursor state directory.
+    #[error("state directory `{path}` is in use by another fili process")]
+    #[diagnostic(
+        code(fili::host::state_dir_locked),
+        help("stop the other fili process or pass --state-dir to use a different directory")
+    )]
+    StateDirLocked { path: String },
+
     /// A plugin component could not be opened, compiled or linked.
     #[error("plugin `{plugin}`: cannot load component `{path}`: {reason}")]
     #[diagnostic(code(fili::host::component_load))]
