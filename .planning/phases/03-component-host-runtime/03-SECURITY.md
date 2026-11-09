@@ -1,9 +1,9 @@
 ---
 phase: "3"
 slug: "component-host-runtime"
-status: draft
+status: verified
 # threats_open = count of OPEN threats at or above workflow.security_block_on severity (the blocking gate)
-threats_open: 1
+threats_open: 0
 asvs_level: 1
 created: "2026-11-09"
 ---
@@ -61,7 +61,7 @@ created: "2026-11-09"
 | T-3-10 (03-04) | Tampering | guest `log` import and guest error text reaching the termina | medium | mitigate | Every guest string passes `clean_guest_text` (`sanitize_for_terminal` plus a character clip: 4096 for log lines, 512 for error text) before it reaches `tracing` — verified: engine.rs:71-117 clean_guest_text | closed |
 | T-3-11 (03-04) | Tampering | cursor file path derived from the plugin name | medium | mitigate | The path is only ever `dir.join("<alias>.json")` with `alias` from `LoadedRegistry` (names limited to `[a-z0-9_-]` by `is_valid_name`); no other source of alias — verified: cursor.rs:85-87; config.rs:388-393 alias charset | closed |
 | T-3-12 (03-04) | Denial of Service | a guest that never yields starving a tokio worker | medium | mitigate | Epoch interruption: engine config enables it, every Store sets deadline 1 with async yield-and-update, a 10 ms ticker thread advances the epoch, so every `call_ — verified: engine.rs:151-195, instance.rs:98 epoch yield; wasm spin test (residual WR-02) | closed |
-| T-3-13 (03-04) | Denial of Service | a guest allocating unbounded memory or burning CPU without l | medium | accept | Per-plugin CPU and memory limits are deferred to v2 HOST-06 (CONTEXT, Deferred Ideas); epoch yield only keeps the runtime responsive and does not kill a looping — verified (no dependency change in this plan) | open — below high threshold (non-blocking) |
+| T-3-13 (03-04) | Denial of Service | a guest allocating unbounded memory or burning CPU without l | medium | accept | Per-plugin CPU and memory limits are deferred to v2 HOST-06 (CONTEXT, Deferred Ideas); epoch yield only keeps the runtime responsive and does not kill a looping — verified (no dependency change in this plan)  — acceptance withdrawn by user ruling; MITIGATED 2e7c091 (64 MiB StoreLimits + trap_on_grow_failure, 1000 items/poll, 4096 B cursor); re-audited 2026-11-09: verified | closed |
 | T-3-SC (03-04) | Tampering | npm/pip/cargo installs | high | mitigate | This plan adds no new package: wasmtime, base64 and tokio-util arrived in plan 03-03 behind the RESEARCH package-legitimacy audit and a Cargo.lock gate. — verified (no dependency change in this plan) | closed |
 | T-3-14 (03-05) | Information Disclosure | tracing subscriber and the default filter | low | mitigate | Default directive limited to `fili::plugins=info`; stderr only; the only existing plugin-target event prints env var NAMES, never values; the host never logs se — verified: main.rs:55-77 plugin-only default, stderr | closed |
 | T-3-15 (03-05) | Tampering | `--state-dir` / `FILI_STATE_DIR` pointing at an arbitrary di | low | accept | The operator controls the process and its environment. The directory only receives `<alias>.json` files with `version`, `plugin` and `cursor` (no secrets), and  — verified: README.md:226-239; accepted (residual WR-07, low) | closed |
@@ -76,7 +76,7 @@ created: "2026-11-09"
 | T-3-22 (03-07) | Tampering | accepting a component of the wrong world and failing later a | medium | mitigate | `instantiate_pre` against the matching world at load time, mapped to `WrongWorld`; ignored wasm tests cover both directions. — verified: loader.rs:152-170 WrongWorld both directions (wasm tests) | closed |
 | T-3-23 (03-07) | Information Disclosure | guest-controlled import names and wasmtime text in diagnosti | low | mitigate | Every such string goes through `clean_guest_text` (128 chars per import, 512 for the reason), the import list is capped at 16 entries, and no `#[source_code]` b — verified: loader.rs:25-31,189-200 capped/sanitized (residual IN-01) | closed |
 | T-3-SC (03-07) | Tampering | npm/pip/cargo installs | high | mitigate | No new package in this plan. — verified (no dependency change in this plan) | closed |
-| T-3-24 (03-08) | Tampering | malformed or oversized plugin items poisoning the Fluvio pro | high | mitigate | Per-item validation in `map_items` (empty or whitespace id and url, `url::Url::parse`, 1_000_000-byte serialized cap under the verified 1_048_576 default); drop — verified: map.rs:84 caps value only; key unbounded (WR-03); sink.rs:82-87 clear_errors skipped on timeout (WR-06) | open |
+| T-3-24 (03-08) | Tampering | malformed or oversized plugin items poisoning the Fluvio pro | high | mitigate | Per-item validation in `map_items` (empty or whitespace id and url, `url::Url::parse`, 1_000_000-byte serialized cap under the verified 1_048_576 default); drop — verified: map.rs:84 caps value only; key unbounded (WR-03); sink.rs:82-87 clear_errors skipped on timeout (WR-06)  — FIXED b7c2324 (key bound 512 B + value+key cap), 60d65ec (timeout inside send_batch, clear_errors on expiry/failure); re-audited 2026-11-09: verified | closed |
 | T-3-25 (03-08) | Information Disclosure | item content or settings in logs | medium | mitigate | Drop warnings carry only plugin name, item index and a fixed reason label; test asserts a content marker never appears in the captured log. — verified: map.rs:105-110 fixed reason labels | closed |
 | T-3-26 (03-08) | Denial of Service | producer hanging for up to 300 s when the cluster is down | medium | mitigate | `FluvioSink::connect` runs `preflight` and fails fast with a named missing topic; every sink call is wrapped in `SINK_TIMEOUT` (60 s) by the scheduler, and a ti — verified: sink.rs:20,56-63; scheduler.rs:222 (residual WR-06) | closed |
 | T-3-27 (03-08) | Tampering | social items written to the wrong topic or through the news  | low | mitigate | `connect_social` uses the `TOPIC_SOCIAL_ITEMS` constant; no plugin or registry value selects a topic; live tests use scratch topics only. — verified: sink.rs:66-68 TOPIC_SOCIAL_ITEMS const only | closed |
@@ -95,14 +95,14 @@ created: "2026-11-09"
 *Severity: critical > high > medium > low — only open threats at or above workflow.security_block_on (high) count toward threats_open*
 *Disposition: mitigate (implementation required) · accept (documented risk) · transfer (third-party)*
 
-### Open items
+### Resolved items (re-audit 2026-11-09: SECURED, threats_open 0)
 
-- **T-3-24 (high, BLOCKING).** The 1,000,000-byte record cap measures only the serialized value (`map.rs:84`); the guest-controlled key `{platform}:{id}` (`map.rs:70`) is unbounded and not counted, and Fluvio sizes the whole record. An oversized key passes the host gate, fails at the producer, and the scheduler retries forever, re-sending earlier records as duplicates (WR-03). Also `clear_errors` is skipped when the 60 s sink timeout drops `send_batch` (WR-06). **User ruling: block and fix.**
-- **T-3-13 (medium, non-blocking).** Accepted at plan time on the premise that failures stay isolated, but no guest memory limit exists (no `StoreLimits`/limiter), so a guest can grow memory until the OS kills the whole process (WR-01), contradicting HOST-05 and README line 220. Items per poll, `next_cursor` size and guest log volume are also uncapped. **User ruling: add a small fixed safety cap now** (HOST-06 keeps configurable per-plugin limits).
+- **T-3-24 (high) — closed.** The cap now counts value + key (`map.rs`), the key is bounded at 512 bytes (`DropReason::KeyTooLong`, fixed label, no content logged), and the sink timeout runs inside `FluvioSink::send_batch` after the producer lock with `clear_errors` on expiry and failure (`sink.rs`). The scheduler has no outer timeout. Tests: 8 `map::` key/cap tests, 3 `sink::send_bounded_*`, scheduler sink-failure tests, live `live_fluvio_sink_recovers_after_a_failed_batch`.
+- **T-3-13 (medium) — closed by the user ruling "add a small fixed safety cap now".** `store.limiter` is installed on the only non-test `Store::new` (`instance.rs:96-99`); a refused grow traps into `InstanceFatal` -> backoff -> rebuild; items per poll capped at 1000 (excess dropped, not retried), `next_cursor` capped at 4096 bytes (oversize = plugin `fatal`, never persisted). Configurable per-plugin limits remain v2 HOST-06. README states the caps accurately.
 
 ### Residuals on closed threats (low, tracked in 03-REVIEW-DISPOSITION.md)
 
-WR-02 epoch-ticker spawn failure swallowed (T-3-12/T-3-32); WR-07 empty `--state-dir` resolves to cwd (T-3-15); IN-01 Unicode line/bidi controls survive `clean_guest_text` (T-3-10/18/23); IN-03 missing `cursor` key reads as first poll (T-3-28); WR-04 URL scheme unrestricted and WR-05 platform impersonation / ambiguous key (recommended hardening on T-3-24). Not checked: RUSTSEC advisory scan of wasmtime 48.0.8 (needs network).
+New from the re-audit (all non-blocking): (LOW) host-side copies / `SourceItem::social` re-parsing `raw` before a size check can transiently expand a guest response several-fold - cheap length pre-check recommended; (LOW) no test grows a real component past 64 MiB through `WasmtimeFactory` and none asserts `store.limiter(...)` is installed; (LOW) `send_batch` lock->timeout->clear wiring has no non-live test; (LOW, latent) dropping the `Host::run` future instead of cancelling its token skips `clear_errors` - Phase 4 must stop the host via the token; (INFO) Phase 5 fetchers must install the same limiter (prefer one shared Store constructor); limiter trap log line does not name the memory cause; `instances(16)` may reject guests from toolchains emitting many core modules. Carried: WR-02 epoch-ticker spawn failure swallowed (T-3-12/T-3-32); WR-07 empty `--state-dir` resolves to cwd (T-3-15); IN-01 Unicode line/bidi controls survive `clean_guest_text` (T-3-10/18/23); IN-03 missing `cursor` key reads as first poll (T-3-28); WR-04 URL scheme unrestricted and WR-05 platform impersonation / ambiguous key (recommended hardening on T-3-24). Not checked: RUSTSEC advisory scan of wasmtime 48.0.8 (needs network).
 
 ---
 
@@ -131,7 +131,15 @@ WR-02 epoch-ticker spawn failure swallowed (T-3-12/T-3-32); WR-07 empty `--state
 
 - [x] All threats have a disposition (mitigate / accept / transfer)
 - [x] Accepted risks documented in Accepted Risks Log
-- [ ] `threats_open: 0` confirmed
-- [ ] `status: verified` set in frontmatter
+- [x] `threats_open: 0` confirmed
+- [x] `status: verified` set in frontmatter
 
-**Approval:** pending — blocked by T-3-24
+**Approval:** verified 2026-11-09 (re-audit SECURED; T-3-24 and T-3-13 closed)
+
+## Security Audit 2026-11-09
+
+| Metric | Count |
+|---|---|
+| Threats found | 44 |
+| Closed | 44 |
+| Open | 0 |
