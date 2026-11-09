@@ -87,7 +87,7 @@ Plans:
   2. A test source component is polled at the interval set in its TOML, and its items appear in a Fluvio topic as `SourceItem` records. After the host is stopped and restarted, polling resumes from the last persisted cursor instead of starting over.
   3. When a component returns an error or reports rate limiting (HTTP 429), the host backs it off using the backoff settings in that plugin's TOML and polls it again after the backoff window.
   4. A component that traps or errors is logged with its plugin name and backed off, while the other plugins keep polling and the `fili` process stays up.
-**Plans:** 2/10 plans executed
+**Plans:** 3/10 plans executed
 
 Plans:
 **Wave 1**
@@ -95,7 +95,7 @@ Plans:
 - [x] 03-02-PLAN.md — `plugins/fault-source` fault-injection fixture component (ok, rate-limited, transient, auth-required, fatal, config, init-fatal, trap, spin) (HOST-03, HOST-05)
 
 **Wave 2** *(blocked on 03-01)*
-- [ ] 03-03-PLAN.md — Root `rust-toolchain.toml` 1.96.0, `rust-version` 1.95, wasmtime 48 / base64 / tokio-util, nested 1.85.0 SmartModule pins proven by `smdk build`, README prerequisites, `.fili-state/` ignore (HOST-01..HOST-05, build prerequisite)
+- [x] 03-03-PLAN.md — Root `rust-toolchain.toml` 1.96.0, `rust-version` 1.95, wasmtime 48 / base64 / tokio-util, nested 1.85.0 SmartModule pins proven by `smdk build`, README prerequisites, `.fili-state/` ignore (HOST-01..HOST-05, build prerequisite)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 03-04-PLAN.md — Tracer: a registry-listed stub source is loaded, polled, mapped, produced to a sink and its cursor persisted atomically through every layer; restart resumes from the persisted cursor (HOST-01, HOST-02, HOST-04)
@@ -178,7 +178,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 |-------|----------------|--------|-----------|
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
-| 3. Component Host Runtime | 2/10 | In Progress | - |
+| 3. Component Host Runtime | 3/10 | In Progress | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |
