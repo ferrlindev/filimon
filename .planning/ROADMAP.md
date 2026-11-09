@@ -121,7 +121,24 @@ Plans:
   2. `fili plugins check <name>` reports, without polling, whether the component satisfies its declared WIT world and whether its TOML and required `.env` secrets are valid. A broken component or config exits non-zero with a message naming the problem.
   3. `fili plugins run-once <name>` performs a single poll and prints the returned items. Nothing is produced to Fluvio unless the produce option is given.
   4. The run command polls every enabled source plugin on its interval and produces items to Fluvio until it is stopped.
-**Plans**: TBD
+**Plans:** 6 plans
+
+Plans:
+**Wave 1**
+- [ ] 04-01-PLAN.md — Tracer: poll status sidecar `<alias>.status.json` written by the scheduler after every cycle outcome, lock-free `read_status`, `list_registry`, and the first end-to-end `fili plugins list` through the real binary; WR-07 empty `--state-dir` rejected by clap and by the store (CLI-01)
+- [ ] 04-02-PLAN.md — Generic host supervisor with a 10 s shutdown grace, second-signal abort and `aborted at shutdown` reports (WR-10); `Host` accessors for load failures and loaded sources (CLI-04)
+
+**Wave 2** *(blocked on 04-01)*
+- [ ] 04-03-PLAN.md — `fili plugins list --json`, complete row coverage, tolerance of broken plugins, lock-free and creates-nothing guarantees, sanitization, exit codes (CLI-01)
+
+**Wave 3** *(blocked on 04-03)*
+- [ ] 04-04-PLAN.md — `fili plugins check <name>`: `check_component` through the host's own preflight, plugin-scoped config and secrets load, no polling, no secret values, exit 1 on any problem (CLI-02)
+
+**Wave 4** *(blocked on 04-02 and 04-04)*
+- [ ] 04-05-PLAN.md — `fili plugins run-once <name> [--produce] [--json]`: single-cycle `poll_once`/`commit_once`, dry run by default from the saved cursor, send-then-save under `--produce` (CLI-03)
+
+**Wave 5** *(blocked on 04-02 and 04-05)*
+- [ ] 04-06-PLAN.md — `fili run`: `Host::load` + `run_with_abort` over the production sink, startup report, SIGINT/SIGTERM with second-signal abort, summary and exit rule; unused-code allows removed; READMEs corrected (CLI-04)
 
 ### Phase 5: Fetcher Layer
 **Goal**: All outbound HTTP from source plugins, and optionally from the news crawler, goes through a swappable fetcher component. The host enforces allowlists and timeouts whichever fetcher handles the request
@@ -179,7 +196,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
-| 4. Plugin CLI | 0/TBD | Not started | - |
+| 4. Plugin CLI | 0/6 | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |
