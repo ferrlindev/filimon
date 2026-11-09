@@ -852,7 +852,7 @@ mod tests {
             "bad setting".to_string(),
         ))]));
         let report = run_for(
-            default_spec("c"),
+            spec("c", 60, 60, 3600, 2.0),
             Arc::clone(&factory),
             Arc::new(VecSink::default()),
             cursors,
@@ -1090,5 +1090,330 @@ mod tests {
                 "wrong target: {line}"
             );
         }
+    }
+
+    // ── Cursor policies (D-07, D-08, A6, empty and ordering edges) ────────────
+
+    use crate::plugins::host::sink::SinkError;
+
+    /// A `VecSink` that records what the plugin's cursor file held at the
+    /// moment each batch arrived, to prove commit-after-flush.
+    struct InspectingSink {
+        inner: VecSink,
+        cursors: Arc<CursorStore>,
+        seen: std::sync::Mutex<Vec<Option<Vec<u8>>>>,
+    }
+
+    impl InspectingSink {
+        fn new(cursors: Arc<CursorStore>) -> Self {
+            Self {
+                inner: VecSink::default(),
+                cursors,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<Option<Vec<u8>>> {
+            self.seen.lock().expect("seen").clone()
+        }
+    }
+
+    impl ItemSink for InspectingSink {
+        async fn send_batch(
+            &self,
+            plugin: &str,
+            records: Vec<SinkRecord>,
+        ) -> Result<(), SinkError> {
+            let on_disk = self.cursors.read(plugin).expect("cursor file readable");
+            self.seen.lock().expect("seen").push(on_disk);
+            self.inner.send_batch(plugin, records).await
+        }
+    }
+
+    /// A poll that returns one item and the given next cursor.
+    fn poll_item(id: &str, next_cursor: Option<Vec<u8>>) -> FakeStep {
+        FakeStep::PollOk {
+            items: vec![wit_item(id)],
+            next_cursor,
+            delay: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_commit_happens_only_after_the_sink_returned() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(InspectingSink::new(Arc::clone(&cursors)));
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_item("a", Some(vec![1])),
+            poll_item("b", Some(vec![2])),
+        ]));
+        let report = run_for(
+            spec("c", 60, 60, 3600, 2.0),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+        assert_eq!(report.items_sent, 2);
+        // Inside batch 1 the file is absent; inside batch 2 it holds batch 1's
+        // cursor, never the cursor of the batch being sent.
+        assert_eq!(sink.seen(), vec![None, Some(vec![1])]);
+        assert_eq!(cursors.read("c").expect("read"), Some(vec![2]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_persistent_sink_failure_never_commits_a_cursor() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_item("a", Some(vec![1])),
+            poll_item("b", Some(vec![2])),
+            poll_item("c", Some(vec![3])),
+        ]));
+        let sink = Arc::new(FlakySink::new(usize::MAX));
+        let report = run_for(
+            default_spec("pf"),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(200),
+        )
+        .await;
+        assert!(report.failures >= 3, "failures: {}", report.failures);
+        assert_eq!(report.disabled, None);
+        assert_eq!(sink.calls(), 3);
+        assert!(
+            !cursors.path_for("pf").exists(),
+            "no cursor may be committed for undelivered items"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_persist_failure_keeps_in_memory_cursor_and_continues() {
+        let (logs, _guard) = LogCapture::start();
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let cursors = Arc::new(CursorStore::open(&state).expect("cursor store"));
+        std::fs::remove_dir_all(&state).expect("remove the state directory");
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::poll_ok(Some(vec![1])),
+            FakeStep::poll_ok(Some(vec![2])),
+        ]));
+        let report = run_for(
+            spec("pw", 60, 60, 3600, 2.0),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+        assert_eq!(report.disabled, None);
+        assert_eq!(report.polls, 2);
+        assert_eq!(
+            factory.poll_cursors(),
+            vec![None, Some(vec![1])],
+            "the in-memory cursor survives a failed write"
+        );
+        let text = logs.text();
+        let path = cursors.path_for("pw").display().to_string();
+        let line = text
+            .lines()
+            .find(|l| l.contains("plugin=pw") && l.contains(&path))
+            .unwrap_or_else(|| panic!("no error line naming plugin and {path} in:\n{text}"));
+        assert!(line.contains("ERROR"), "{line}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_corrupt_cursor_file_disables_only_that_plugin_and_never_resets_it() {
+        let (logs, _guard) = LogCapture::start();
+        let (_dir, cursors) = store();
+        let garbage: &[u8] = b"{not json \xff\xfe";
+        let path = cursors.path_for("a");
+        std::fs::write(&path, garbage).expect("write garbage");
+        let sink = Arc::new(VecSink::default());
+        let bad = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let good = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let start = Instant::now();
+        let (bad_report, good_report) = tokio::join!(
+            run_for(
+                default_spec("a"),
+                Arc::clone(&bad),
+                Arc::clone(&sink),
+                Arc::clone(&cursors),
+                secs(200),
+            ),
+            run_for(
+                spec("b", 60, 60, 3600, 2.0),
+                Arc::clone(&good),
+                Arc::clone(&sink),
+                Arc::clone(&cursors),
+                secs(200),
+            ),
+        );
+
+        let reason = bad_report.disabled.expect("a is disabled");
+        assert!(reason.contains("a.json"), "{reason}");
+        assert_eq!(bad_report.polls, 0);
+        assert!(bad.events().is_empty(), "a was never instantiated");
+        assert_eq!(bad.builds(), 0);
+        assert_eq!(std::fs::read(&path).expect("file"), garbage, "bytes changed");
+
+        assert_eq!(good_report.disabled, None);
+        assert_eq!(good.poll_offsets(start), vec![0, 60, 120, 180]);
+
+        let text = logs.text();
+        let shown = path.display().to_string();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("plugin=a") && l.contains(&shown)),
+            "no log line naming plugin a and {shown} in:\n{text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_unreadable_cursor_disables_plugin() {
+        let (_dir, cursors) = store();
+        let path = cursors.path_for("a");
+        std::fs::create_dir(&path).expect("directory named a.json");
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let report = run_for(
+            default_spec("a"),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+        let reason = report.disabled.expect("disabled");
+        assert!(reason.contains(&path.display().to_string()), "{reason}");
+        assert!(reason.contains("cannot read"), "{reason}");
+        assert!(factory.events().is_empty(), "never instantiated");
+        assert!(path.is_dir(), "the path is left as it was");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_empty_items_still_persist_the_cursor() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(FlakySink::new(0));
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::poll_ok(Some(vec![9])),
+        ]));
+        let report = run_for(
+            default_spec("e"),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(10),
+        )
+        .await;
+        assert_eq!(report.polls, 1);
+        assert_eq!(sink.calls(), 0, "an empty list makes no sink call");
+        assert_eq!(cursors.read("e").expect("read"), Some(vec![9]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_null_next_cursor_persists_null_and_next_poll_is_a_first_poll() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::poll_ok(Some(vec![5])),
+            FakeStep::poll_ok(None),
+            FakeStep::poll_ok(None),
+        ]));
+        run_for(
+            spec("n", 60, 60, 3600, 2.0),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(150),
+        )
+        .await;
+        assert_eq!(
+            factory.poll_cursors(),
+            vec![None, Some(vec![5]), None],
+            "a null next cursor makes the next poll a first poll"
+        );
+        let text = std::fs::read_to_string(cursors.path_for("n")).expect("file");
+        assert!(text.contains(r#""cursor":null"#), "{text}");
+
+        // A restart reads that file as a first poll too.
+        let again = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        run_for(
+            default_spec("n"),
+            Arc::clone(&again),
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(10),
+        )
+        .await;
+        assert_eq!(again.poll_cursors(), vec![None]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_equal_cursors_are_committed_in_poll_order() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(InspectingSink::new(Arc::clone(&cursors)));
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_item("a", Some(vec![1])),
+            poll_item("b", Some(vec![1])),
+            poll_item("c", Some(vec![2])),
+        ]));
+        run_for(
+            spec("q", 60, 60, 3600, 2.0),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(150),
+        )
+        .await;
+        assert_eq!(
+            sink.seen(),
+            vec![None, Some(vec![1]), Some(vec![1])],
+            "each batch sees only the previously committed cursor"
+        );
+        assert_eq!(
+            factory.poll_cursors(),
+            vec![None, Some(vec![1]), Some(vec![1])]
+        );
+        assert_eq!(cursors.read("q").expect("read"), Some(vec![2]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_cursor_round_trips_across_two_runs_with_fakes() {
+        let (_dir, cursors) = store();
+        let first = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::poll_ok(Some(vec![1])),
+            FakeStep::poll_ok(Some(vec![2])),
+        ]));
+        run_for(
+            spec("rt", 60, 60, 3600, 2.0),
+            Arc::clone(&first),
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+        assert_eq!(first.poll_cursors(), vec![None, Some(vec![1])]);
+
+        let second = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        run_for(
+            spec("rt", 60, 60, 3600, 2.0),
+            Arc::clone(&second),
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(10),
+        )
+        .await;
+        assert_eq!(
+            second.poll_cursors(),
+            vec![Some(vec![2])],
+            "a restart resumes from the last committed cursor"
+        );
     }
 }
