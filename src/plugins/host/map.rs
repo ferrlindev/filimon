@@ -14,9 +14,16 @@ use super::engine::WitItem;
 use super::sink::SinkRecord;
 use crate::models::SourceItem;
 
-/// Largest serialized record the host sends, in bytes. This stays under the
-/// Fluvio default `max_request_size` (about 1 MiB) to leave headroom for framing.
+/// Largest record the host sends, in bytes: the serialized value plus the
+/// message key. Fluvio sizes the whole record, key included, so both count.
+/// This stays under the Fluvio default `max_request_size` (about 1 MiB) to leave
+/// headroom for framing.
 pub const MAX_RECORD_BYTES: usize = 1_000_000;
+
+/// Longest message key (`"{platform}:{id}"`) the host accepts, in bytes. Both
+/// parts are guest-controlled, so the key is bounded on its own as well as
+/// counted in `MAX_RECORD_BYTES`.
+pub const MAX_KEY_BYTES: usize = 512;
 
 /// Why an item was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +31,7 @@ pub enum DropReason {
     EmptyId,
     EmptyUrl,
     InvalidUrl,
+    KeyTooLong,
     RecordTooLarge,
     Unserializable,
 }
@@ -36,6 +44,7 @@ impl DropReason {
             Self::EmptyId => "empty-id",
             Self::EmptyUrl => "empty-url",
             Self::InvalidUrl => "invalid-url",
+            Self::KeyTooLong => "key-too-long",
             Self::RecordTooLarge => "record-too-large",
             Self::Unserializable => "unserializable",
         }
@@ -67,6 +76,11 @@ fn map_item(plugin: &str, item: WitItem) -> Result<SinkRecord, DropReason> {
     } else {
         item.platform
     };
+    // Bound the key before building it: a guest can make `platform` and `id`
+    // nearly as large as the whole record.
+    if platform.len() + 1 + item.id.len() > MAX_KEY_BYTES {
+        return Err(DropReason::KeyTooLong);
+    }
     let key = format!("{platform}:{}", item.id);
     let source_item = SourceItem::social(
         item.id,
@@ -81,7 +95,9 @@ fn map_item(plugin: &str, item: WitItem) -> Result<SinkRecord, DropReason> {
 
     match serde_json::to_vec(&source_item) {
         Err(_) => Err(DropReason::Unserializable),
-        Ok(bytes) if bytes.len() > MAX_RECORD_BYTES => Err(DropReason::RecordTooLarge),
+        Ok(bytes) if bytes.len() + key.len() > MAX_RECORD_BYTES => {
+            Err(DropReason::RecordTooLarge)
+        }
         Ok(_) => Ok(SinkRecord {
             key,
             item: source_item,
@@ -271,9 +287,10 @@ mod tests {
         assert_eq!(ids, ["a", "b"]);
     }
 
+    /// Pads `text` so the record (value plus key) is exactly `total` bytes.
     fn padded(id: &str, total: usize) -> WitItem {
         let mut item = good(id);
-        let baseline = serialized_len(&item);
+        let baseline = record_len(&item);
         item.text = "a".repeat(total - baseline);
         item
     }
@@ -292,17 +309,95 @@ mod tests {
         serde_json::to_vec(&source).expect("serializes").len()
     }
 
+    /// The size the host compares to the cap: value plus `"{platform}:{id}"`.
+    fn record_len(item: &WitItem) -> usize {
+        serialized_len(item) + item.platform.len() + 1 + item.id.len()
+    }
+
     #[test]
     fn record_exactly_at_the_cap_is_kept() {
         let at_cap = padded("a", MAX_RECORD_BYTES);
-        assert_eq!(serialized_len(&at_cap), MAX_RECORD_BYTES);
+        assert_eq!(record_len(&at_cap), MAX_RECORD_BYTES);
         let over = padded("b", MAX_RECORD_BYTES + 1);
-        assert_eq!(serialized_len(&over), MAX_RECORD_BYTES + 1);
+        assert_eq!(record_len(&over), MAX_RECORD_BYTES + 1);
 
         let mapped = map_items("p", vec![at_cap, over]);
         assert_eq!(mapped.dropped, 1);
         assert_eq!(mapped.records.len(), 1);
         assert_eq!(mapped.records[0].item.id, "a");
+    }
+
+    #[test]
+    fn the_key_counts_toward_the_record_cap() {
+        // A value that alone is at the cap is over it once the key is added.
+        let mut value_at_cap = good("a");
+        let baseline = serialized_len(&value_at_cap);
+        value_at_cap.text = "a".repeat(MAX_RECORD_BYTES - baseline);
+        assert_eq!(serialized_len(&value_at_cap), MAX_RECORD_BYTES);
+
+        // One byte less than the value cap minus the key (3 bytes: "p:a") fits.
+        let mut fits = good("a");
+        fits.text = "a".repeat(MAX_RECORD_BYTES - baseline - 3);
+        assert_eq!(record_len(&fits), MAX_RECORD_BYTES);
+
+        let mapped = map_items("p", vec![value_at_cap, fits]);
+        assert_eq!(mapped.dropped, 1);
+        assert_eq!(mapped.records.len(), 1);
+    }
+
+    #[test]
+    fn a_huge_id_is_dropped_by_the_key_bound_and_others_kept() {
+        let big_id = "i".repeat(900_000);
+        let mapped = map_items("p", vec![good("a"), good(&big_id), good("c")]);
+        assert_eq!(mapped.dropped, 1);
+        let ids: Vec<_> = mapped.records.iter().map(|r| r.item.id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn a_huge_platform_is_dropped_by_the_key_bound() {
+        let mut item = good("a");
+        item.platform = "x".repeat(MAX_KEY_BYTES);
+        let mapped = map_items("p", vec![item]);
+        assert_eq!(mapped.dropped, 1);
+        assert!(mapped.records.is_empty());
+    }
+
+    #[test]
+    fn key_exactly_at_the_bound_is_kept_and_one_over_is_dropped() {
+        // platform "p" + ":" + id = MAX_KEY_BYTES.
+        let at_bound = good(&"i".repeat(MAX_KEY_BYTES - 2));
+        let over = good(&"j".repeat(MAX_KEY_BYTES - 1));
+
+        let mapped = map_items("p", vec![at_bound, over]);
+        assert_eq!(mapped.dropped, 1);
+        assert_eq!(mapped.records.len(), 1);
+        assert_eq!(mapped.records[0].key.len(), MAX_KEY_BYTES);
+    }
+
+    #[test]
+    fn the_key_bound_counts_bytes_not_chars() {
+        // Two-byte chars: 255 of them (510 bytes) + "p:" = 512 fits; 256 does not.
+        let fits = good(&"é".repeat(255));
+        let over = good(&"é".repeat(256));
+        let mapped = map_items("p", vec![fits, over]);
+        assert_eq!(mapped.dropped, 1);
+        assert_eq!(mapped.records.len(), 1);
+    }
+
+    #[test]
+    fn key_too_long_warning_has_a_fixed_label_and_no_content() {
+        let (capture, _guard) = LogCapture::start();
+        let secret_id = format!("SECRET-ID-789-{}", "z".repeat(MAX_KEY_BYTES));
+        let mapped = map_items("acme", vec![good(&secret_id)]);
+        assert_eq!(mapped.dropped, 1);
+
+        let log = capture.text();
+        assert!(
+            log.contains("reason=\"key-too-long\"") || log.contains("reason=key-too-long"),
+            "{log}"
+        );
+        assert!(!log.contains("SECRET-ID-789"), "{log}");
     }
 
     #[test]
@@ -397,6 +492,7 @@ mod tests {
         assert_eq!(DropReason::EmptyId.label(), "empty-id");
         assert_eq!(DropReason::EmptyUrl.label(), "empty-url");
         assert_eq!(DropReason::InvalidUrl.label(), "invalid-url");
+        assert_eq!(DropReason::KeyTooLong.label(), "key-too-long");
         assert_eq!(DropReason::RecordTooLarge.label(), "record-too-large");
         assert_eq!(DropReason::Unserializable.label(), "unserializable");
     }
