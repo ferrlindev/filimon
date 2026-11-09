@@ -301,6 +301,162 @@ mod tests {
         }
     }
 
+    /// Delegates to a `FluvioSink` and counts the records it delivered.
+    struct CountingSink {
+        inner: FluvioSink,
+        delivered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSink {
+        fn new(inner: FluvioSink) -> Self {
+            Self {
+                inner,
+                delivered: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn delivered(&self) -> usize {
+            self.delivered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ItemSink for CountingSink {
+        async fn send_batch(
+            &self,
+            plugin: &str,
+            records: Vec<SinkRecord>,
+        ) -> Result<(), SinkError> {
+            let count = records.len();
+            self.inner.send_batch(plugin, records).await?;
+            self.delivered
+                .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Runs a host over `registry` into `topic` until `at_least` records were
+    /// delivered (30 s limit), then cancels and joins. Returns the final count.
+    async fn run_host_until(
+        registry: &crate::plugins::config::LoadedRegistry,
+        state_dir: &std::path::Path,
+        topic: &str,
+        at_least: usize,
+    ) -> miette::Result<usize> {
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::{Host, HostOptions};
+
+        let sink = Arc::new(CountingSink::new(ready_sink(topic).await?));
+        let host = Host::load(
+            registry,
+            HostOptions {
+                state_dir: state_dir.to_path_buf(),
+            },
+        )
+        .map_err(|e| miette::miette!("Host::load: {e}"))?;
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(host.run(Arc::clone(&sink), token.clone()));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while sink.delivered() < at_least {
+            if tokio::time::Instant::now() >= deadline {
+                token.cancel();
+                let _ = handle.await;
+                return Err(miette::miette!(
+                    "only {} of {at_least} records were produced within 30 s",
+                    sink.delivered()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        token.cancel();
+        let report = handle
+            .await
+            .map_err(|e| miette::miette!("host task: {e}"))?;
+        let stub = report
+            .plugins
+            .get("stub")
+            .ok_or_else(|| miette::miette!("no report for stub"))?;
+        if let Some(reason) = &stub.disabled {
+            return Err(miette::miette!("stub was disabled: {reason}"));
+        }
+        Ok(sink.delivered())
+    }
+
+    /// SC2 on a real cluster: the real stub component produces `SourceItem`s
+    /// to a scratch topic, and a stop and restart on the same state directory
+    /// continues the sequence with no gap and no repeat. Real clock: the Fluvio
+    /// client's I/O and the host's sink timeout must not see an auto-advanced
+    /// clock.
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster and plugin fixtures: see plugins/README.md"]
+    async fn live_host_end_to_end_stub_to_fluvio_with_restart() -> miette::Result<()> {
+        use super::super::testing::{
+            TestSource, fixture_wasm, load_test_registry, write_registry,
+        };
+        use crate::models::SourceType;
+
+        let topic = scratch_topic("host").await?;
+        let body = std::panic::AssertUnwindSafe(async {
+            let tmp = tempfile::TempDir::new().map_err(|e| miette::miette!("tempdir: {e}"))?;
+            let registry_path = write_registry(
+                tmp.path(),
+                &[TestSource {
+                    name: "stub".to_string(),
+                    component: fixture_wasm("stub-source", "stub_source.wasm"),
+                    enabled: true,
+                    interval_secs: 1,
+                    backoff: None,
+                    settings: "greeting = \"live end to end\"".to_string(),
+                }],
+            );
+            let registry = load_test_registry(&registry_path);
+            let state_dir = tmp.path().join(".fili-state");
+
+            // Run 1, then a stop; run 2 on the same state directory.
+            let n1 = run_host_until(&registry, &state_dir, &topic, 2).await?;
+            let n2 = run_host_until(&registry, &state_dir, &topic, 1).await?;
+            assert!(n1 >= 2, "run 1 produced {n1}");
+            assert!(n2 >= 1, "run 2 produced {n2}");
+            let total = n1 + n2;
+
+            let stream = FluvioStream::connect().await?;
+            let mut records = stream
+                .topic_stream(&topic, Offset::beginning(), Vec::new())
+                .await?;
+            let mut ids = Vec::new();
+            for _ in 0..total {
+                let got = tokio::time::timeout(Duration::from_secs(15), records.next())
+                    .await
+                    .map_err(|_| miette::miette!("timed out reading back {total} records"))?
+                    .ok_or_else(|| miette::miette!("stream ended early"))?
+                    .map_err(|e| miette::miette!("stream error: {e:?}"))?;
+                let item: SourceItem =
+                    serde_json::from_slice(got.value()).expect("value is a SourceItem");
+                assert_eq!(item.platform, "stub");
+                assert_eq!(item.source_type, SourceType::Social);
+                let key = got.key().map(|k| String::from_utf8_lossy(k).into_owned());
+                assert_eq!(key, Some(format!("stub:{}", item.id)));
+                ids.push(item.id);
+            }
+
+            // No gap and no repeat across the restart.
+            let expected: Vec<String> = (0..total).map(|n| format!("stub-{n}")).collect();
+            assert_eq!(ids, expected, "n1 = {n1}, n2 = {n2}");
+            Ok::<(), miette::Report>(())
+        })
+        .catch_unwind()
+        .await;
+        let deleted = delete_topic(&topic).await;
+        match body {
+            Ok(outcome) => {
+                outcome?;
+                deleted
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     #[tokio::test]
     #[ignore = "needs a local Fluvio cluster with topic creation rights"]
     async fn live_fluvio_sink_connect_names_a_missing_topic() -> miette::Result<()> {
