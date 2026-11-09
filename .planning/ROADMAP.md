@@ -87,11 +87,11 @@ Plans:
   2. A test source component is polled at the interval set in its TOML, and its items appear in a Fluvio topic as `SourceItem` records. After the host is stopped and restarted, polling resumes from the last persisted cursor instead of starting over.
   3. When a component returns an error or reports rate limiting (HTTP 429), the host backs it off using the backoff settings in that plugin's TOML and polls it again after the backoff window.
   4. A component that traps or errors is logged with its plugin name and backed off, while the other plugins keep polling and the `fili` process stays up.
-**Plans:** 1/10 plans executed
+**Plans:** 2/10 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 03-01-PLAN.md — Consent gate: the user removes the machine-local `rustup override` (human action; wasmtime 48 LTS needs Rust >= 1.95) (HOST-01..HOST-05, build prerequisite)
+- [x] 03-01-PLAN.md — Consent gate: the user removes the machine-local `rustup override` (human action; wasmtime 48 LTS needs Rust >= 1.95) (HOST-01..HOST-05, build prerequisite)
 - [x] 03-02-PLAN.md — `plugins/fault-source` fault-injection fixture component (ok, rate-limited, transient, auth-required, fatal, config, init-fatal, trap, spin) (HOST-03, HOST-05)
 
 **Wave 2** *(blocked on 03-01)*
@@ -178,7 +178,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 |-------|----------------|--------|-----------|
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
-| 3. Component Host Runtime | 1/10 | In Progress | - |
+| 3. Component Host Runtime | 2/10 | In Progress | - |
 | 4. Plugin CLI | 0/TBD | Not started | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |

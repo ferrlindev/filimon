@@ -32,7 +32,7 @@ key-decisions:
 
 patterns-established: []
 
-requirements-completed: [HOST-01, HOST-02, HOST-03, HOST-04, HOST-05]
+requirements-completed: []
 
 coverage:
   - id: D1
