@@ -33,6 +33,30 @@ pub enum HostError {
         reason: String,
     },
 
+    /// A component imports something outside the `filimon:plugin/` package.
+    #[error("plugin `{plugin}` (`{path}`) imports {imports:?}, which fili does not provide")]
+    #[diagnostic(
+        code(fili::host::foreign_import),
+        help(
+            "build the component for wasm32-unknown-unknown so it has no WASI imports; see plugins/README.md"
+        )
+    )]
+    ForeignImports {
+        plugin: String,
+        path: String,
+        imports: Vec<String>,
+    },
+
+    /// A component does not fit the WIT world it was loaded as.
+    #[error("plugin `{plugin}` (`{path}`) does not fit the `{kind}` world: {reason}")]
+    #[diagnostic(code(fili::host::wrong_world))]
+    WrongWorld {
+        plugin: String,
+        kind: &'static str,
+        path: String,
+        reason: String,
+    },
+
     /// A cursor state file exists but could not be read.
     #[error("plugin `{plugin}`: cannot read cursor file `{path}`: {reason}")]
     #[diagnostic(
