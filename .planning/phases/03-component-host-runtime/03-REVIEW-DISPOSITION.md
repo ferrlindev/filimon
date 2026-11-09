@@ -21,15 +21,15 @@ findings:
     title: "An empty `--state-dir` / `FILI_STATE_DIR` silently resolves to the current directory"
   - id: WR-08
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "The per-poll item cap does not bound host memory: list lifting copies every item before `map_items` runs"
   - id: WR-09
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "The \"64 MiB per instance\" ceiling is per memory, so one instance can hold up to 512 MiB"
   - id: WR-10
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "Sink sends are never raced against shutdown and lock waiting is unbounded, so shutdown can take N x 60 s"
   - id: IN-01
     severity: info
@@ -49,11 +49,11 @@ findings:
     title: "The core isolation tests are all `#[ignore]` and depend on a manual fixture build"
   - id: IN-05
     severity: info
-    disposition: open
+    disposition: deferred
     title: "Items over the per-poll cap are lost permanently while an oversize cursor disables the plugin"
   - id: IN-06
     severity: info
-    disposition: open
+    disposition: deferred
     title: "Misleading variable name in the `grow` fixture mode"
   - id: WR-01
     severity: warning
@@ -67,9 +67,9 @@ findings:
     severity: warning
     disposition: fixed
     title: "`send_batch` is not cancellation-safe when the sink timeout drops it mid-flight"
-open: 13
+open: 8
 total: 16
-recorded: 2026-11-09T17:38:57.640Z
+recorded: 2026-11-09T17:59:59.006Z
 ---
 
 # Phase 03: Code Review Disposition
@@ -80,15 +80,15 @@ recorded: 2026-11-09T17:38:57.640Z
 | WR-04 | warning | open | - |
 | WR-05 | warning | open | - |
 | WR-07 | warning | open | - |
-| WR-08 | warning | open | - |
-| WR-09 | warning | open | - |
-| WR-10 | warning | open | - |
+| WR-08 | warning | deferred | deferred by user 2026-11-10: hostile-plugin hardening; revisit before third-party plugins run (Phase 7) / v2 HOST-06 |
+| WR-09 | warning | deferred | deferred by user 2026-11-10: per-memory cap allows up to 512 MiB; revisit with WR-08; README 'per instance' wording (plugins/README.md lines 222, 282) also deferred |
+| WR-10 | warning | deferred | deferred by user 2026-11-10: shutdown can take N x 60 s with a stuck broker; revisit when Phase 4 wires the run command |
 | IN-01 | info | open | - |
 | IN-02 | info | open | - |
 | IN-03 | info | open | - |
 | IN-04 | info | open | - |
-| IN-05 | info | open | - |
-| IN-06 | info | open | - |
+| IN-05 | info | deferred | deferred by user 2026-11-10: minor; revisit with WR-08 |
+| IN-06 | info | deferred | deferred by user 2026-11-10: naming only, fixture code |
 | WR-01 | warning | fixed | fixed in 2e7c091 (guest memory, item-count and cursor-size caps); confirmed by the re-review in 03-REVIEW.md (not in the current review) |
 | WR-03 | warning | fixed | fixed in b7c2324 (record key bounded and counted in the record cap); confirmed by the re-review in 03-REVIEW.md (not in the current review) |
 | WR-06 | warning | fixed | fixed in 60d65ec (sink send bounded inside FluvioSink, errors cleared on timeout); confirmed by the re-review in 03-REVIEW.md (not in the current review) |
