@@ -15,7 +15,8 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
 - `fault-source/`: a fault-injection plugin for the `source` world and a
   Phase 3 test fixture, not a registry example. Its `[settings]` `mode`
   selects `ok`, `rate-limited`, `transient`, `auth-required`, `fatal`,
-  `config`, `init-fatal`, `trap` or `spin`. Optional `retry_after_secs`
+  `config`, `init-fatal`, `trap`, `spin` or `grow` (allocates `grow_mib`,
+  default 192, past the host's 64 MiB memory cap). Optional `retry_after_secs`
   (used by `rate-limited`) and `after_polls` (polls up to that count behave as
   `ok`) refine it. The `trap` and `spin` modes deliberately misbehave, so
   never reference it from a plugin registry such as `examples/plugins/`.

@@ -13,6 +13,8 @@
 //   mode = "init-fatal"    init -> PollError::Fatal
 //   mode = "trap"          poll panics (a wasm `unreachable` trap)
 //   mode = "spin"          poll never returns
+//   mode = "grow"          poll tries to grow linear memory by `grow_mib`
+//                          (default 192 MiB) in one allocation
 //
 // Optional settings: `retry_after_secs` (for `rate-limited`) and `after_polls`
 // (default 0): a poll whose per-instance 1-based count is <= `after_polls`
@@ -41,13 +43,15 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
-    /// One of the nine mode names, see `Mode::parse`.
+    /// One of the ten mode names, see `Mode::parse`.
     mode: String,
     /// Retry-after seconds reported by `rate-limited`.
     retry_after_secs: Option<u32>,
     /// Polls (1-based count <= this value) that behave as `ok` before the
     /// configured mode takes effect. Defaults to 0.
     after_polls: Option<u32>,
+    /// Size in MiB that `grow` mode allocates in one go. Defaults to 192.
+    grow_mib: Option<u32>,
 }
 
 // ── Modes ────────────────────────────────────────────────────────────────────
@@ -63,6 +67,7 @@ enum Mode {
     InitFatal,
     Trap,
     Spin,
+    Grow,
 }
 
 impl Mode {
@@ -77,6 +82,7 @@ impl Mode {
             "init-fatal" => Some(Mode::InitFatal),
             "trap" => Some(Mode::Trap),
             "spin" => Some(Mode::Spin),
+            "grow" => Some(Mode::Grow),
             _ => None,
         }
     }
@@ -89,6 +95,7 @@ struct State {
     mode_name: String,
     retry_after_secs: Option<u32>,
     after_polls: u32,
+    grow_mib: u32,
     polls: u32,
 }
 
@@ -124,6 +131,7 @@ impl Guest for Component {
                 mode_name: settings.mode,
                 retry_after_secs: settings.retry_after_secs,
                 after_polls: settings.after_polls.unwrap_or(0),
+                grow_mib: settings.grow_mib.unwrap_or(192),
                 polls: 0,
             });
         });
@@ -135,7 +143,7 @@ impl Guest for Component {
         cursor: Option<Vec<u8>>,
         _access_token: Option<String>,
     ) -> Result<PollResponse, PollError> {
-        let (mode, mode_name, retry_after_secs, after_polls, n) = STATE.with(|state| {
+        let (mode, mode_name, retry_after_secs, after_polls, grow_mib, n) = STATE.with(|state| {
             let mut state = state.borrow_mut();
             let Some(state) = state.as_mut() else {
                 return Err(PollError::Fatal(
@@ -148,6 +156,7 @@ impl Guest for Component {
                 state.mode_name.clone(),
                 state.retry_after_secs,
                 state.after_polls,
+                state.grow_mib,
                 state.polls,
             ))
         })?;
@@ -185,6 +194,19 @@ impl Guest for Component {
             Mode::Fatal => Err(PollError::Fatal("fault-source: fatal mode".to_string())),
             Mode::Config => Err(PollError::Config("fault-source: config mode".to_string())),
             Mode::Trap => panic!("fault-source: trap mode"),
+            Mode::Grow => {
+                // One allocation far above the host's memory cap. If the host
+                // refuses the grow, the allocator aborts (a wasm trap). If it
+                // were allowed, touch every page so it is really committed.
+                let mut block = vec![0u8; grow_mib as usize * 1024 * 1024];
+                for i in (0..block.len()).step_by(4096) {
+                    block[i] = 1;
+                }
+                let sum: usize = std::hint::black_box(block.iter().step_by(4096).count());
+                Err(PollError::Fatal(format!(
+                    "fault-source: grow mode was NOT refused ({sum} pages)"
+                )))
+            }
             Mode::Spin => {
                 let mut counter: u64 = 0;
                 loop {

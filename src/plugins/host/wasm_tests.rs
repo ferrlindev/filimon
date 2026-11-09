@@ -256,6 +256,57 @@ async fn wasm_trap_is_isolated_logged_and_instance_rebuilt() {
     assert!(!captured.contains('\u{1b}'), "{captured:?}");
 }
 
+/// T-3-13 end to end: a real component that tries to grow linear memory far
+/// past the fixed 64 MiB cap must be refused by the store limiter. The refusal
+/// is a trap, handled like any other: logged, backed off, rebuilt, not disabled.
+#[tokio::test(start_paused = true)]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_guest_memory_growth_past_the_cap_is_refused_and_isolated() {
+    let tmp = TempDir::new().expect("tempdir");
+    let host = load_host(
+        &tmp,
+        &[
+            stub_source(60),
+            fault_source(
+                "hog",
+                60,
+                Some((10, 100, 2.0)),
+                "mode = \"grow\"\ngrow_mib = 192",
+            ),
+        ],
+    );
+    let (logs, _guard) = LogCapture::start();
+
+    let sink = Arc::new(VecSink::default());
+    let report = run_host(host, Arc::clone(&sink), Duration::from_secs(150)).await;
+
+    // Never a successful poll: grow mode only ever succeeds if the cap is gone.
+    assert!(ids_of(&sink, "hog").is_empty(), "{:?}", ids_of(&sink, "hog"));
+    let hog = &report.plugins["hog"];
+    assert_eq!(hog.polls, 0, "{hog:?}");
+    // Failures at 0, 10, 30, 70 s: the instance is rebuilt and re-initialised
+    // after each trap and retried on the backoff schedule.
+    assert!(hog.failures >= 3, "{hog:?}");
+    assert_eq!(hog.disabled, None, "{hog:?}");
+
+    // The neighbour keeps its own schedule and the host stayed up (the report
+    // exists only because `run` returned normally after cancellation).
+    assert_eq!(ids_of(&sink, "stub"), vec!["stub-0", "stub-1", "stub-2"]);
+    let stub = &report.plugins["stub"];
+    assert_eq!(stub.polls, 3);
+    assert_eq!(stub.disabled, None);
+
+    let captured = logs.text();
+    assert!(captured.contains("plugin=hog"), "{captured}");
+    assert!(captured.contains("instance fault"), "{captured}");
+    assert!(!captured.contains("NOT refused"), "{captured}");
+    // Re-initialised after each trap: init logs once per instance.
+    assert!(
+        captured.matches("init: mode=grow").count() >= 2,
+        "{captured}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 #[ignore = "needs plugin fixtures: see plugins/README.md"]
 async fn wasm_fatal_disables_only_that_plugin() {

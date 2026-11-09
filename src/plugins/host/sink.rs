@@ -386,6 +386,48 @@ mod tests {
         }
     }
 
+    /// The `SINK_TIMEOUT` clock starts after the producer lock is held: a batch
+    /// that waits longer than the timeout for the lock still succeeds once it
+    /// gets it. Real time on purpose (about 62 s): a paused clock would
+    /// auto-advance during the real network I/O and fire the timeout. The
+    /// timeout-expiry path through the sink needs a producer that hangs, which
+    /// needs a production seam, so it stays covered by the `send_bounded` tests.
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with topic creation rights; takes about 62 s"]
+    async fn live_fluvio_sink_lock_wait_does_not_count_against_the_timeout() -> miette::Result<()>
+    {
+        let topic = scratch_topic("sink-lockwait").await?;
+        let body = std::panic::AssertUnwindSafe(async {
+            let sink = Arc::new(ready_sink(&topic).await?);
+
+            // Another plugin's batch holds the producer for longer than the limit.
+            let guard = sink.producer.lock().await;
+            let waiting = {
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move { sink.send_batch("p", vec![record("late")]).await })
+            };
+            tokio::time::sleep(SINK_TIMEOUT + Duration::from_secs(2)).await;
+            assert!(!waiting.is_finished(), "batch must wait for the lock");
+            drop(guard);
+
+            waiting
+                .await
+                .expect("send task")
+                .map_err(|e| miette::miette!("lock wait was counted against the timeout: {e}"))?;
+            Ok::<(), miette::Report>(())
+        })
+        .catch_unwind()
+        .await;
+        let deleted = delete_topic(&topic).await;
+        match body {
+            Ok(outcome) => {
+                outcome?;
+                deleted
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     /// A failed batch clears the producer's sticky error, so the next batch on
     /// the same sink succeeds. The failure here is a record over the broker's
     /// request limit, which is what `MAX_RECORD_BYTES` exists to prevent. The
