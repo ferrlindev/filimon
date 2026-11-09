@@ -240,6 +240,18 @@ impl TypedProducer {
             .map_err(|e| miette::miette!("Failed to flush producer: {}", e))?;
         Ok(())
     }
+
+    /// Clear the producer's stored errors.
+    ///
+    /// In fluvio 0.50.1 a produce failure is sticky: `send` and `flush` keep
+    /// returning the stored error until the errors are cleared.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used by the plugin host sink")
+    )]
+    pub async fn clear_errors(&self) {
+        self.producer.clear_errors().await;
+    }
 }
 
 // ── Typed Consumer ────────────────────────────────────────────────────────────

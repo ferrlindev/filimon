@@ -2,14 +2,19 @@
 // plugins/host/sink.rs - Where polled items go
 //
 // The scheduler hands each poll's records to an `ItemSink` and only then
-// persists the cursor (D-07). The Fluvio sink arrives in a later plan; tests
-// use the in-memory `VecSink`.
+// persists the cursor (D-07). `FluvioSink` produces to the social topic;
+// tests use the in-memory `VecSink`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
+use tracing::debug;
+
 use crate::models::SourceItem;
+use crate::streaming::{FluvioStream, TOPIC_SOCIAL_ITEMS, TypedProducer};
 
 /// Longest the host waits for one `send_batch` before treating it as failed.
 pub const SINK_TIMEOUT: Duration = Duration::from_mins(1);
@@ -35,6 +40,57 @@ pub trait ItemSink: Send + Sync + 'static {
         plugin: &str,
         records: Vec<SinkRecord>,
     ) -> impl Future<Output = Result<(), SinkError>> + Send;
+}
+
+/// Produces records to one Fluvio topic.
+///
+/// The production sink is only ever built for `filimon-social-items`: no
+/// plugin or registry value selects a topic.
+pub struct FluvioSink {
+    producer: Arc<Mutex<TypedProducer>>,
+}
+
+impl FluvioSink {
+    /// Connects and checks that `topic` exists. A missing topic is named in the
+    /// error together with the `fluvio topic create` command.
+    pub async fn connect(topic: &str) -> miette::Result<Self> {
+        let stream = FluvioStream::connect().await?;
+        stream.preflight(&[topic], &[]).await?;
+        let producer = stream.producer(topic).await?;
+        Ok(Self {
+            producer: Arc::new(Mutex::new(producer)),
+        })
+    }
+
+    /// The sink for social items (`filimon-social-items`).
+    pub async fn connect_social() -> miette::Result<Self> {
+        Self::connect(TOPIC_SOCIAL_ITEMS).await
+    }
+}
+
+impl ItemSink for FluvioSink {
+    /// Sends every record, then flushes, under one lock so a failure cannot be
+    /// attributed to another plugin's batch. Fluvio 0.50.1 keeps returning a
+    /// stored producer error until it is cleared, so every failure clears it
+    /// before returning and a later batch can succeed.
+    async fn send_batch(&self, plugin: &str, records: Vec<SinkRecord>) -> Result<(), SinkError> {
+        let count = records.len();
+        let producer = self.producer.lock().await;
+
+        for record in &records {
+            if let Err(e) = producer.send(&record.key, &record.item).await {
+                producer.clear_errors().await;
+                return Err(SinkError(e.to_string()));
+            }
+        }
+        if let Err(e) = producer.flush().await {
+            producer.clear_errors().await;
+            return Err(SinkError(e.to_string()));
+        }
+
+        debug!(plugin = %plugin, count, "sent plugin items");
+        Ok(())
+    }
 }
 
 /// In-memory sink for tests: keeps `(plugin, record)` pairs in arrival order.
@@ -75,6 +131,194 @@ impl ItemSink for VecSink {
         for record in records {
             guard.push((plugin.to_string(), record));
         }
+        Ok(())
+    }
+}
+
+/// Scratch-topic helpers for cluster-backed tests. They never touch
+/// `filimon-social-items`.
+#[cfg(test)]
+pub(crate) mod live_support {
+    use std::time::Duration;
+
+    use fluvio::metadata::topic::TopicSpec;
+
+    use super::FluvioSink;
+
+    fn nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    }
+
+    async fn admin() -> miette::Result<fluvio::FluvioAdmin> {
+        Ok(fluvio::Fluvio::connect()
+            .await
+            .map_err(|e| miette::miette!("connect: {e}"))?
+            .admin()
+            .await)
+    }
+
+    /// Creates a scratch topic `filimon-test-<kind>-<nanos>-<pid>-<n>`.
+    ///
+    /// Tests run in parallel and the clock can be coarser than a nanosecond,
+    /// so the process id and a counter keep names unique.
+    pub async fn scratch_topic(kind: &str) -> miette::Result<String> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let topic = format!(
+            "filimon-test-{kind}-{}-{}-{}",
+            nanos(),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        admin()
+            .await?
+            .create(topic.clone(), false, TopicSpec::new_computed(1, 1, None))
+            .await
+            .map_err(|e| miette::miette!("create {topic}: {e}"))?;
+        Ok(topic)
+    }
+
+    /// Deletes a scratch topic.
+    pub async fn delete_topic(topic: &str) -> miette::Result<()> {
+        admin()
+            .await?
+            .delete::<TopicSpec>(topic.to_string())
+            .await
+            .map_err(|e| miette::miette!("delete {topic}: {e}"))
+    }
+
+    /// A sink for a new topic; it can take a moment to provision.
+    pub async fn ready_sink(topic: &str) -> miette::Result<FluvioSink> {
+        for _ in 0..20 {
+            if let Ok(sink) = FluvioSink::connect(topic).await {
+                return Ok(sink);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Err(miette::miette!("no sink for {topic}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fluvio::Offset;
+    use futures_util::{FutureExt, StreamExt};
+
+    use super::live_support::{delete_topic, ready_sink, scratch_topic};
+    use super::*;
+
+    fn assert_item_sink<S: ItemSink + Send + Sync + 'static>() {}
+
+    fn record(id: &str) -> SinkRecord {
+        SinkRecord {
+            key: format!("p:{id}"),
+            item: SourceItem::social(
+                id.to_string(),
+                format!("https://example.invalid/{id}"),
+                Some(format!("title {id}")),
+                format!("text {id}"),
+                None,
+                Some(1_730_000_000_123),
+                "p".to_string(),
+                Some("{\"n\":1}".to_string()),
+            ),
+        }
+    }
+
+    #[test]
+    fn fluvio_sink_is_an_item_sink() {
+        assert_item_sink::<FluvioSink>();
+        assert_item_sink::<VecSink>();
+    }
+
+    #[tokio::test]
+    async fn vec_sink_keeps_batch_order() {
+        let sink = VecSink::default();
+        sink.send_batch("a", vec![record("1"), record("2")])
+            .await
+            .expect("batch a");
+        sink.send_batch("b", vec![record("3"), record("4")])
+            .await
+            .expect("batch b");
+
+        let keys: Vec<_> = sink.records().into_iter().map(|r| r.key).collect();
+        assert_eq!(keys, ["p:1", "p:2", "p:3", "p:4"]);
+        let a: Vec<_> = sink
+            .plugin_records("a")
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        let b: Vec<_> = sink
+            .plugin_records("b")
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(a, ["p:1", "p:2"]);
+        assert_eq!(b, ["p:3", "p:4"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with topic creation rights"]
+    async fn live_fluvio_sink_produces_records_in_order_with_keys() -> miette::Result<()> {
+        let topic = scratch_topic("sink").await?;
+        let body = std::panic::AssertUnwindSafe(async {
+            let sink = ready_sink(&topic).await?;
+            let sent = vec![record("1"), record("2")];
+            sink.send_batch("p", sent.clone())
+                .await
+                .map_err(|e| miette::miette!("send_batch: {e}"))?;
+
+            let stream = FluvioStream::connect().await?;
+            let mut records = stream
+                .topic_stream(&topic, Offset::beginning(), Vec::new())
+                .await?;
+            for expected in &sent {
+                let got = tokio::time::timeout(Duration::from_secs(10), records.next())
+                    .await
+                    .map_err(|_| miette::miette!("timed out waiting for a record"))?
+                    .ok_or_else(|| miette::miette!("stream ended early"))?
+                    .map_err(|e| miette::miette!("stream error: {e:?}"))?;
+                let key = got.key().map(|k| String::from_utf8_lossy(k).into_owned());
+                assert_eq!(key.as_deref(), Some(expected.key.as_str()));
+                let item: SourceItem =
+                    serde_json::from_slice(got.value()).expect("value is a SourceItem");
+                assert_eq!(item, expected.item);
+            }
+            Ok::<(), miette::Report>(())
+        })
+        .catch_unwind()
+        .await;
+        let deleted = delete_topic(&topic).await;
+        match body {
+            Ok(outcome) => {
+                outcome?;
+                deleted
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster with topic creation rights"]
+    async fn live_fluvio_sink_connect_names_a_missing_topic() -> miette::Result<()> {
+        // A unique name that was never created, so it cannot exist.
+        let topic = format!(
+            "filimon-test-missing-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos(),
+            std::process::id()
+        );
+        let text = match FluvioSink::connect(&topic).await {
+            Ok(_) => panic!("connect to a missing topic should fail"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(text.contains("fluvio topic create"), "{text}");
+        assert!(text.contains(&topic), "{text}");
         Ok(())
     }
 }
