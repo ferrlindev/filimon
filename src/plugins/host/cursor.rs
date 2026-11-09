@@ -20,6 +20,10 @@ use serde::{Deserialize, Serialize};
 use super::engine::clean_guest_text;
 use super::error::HostError;
 
+/// Largest `next-cursor` the host accepts from a plugin, in bytes. A poll that
+/// returns more is a plugin fault and its cursor is never persisted.
+pub const MAX_CURSOR_BYTES: usize = 4096;
+
 /// Version written into every state file.
 pub const STATE_VERSION: u32 = 1;
 

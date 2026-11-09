@@ -94,6 +94,9 @@ impl InstanceFactory for WasmtimeFactory {
 
     async fn instantiate(&self, plugin: &str) -> Result<WasmtimeInstance, InstanceBuildError> {
         let mut store = Store::new(&self.engine, HostState::new(plugin));
+        // Fixed per-instance memory and table caps. A breach traps, which the
+        // scheduler handles as an instance fault (backoff, fresh instance).
+        store.limiter(HostState::limits_mut);
         // Anti-wedge: yield to tokio each epoch tick instead of trapping.
         store.set_epoch_deadline(1);
         store.epoch_deadline_async_yield_and_update(1);

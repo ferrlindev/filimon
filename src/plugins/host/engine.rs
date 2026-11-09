@@ -6,6 +6,9 @@
 // thread. Epoch interruption is an anti-wedge measure: every guest call yields
 // to tokio about every tick, so a spinning guest cannot starve a worker and a
 // shutdown can drop its future. It is not a CPU limit (HOST-06 is deferred).
+// Every store also carries a small fixed memory ceiling (`store_limits`) so one
+// guest cannot take the whole process down; configurable per-plugin limits stay
+// deferred (HOST-06).
 //
 // Guest text is untrusted: every string that reaches `tracing` passes through
 // `clean_guest_text` first.
@@ -17,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use wasmtime::component::{HasSelf, Linker};
-use wasmtime::{Config, Engine};
+use wasmtime::{Config, Engine, StoreLimits, StoreLimitsBuilder};
 
 /// Generated bindings for the `source` world.
 #[allow(clippy::all, clippy::pedantic)]
@@ -58,6 +61,36 @@ use crate::output::sanitize_for_terminal;
 /// How often the epoch ticker advances the engine epoch.
 pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// Fixed ceiling on one instance's linear memory, in bytes. A guest that tries
+/// to grow past it traps, which the scheduler handles like any instance fault
+/// (backoff, then a fresh instance). Not configurable until HOST-06.
+pub const GUEST_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Most core instances, tables and memories one component may create. A
+/// component built by `cargo component` is a few core modules (the guest plus
+/// adapter shims), so these are small but not 1.
+const MAX_CORE_INSTANCES: usize = 16;
+const MAX_TABLES: usize = 16;
+const MAX_MEMORIES: usize = 8;
+/// Most elements in one table.
+const MAX_TABLE_ELEMENTS: usize = 100_000;
+
+/// The fixed per-instance resource limits installed on every store.
+#[must_use]
+pub fn store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(GUEST_MEMORY_LIMIT_BYTES)
+        .table_elements(MAX_TABLE_ELEMENTS)
+        .instances(MAX_CORE_INSTANCES)
+        .tables(MAX_TABLES)
+        .memories(MAX_MEMORIES)
+        // A refused `memory.grow` traps instead of returning -1, so the breach
+        // is an instance fault and never a guest that limps on or aborts the
+        // host.
+        .trap_on_grow_failure(true)
+        .build()
+}
+
 /// Longest guest log line passed to `tracing`, in characters.
 const GUEST_LOG_CLIP: usize = 4096;
 
@@ -82,9 +115,11 @@ pub fn clean_guest_text(text: &str, max_chars: usize) -> String {
 
 // ── Host State And Guest Imports ──────────────────────────────────────────────
 
-/// Per-instance host state: the plugin alias used to tag every guest log line.
+/// Per-instance host state: the plugin alias used to tag every guest log line
+/// and the instance's resource limits.
 pub struct HostState {
     plugin: Arc<str>,
+    limits: StoreLimits,
 }
 
 impl HostState {
@@ -92,7 +127,13 @@ impl HostState {
     pub fn new(plugin: &str) -> Self {
         Self {
             plugin: Arc::from(plugin),
+            limits: store_limits(),
         }
+    }
+
+    /// The limits `Store::limiter` points at.
+    pub fn limits_mut(&mut self) -> &mut dyn wasmtime::ResourceLimiter {
+        &mut self.limits
     }
 
     #[must_use]
@@ -253,6 +294,44 @@ mod tests {
 
         // Exactly at the limit is not clipped.
         assert_eq!(clean_guest_text("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn store_limits_cap_guest_memory_at_64_mib_and_trap_on_breach() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limits = store_limits();
+        // Growing up to the cap is allowed.
+        assert!(
+            limits
+                .memory_growing(0, GUEST_MEMORY_LIMIT_BYTES, None)
+                .expect("allowed")
+        );
+        // One byte over is a trap, not a quiet `false`, so the scheduler sees
+        // an instance fault.
+        let denied = limits.memory_growing(0, GUEST_MEMORY_LIMIT_BYTES + 1, None);
+        assert!(denied.is_err(), "growth past the cap must trap: {denied:?}");
+    }
+
+    #[test]
+    fn store_limits_allow_a_small_component_and_refuse_a_table_flood() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limits = store_limits();
+        assert!(limits.instances() >= 3, "adapter shims need a few instances");
+        assert!(limits.table_growing(0, 1000, None).expect("allowed"));
+        let denied = limits.table_growing(0, MAX_TABLE_ELEMENTS + 1, None);
+        assert!(denied.is_err(), "{denied:?}");
+    }
+
+    #[test]
+    fn host_state_carries_the_fixed_limits() {
+        let mut state = HostState::new("p");
+        let limits = state.limits_mut();
+        assert!(
+            wasmtime::ResourceLimiter::memory_growing(limits, 0, GUEST_MEMORY_LIMIT_BYTES + 1, None)
+                .is_err()
+        );
     }
 
     #[test]

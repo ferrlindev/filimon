@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::backoff;
-use super::cursor::CursorStore;
+use super::cursor::{CursorStore, MAX_CURSOR_BYTES};
 use super::engine::{PollError, clean_guest_text};
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
@@ -365,6 +365,23 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
             };
 
             let outcome = match polled {
+                // An oversize cursor is a plugin fault: nothing from this poll
+                // is sent and the cursor is never persisted. It is `fatal`
+                // because the same instance and cursor reproduce it.
+                CallOutcome::Ok(response)
+                    if response
+                        .next_cursor
+                        .as_ref()
+                        .is_some_and(|c| c.len() > MAX_CURSOR_BYTES) =>
+                {
+                    let len = response.next_cursor.as_ref().map_or(0, Vec::len);
+                    CycleOutcome::Guest {
+                        phase: Phase::Poll,
+                        error: PollError::Fatal(format!(
+                            "next-cursor is {len} bytes, over the {MAX_CURSOR_BYTES} byte cap"
+                        )),
+                    }
+                }
                 CallOutcome::Ok(response) => {
                     report.polls += 1;
                     let mapped = map_items(&spec.name, response.items);
@@ -899,6 +916,94 @@ mod tests {
         assert_eq!(bad.poll_offsets(start), vec![0]);
         assert_eq!(good.poll_offsets(start), vec![0, 60, 120, 180]);
         assert_eq!(good_report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_oversize_next_cursor_is_a_plugin_fault_and_never_persisted() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(VecSink::default());
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items: vec![wit_item("a")],
+                next_cursor: Some(vec![7; MAX_CURSOR_BYTES + 1]),
+                delay: Duration::ZERO,
+            },
+        ]));
+        let report = run_for(
+            default_spec("big"),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+
+        let reason = report.disabled.as_deref().expect("disabled");
+        assert!(reason.contains("next-cursor"), "{reason}");
+        assert!(reason.contains("4096"), "{reason}");
+        assert_eq!(report.items_sent, 0);
+        assert!(sink.records().is_empty());
+        assert_eq!(cursors.read("big").expect("read"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_next_cursor_exactly_at_the_cap_is_persisted() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(VecSink::default());
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items: vec![wit_item("a")],
+                next_cursor: Some(vec![7; MAX_CURSOR_BYTES]),
+                delay: Duration::ZERO,
+            },
+        ]));
+        let report = run_for(
+            default_spec("ok"),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+
+        assert_eq!(report.disabled, None);
+        assert_eq!(report.items_sent, 1);
+        assert_eq!(
+            cursors.read("ok").expect("read"),
+            Some(vec![7; MAX_CURSOR_BYTES])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_poll_over_the_item_cap_sends_the_cap_and_counts_the_rest_dropped() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(VecSink::default());
+        let items: Vec<_> = (0..super::super::map::MAX_ITEMS_PER_POLL + 3)
+            .map(|n| wit_item(&format!("i{n}")))
+            .collect();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items,
+                next_cursor: Some(vec![1]),
+                delay: Duration::ZERO,
+            },
+        ]));
+        let report = run_for(
+            default_spec("many"),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+
+        assert_eq!(report.items_sent, super::super::map::MAX_ITEMS_PER_POLL as u64);
+        assert_eq!(report.dropped, 3);
+        assert_eq!(report.disabled, None);
+        assert_eq!(cursors.read("many").expect("read"), Some(vec![1]));
     }
 
     #[tokio::test(start_paused = true)]

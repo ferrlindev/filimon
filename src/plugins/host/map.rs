@@ -20,6 +20,11 @@ use crate::models::SourceItem;
 /// headroom for framing.
 pub const MAX_RECORD_BYTES: usize = 1_000_000;
 
+/// Most items the host takes from one poll. Items past the cap are dropped (and
+/// counted) so one poll cannot make the host serialize and send an unbounded
+/// list. The cursor still advances, so dropped items are not retried.
+pub const MAX_ITEMS_PER_POLL: usize = 1000;
+
 /// Longest message key (`"{platform}:{id}"`) the host accepts, in bytes. Both
 /// parts are guest-controlled, so the key is bounded on its own as well as
 /// counted in `MAX_RECORD_BYTES`.
@@ -34,6 +39,7 @@ pub enum DropReason {
     KeyTooLong,
     RecordTooLarge,
     Unserializable,
+    TooManyItems,
 }
 
 impl DropReason {
@@ -47,6 +53,7 @@ impl DropReason {
             Self::KeyTooLong => "key-too-long",
             Self::RecordTooLarge => "record-too-large",
             Self::Unserializable => "unserializable",
+            Self::TooManyItems => "too-many-items",
         }
     }
 }
@@ -108,11 +115,23 @@ fn map_item(plugin: &str, item: WitItem) -> Result<SinkRecord, DropReason> {
 /// Maps one poll's items to sink records, keeping the plugin's list order.
 ///
 /// Invalid items are dropped and counted; equal keys are all kept (no dedupe
-/// in this phase).
+/// in this phase). At most `MAX_ITEMS_PER_POLL` items are considered.
 #[must_use]
-pub fn map_items(plugin: &str, items: Vec<WitItem>) -> Mapped {
+pub fn map_items(plugin: &str, mut items: Vec<WitItem>) -> Mapped {
+    // Over the per-poll cap: keep the first `MAX_ITEMS_PER_POLL` in list order
+    // and drop the rest with one warning (a count, never content).
+    let excess = items.len().saturating_sub(MAX_ITEMS_PER_POLL);
+    if excess > 0 {
+        items.truncate(MAX_ITEMS_PER_POLL);
+        warn!(
+            plugin = %plugin,
+            dropped = excess,
+            reason = DropReason::TooManyItems.label(),
+            "dropped plugin items over the per-poll cap"
+        );
+    }
     let mut records = Vec::with_capacity(items.len());
-    let mut dropped = 0;
+    let mut dropped = excess;
     for (index, item) in items.into_iter().enumerate() {
         match map_item(plugin, item) {
             Ok(record) => records.push(record),
@@ -424,6 +443,41 @@ mod tests {
     }
 
     #[test]
+    fn exactly_the_per_poll_cap_is_kept() {
+        let items: Vec<_> = (0..MAX_ITEMS_PER_POLL).map(|n| good(&n.to_string())).collect();
+        let mapped = map_items("p", items);
+        assert_eq!(mapped.dropped, 0);
+        assert_eq!(mapped.records.len(), MAX_ITEMS_PER_POLL);
+    }
+
+    #[test]
+    fn items_over_the_per_poll_cap_are_dropped_in_order_with_one_content_free_warning() {
+        let (capture, _guard) = LogCapture::start();
+        let items: Vec<_> = (0..MAX_ITEMS_PER_POLL + 5)
+            .map(|n| good(&format!("SECRET-{n}")))
+            .collect();
+        let mapped = map_items("acme", items);
+
+        assert_eq!(mapped.dropped, 5);
+        assert_eq!(mapped.records.len(), MAX_ITEMS_PER_POLL);
+        assert_eq!(mapped.records[0].item.id, "SECRET-0");
+        assert_eq!(
+            mapped.records[MAX_ITEMS_PER_POLL - 1].item.id,
+            format!("SECRET-{}", MAX_ITEMS_PER_POLL - 1)
+        );
+
+        let log = capture.text();
+        assert!(log.contains("plugin=acme"), "{log}");
+        assert!(log.contains("dropped=5"), "{log}");
+        assert!(
+            log.contains("reason=\"too-many-items\"") || log.contains("reason=too-many-items"),
+            "{log}"
+        );
+        assert_eq!(log.matches("dropped plugin items").count(), 1, "{log}");
+        assert!(!log.contains("SECRET-"), "{log}");
+    }
+
+    #[test]
     fn empty_list_maps_to_nothing() {
         let mapped = map_items("p", Vec::new());
         assert!(mapped.records.is_empty());
@@ -495,5 +549,6 @@ mod tests {
         assert_eq!(DropReason::KeyTooLong.label(), "key-too-long");
         assert_eq!(DropReason::RecordTooLarge.label(), "record-too-large");
         assert_eq!(DropReason::Unserializable.label(), "unserializable");
+        assert_eq!(DropReason::TooManyItems.label(), "too-many-items");
     }
 }
