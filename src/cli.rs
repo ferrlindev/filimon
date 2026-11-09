@@ -40,6 +40,14 @@ pub struct Cli {
     #[arg(long, global = true, env = "FILI_REGISTRY", default_value = DEFAULT_REGISTRY)]
     pub registry: PathBuf,
 
+    /// Directory for per-plugin cursor files. Defaults to `.fili-state/` next to the registry file.
+    #[arg(long, global = true, env = "FILI_STATE_DIR")]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "consumed by the plugin run command in Phase 4")
+    )]
+    pub state_dir: Option<PathBuf>,
+
     /// Relevance threshold for filtering [0.0 - 1.0]
     #[arg(long, default_value_t = 0.05)]
     pub threshold: f64,
@@ -143,6 +151,39 @@ mod tests {
             .expect("registry argument exists");
         assert_eq!(registry.get_env(), Some(OsStr::new("FILI_REGISTRY")));
         assert!(registry.is_global_set());
+    }
+
+    #[test]
+    fn state_dir_flag_is_global_with_env() {
+        let command = Cli::command();
+        let state_dir = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "state_dir")
+            .expect("state_dir argument exists");
+        assert_eq!(state_dir.get_env(), Some(OsStr::new("FILI_STATE_DIR")));
+        assert!(state_dir.is_global_set());
+    }
+
+    #[test]
+    fn state_dir_has_no_default() {
+        // Asserted on argument metadata, so an operator's FILI_STATE_DIR cannot skip the check.
+        let command = Cli::command();
+        let state_dir = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "state_dir")
+            .expect("state_dir argument exists");
+        assert!(state_dir.get_default_values().is_empty());
+    }
+
+    #[test]
+    fn state_dir_flag_parses_before_and_after_subcommand() {
+        let before = Cli::try_parse_from(["fili", "--state-dir", "/tmp/s", "watch"])
+            .expect("parses before the subcommand");
+        assert_eq!(before.state_dir, Some(PathBuf::from("/tmp/s")));
+
+        let after = Cli::try_parse_from(["fili", "watch", "--state-dir", "/tmp/s"])
+            .expect("parses after the subcommand");
+        assert_eq!(after.state_dir, Some(PathBuf::from("/tmp/s")));
     }
 
     /// Default values of a `fili consume` argument, from argument metadata.
