@@ -2,33 +2,22 @@
 phase: 03-component-host-runtime
 reviewed: 2026-11-09T00:00:00Z
 depth: standard
-files_reviewed: 20
+files_reviewed: 9
 files_reviewed_list:
-  - src/cli.rs
-  - src/main.rs
-  - src/streaming.rs
-  - src/plugins/mod.rs
-  - src/plugins/host/mod.rs
-  - src/plugins/host/backoff.rs
+  - plugins/README.md
+  - plugins/fault-source/src/lib.rs
   - src/plugins/host/cursor.rs
   - src/plugins/host/engine.rs
-  - src/plugins/host/error.rs
   - src/plugins/host/instance.rs
-  - src/plugins/host/loader.rs
   - src/plugins/host/map.rs
   - src/plugins/host/scheduler.rs
   - src/plugins/host/sink.rs
-  - src/plugins/host/testing.rs
   - src/plugins/host/wasm_tests.rs
-  - plugins/fault-source/src/lib.rs
-  - Cargo.toml
-  - rust-toolchain.toml
-  - plugins/fault-source/Cargo.toml
 findings:
   critical: 0
   warning: 7
-  info: 4
-  total: 11
+  info: 6
+  total: 13
   necessity: 0
 status: issues_found
 ---
@@ -37,51 +26,29 @@ status: issues_found
 
 **Reviewed:** 2026-11-09
 **Depth:** standard
-**Files Reviewed:** 20
+**Files Reviewed:** 9
 **Status:** issues_found
 
 ## Summary
 
-I reviewed the component host runtime: loader preflight, engine and linker, scheduler state machine, cursor store, mapper, sink, CLI and logging wiring, and the fault-source fixture. I also ran `cargo test --offline plugins::host`. The result was 98 passed and 18 ignored; every ignored test needs prebuilt wasm fixtures or a Fluvio cluster.
+This is a re-review of the current source after the fixes for WR-01, WR-03 and WR-06. I read each file and checked every earlier finding against the code as it stands now. I also read `src/plugins/host/mod.rs`, `src/main.rs`, `src/output.rs` and wasmtime 48.0.8 (the version in `Cargo.lock`) where a claim depended on them. I did not run the test suite.
 
-The core threat-model items hold in code:
-- Only registry-enabled components are opened.
-- Foreign imports are rejected before instantiation.
-- Every guest or wasmtime string that reaches `tracing` or a report goes through `clean_guest_text`.
-- Traps, guest errors and task panics are isolated per plugin.
-- The cursor is written atomically, only after the sink returned, with an alias check and a directory lock.
+Fixes confirmed:
+- **WR-01** (memory, items, cursor caps): a 64 MiB per-memory limiter with `trap_on_grow_failure`, a 1000-item cap and a 4096-byte cursor cap are present and unit-tested. Two gaps remain, reported as WR-08 and WR-09.
+- **WR-03** (record key): a 512-byte key bound runs before the key is built, and the key length now counts toward `MAX_RECORD_BYTES`.
+- **WR-06** (sink timeout): the bound now lives in `FluvioSink::send_batch`, starts after the lock is held, and `clear_errors` runs on both failure and expiry. The fix has a side effect, reported as WR-10.
 
-No critical issues were found. The remaining defects are about unbounded guest-controlled resources and a few robustness gaps:
-- Nothing limits guest memory, items per poll, cursor size or key size.
-- A silently failing epoch ticker disables the anti-wedge guarantee.
-- A single oversized record key can wedge a plugin in an infinite duplicate-producing retry loop.
-- Item URL scheme and platform are unvalidated.
-- The sink's timeout path is not cancellation-safe.
-- An empty `--state-dir` resolves to the current directory.
+Still open from the prior report, re-reported under the same id: WR-02, WR-04, WR-05, WR-07, IN-01, IN-02, IN-03, IN-04. The sources behind these (`engine.rs` ticker, `map.rs` URL and platform, `mod.rs` state dir, `output.rs`, `main.rs`, `cursor.rs`) are unchanged in the relevant lines.
 
-Known accepted gaps were not re-reported: guest infinite loop (HOST-06), no cross-poll dedupe (HOST-07), single-partition key assumption, interim `not-configured` fetch and none access token, and the pre-existing clippy warnings.
+New findings are WR-08 to WR-10 and IN-05 to IN-06. No critical issues.
 
 ## Warnings
 
-### WR-01: No resource limits on guest-controlled memory, item count, cursor size or log volume
-
-**File:** `src/plugins/host/instance.rs:95-105`, `src/plugins/host/engine.rs:194-196`, `src/plugins/host/scheduler.rs:367-390`
-**Issue:**
-- The `Store` has no `limiter`, and `Config` sets no memory or table limits. A guest that calls `memory.grow` repeatedly can take up to the wasm32 maximum (4 GiB) per instance, and a rebuilt instance does it again. That is an OOM kill of the whole `fili` process, which defeats "a misbehaving plugin must not take down the host or other plugins". It is separate from the accepted "guest loops forever" gap, because a bounded loop can still exhaust memory.
-- The host also accepts, without cap:
-  - an unbounded `items` list per poll (`map_items` allocates all of it);
-  - an unbounded `next_cursor`, which is base64-encoded, fsync'd and re-read every poll;
-  - unlimited `log` calls, each up to 4096 characters, at `info` level under the default `fili::plugins=info` filter.
-- Both the cursor and the log lines are caller-controlled disk and log volume.
-
-**Fix:** Install a `ResourceLimiter` on every store, for example `StoreLimitsBuilder::new().memory_size(64 << 20).instances(1).tables(1).build()`. Pass it with `store.limiter(|state| &mut state.limits)`, storing the `StoreLimits` in `HostState`. Add caps for items per poll (for example 1000, dropping the rest with a counted warning) and for cursor bytes (for example 64 KiB). A larger cursor should become a poll failure and must not be persisted. Optionally rate-limit guest log lines per instance.
-
 ### WR-02: Epoch ticker thread spawn failure is silently swallowed, which removes the anti-wedge guarantee
 
-**File:** `src/plugins/host/engine.rs:155-164`
-**Issue:** `std::thread::Builder::spawn(...).ok()` discards the spawn error. If the thread cannot start (thread limit, resource exhaustion), `handle` is `None` and the epoch never advances. `epoch_deadline_async_yield_and_update(1)` then never fires, so a spinning guest never yields to tokio and holds a worker thread forever. With few workers, one spinner stalls every plugin and the shutdown path cannot run. The engine module header promises exactly this will not happen, yet `HostEngine::new()` returns `Ok`.
-
-**Fix:** Make `EpochTicker::start` return `wasmtime::Result<Self>` or `io::Result<Self>`, and propagate it from `HostEngine::new` so that `Host::load` returns `HostError::Engine`:
+**File:** `src/plugins/host/engine.rs:196-205`
+**Issue:** `std::thread::Builder::spawn(...).ok()` discards the spawn error. If the thread cannot start, `handle` is `None` and the epoch never advances, so `epoch_deadline_async_yield_and_update(1)` never fires. A spinning guest then never yields to tokio and holds a worker forever, and shutdown cannot drop its future. The module header promises this cannot happen, yet `HostEngine::new()` returns `Ok`.
+**Fix:** Make `EpochTicker::start` return a `Result` and propagate it from `HostEngine::new`, so `Host::load` reports `HostError::Engine`:
 ```rust
 let handle = std::thread::Builder::new()
     .name("fili-epoch-ticker".to_string())
@@ -90,96 +57,88 @@ let handle = std::thread::Builder::new()
 Ok(Self { stop, handle: Some(handle) })
 ```
 
-### WR-03: Record key is guest-controlled, unbounded and not counted in the size cap; one bad record wedges the plugin in a duplicate-producing retry loop
-
-**File:** `src/plugins/host/map.rs:70-89`, `src/plugins/host/scheduler.rs:372-394`
-**Issue:**
-- The size cap `MAX_RECORD_BYTES` checks only the serialized value. The Fluvio record also carries the key `"{platform}:{id}"`, and both parts are guest-controlled. `id` and `platform` are already inside the 1,000,000-byte value, so the key can be nearly as large as the value. A record of about 1.0 MB with a key of about 1.0 MB exceeds the ~1 MiB request limit that the headroom was meant to protect.
-- `FluvioSink::send_batch` then fails with a permanent, record-specific error. The scheduler treats every sink error as transient (`SinkFailed`: back off, keep the instance, keep the cursor).
-- Each retry re-sends the whole batch, including every valid record that precedes the bad one. Those valid records are duplicated on every retry, and the cursor never advances, so the plugin is stuck for good. The wedge itself is bounded by backoff (at most one retry per `max_secs`), but the duplicates grow without limit.
-
-**Fix:**
-- Bound the key and count it in the cap:
-  - drop an item whose `platform.len() + 1 + id.len()` exceeds a small limit (for example 512 bytes), with a new `DropReason::KeyTooLong`;
-  - include `key.len()` in the `MAX_RECORD_BYTES` comparison.
-- Optionally distinguish record-specific permanent sink errors from broker unavailability, so a poison record is dropped instead of retried forever.
-
 ### WR-04: Item URL scheme is not restricted
 
-**File:** `src/plugins/host/map.rs:58-63`
-**Issue:** The mapper comment says "the consumer does no id or url validation, so the host is the only gate", but the gate is only `url::Url::parse(...).is_ok()`. `javascript:alert(1)`, `data:text/html,...`, `file:///etc/passwd` and `ftp:` all pass and are produced to the topic as the item's canonical URL. Any downstream consumer or UI that renders the URL as a link, or fetches it, inherits an attacker-controlled scheme from a (possibly compromised) plugin. The terminal printer sanitizes only control characters.
-
-**Fix:** Accept only `http` and `https`, and optionally require a host:
+**File:** `src/plugins/host/map.rs:77-79`
+**Issue:** The module header says the host is the only gate, but the gate is only `url::Url::parse(&item.url).is_err()`. `javascript:`, `data:`, `file:` and `ftp:` URLs all pass and are produced to the topic as the item's canonical URL. A downstream consumer or UI that renders or fetches the URL inherits an attacker-controlled scheme from a compromised plugin. `valid_ids_are_not_trimmed_or_altered` (line 499) also pins that the stored URL keeps its surrounding spaces even though the parsed form does not, so a stricter consumer can disagree with the host.
+**Fix:**
 ```rust
-match url::Url::parse(&item.url) {
+match url::Url::parse(item.url.trim()) {
     Ok(u) if matches!(u.scheme(), "http" | "https") && u.has_host() => {}
     _ => return Err(DropReason::InvalidUrl),
 }
 ```
-Add a test with `javascript:`, `file:` and `data:` URLs.
+Add tests with `javascript:`, `file:` and `data:` URLs. Decide whether to store the trimmed URL.
 
 ### WR-05: Guest-chosen `platform` can impersonate another plugin or platform, and the key encoding is ambiguous
 
-**File:** `src/plugins/host/map.rs:65-70`
-**Issue:** `platform` is taken verbatim from the guest whenever it is non-blank. A plugin registered as `acme` can emit `platform = "reddit"`. Its records then carry `platform=reddit` in the item and a `reddit:{id}` key. They are indistinguishable from the real reddit plugin's output and can collide with its keys. The host never records which plugin produced an item. The key `"{platform}:{id}"` is also ambiguous: `platform="a", id="b:c"` and `platform="a:b", id="c"` map to the same key.
-
-**Fix:**
-- Decide the policy explicitly. Either force `platform` to the registry alias, or validate it against `[a-z0-9_-]` (as aliases are) and reject or normalize anything else.
-- Add the producing plugin to the key or to a header, for example `{plugin}:{platform}:{id}`, or percent-encode `id` and `platform` before joining.
-
-### WR-06: `send_batch` is not cancellation-safe when the sink timeout drops it mid-flight
-
-**File:** `src/plugins/host/sink.rs:76-93`, `src/plugins/host/scheduler.rs:222`
-**Issue:** `send_records` wraps `send_batch` in `tokio::time::timeout`. On timeout the future is dropped between `send` calls or during `flush`, so:
-- the `clear_errors()` call that the doc comment says "every failure" performs never runs on this path, and Fluvio 0.50.1 keeps returning the stored error until it is cleared;
-- records already enqueued by earlier `producer.send` calls stay in the producer's accumulator and can be delivered later, while the scheduler re-polls and re-sends the same batch (extra duplicates beyond HOST-07's cross-poll case).
-
-The stale error self-heals only because the next batch hits it, fails once more and then clears it. That costs an extra backoff cycle for every plugin sharing the producer. Time spent waiting on the producer `Mutex` also counts against the 60 s, so a healthy plugin can be reported as `SinkFailed` because another plugin's flush was slow.
-
-**Fix:** Do the bounding inside `send_batch`: apply the timeout around the send and flush while holding the lock, and on expiry call `producer.clear_errors().await` before returning `SinkError("send timed out")`. Keep the outer timeout only as a backstop. Starting the lock-wait timer after the lock is acquired would also stop one slow plugin from failing the others.
+**File:** `src/plugins/host/map.rs:81-91`
+**Issue:** A non-blank guest `platform` is used verbatim, so a plugin registered as `acme` can emit `platform = "reddit"`. Its records carry `platform=reddit` and a `reddit:{id}` key, indistinguishable from the real reddit plugin and able to collide with its keys. The host never records which plugin produced an item. The key `"{platform}:{id}"` is also ambiguous: `("a", "b:c")` and `("a:b", "c")` both produce `a:b:c`.
+**Fix:** Either force `platform` to the registry alias or validate it against `[a-z0-9_-]`. Make the key unambiguous: include the plugin (`{plugin}:{platform}:{id}`), or percent-encode `platform` and `id` before joining.
 
 ### WR-07: An empty `--state-dir` / `FILI_STATE_DIR` silently resolves to the current directory
 
-**File:** `src/plugins/host/mod.rs:52-57` (consumed by `src/plugins/host/cursor.rs:55-66`)
-**Issue:** `resolve_state_dir` uses the flag "exactly as given". For `""`, `std::fs::create_dir_all("")` returns `Ok(())` (verified with rustc), and `"".join(".lock")` is `.lock`. The lock file and every `<alias>.json` cursor file would be written into the process's working directory, mixed with unrelated files. The existing tests cover a relative path but not the empty path.
+**File:** `src/plugins/host/mod.rs:52-57` (consumed by `src/plugins/host/cursor.rs:59-70`)
+**Issue:** `resolve_state_dir` uses the flag as given. For an empty path, `create_dir_all("")` succeeds and `"".join(".lock")` is `.lock`, so the lock file and every `<alias>.json` land in the process working directory. The tests in `mod.rs` cover a relative path but not the empty path.
+**Fix:** Reject an empty path in `resolve_state_dir` or `CursorStore::open` as `HostError::StateDir` ("state directory must not be empty"), or require a non-empty value in clap.
 
-**Fix:** Reject an empty path in `resolve_state_dir` or in `CursorStore::open`. For example, treat `Some(p) if p.as_os_str().is_empty()` as a `HostError::StateDir` ("state directory must not be empty"). Alternatively, filter it out in clap with a `value_parser` that requires a non-empty value.
+### WR-08: The per-poll item cap does not bound host memory: list lifting copies every item before `map_items` runs
+
+**File:** `src/plugins/host/map.rs:120-132`, `src/plugins/host/instance.rs:125`
+**Issue:** `MAX_ITEMS_PER_POLL` is applied in `map_items`, after wasmtime has already lifted the whole `list<item>` into `Vec<WitItem>`. Lifting copies each string out of guest memory (`WasmStr`, then an owned `String`), and the canonical ABI does not require different items to point at different bytes. A guest with the 64 MiB memory cap can build a list of several hundred thousand 96-byte item records whose strings all alias one large string. The host then allocates the product of the two, which can be hundreds of GiB. The 64 MiB guest cap does not bound host-side memory, so the OOM-of-the-whole-process scenario that WR-01 targeted is still reachable. The 1000-item and 1,000,000-byte-record caps run too late to help.
+**Fix:** Bound the amount lifted. Options:
+- Change the WIT `poll-response.items` to a bounded shape, or declare `items` as `WasmList<Item>` in a hand-written binding, so the host reads at most `MAX_ITEMS_PER_POLL` elements.
+- Alternatively, shrink the per-instance memory limit far enough that aliasing cannot amplify to a harmful size, and say plainly in `plugins/README.md` that host memory is not bounded by the guest cap.
+
+### WR-09: The "64 MiB per instance" ceiling is per memory, so one instance can hold up to 512 MiB
+
+**File:** `src/plugins/host/engine.rs:64-92`, `plugins/README.md:222-226`, `plugins/README.md:282`
+**Issue:** `StoreLimitsBuilder::memory_size` limits each linear memory, not the sum. `MAX_MEMORIES = 8` lets a hand-built component use 8 x 64 MiB = 512 MiB per instance. The constant's doc comment ("one instance's linear memory"), the README ("a fixed 64 MiB memory ceiling" per instance) and the new tests all assume a total. `memory_growing(0, GUEST_MEMORY_LIMIT_BYTES, ...)` tests only a single memory, so the gap is not caught. A rebuild loop also gets a fresh 512 MiB each time.
+**Fix:** Either lower `MAX_MEMORIES` to the real need (cargo-component output typically uses one or two) and compute the cap as `GUEST_MEMORY_LIMIT_BYTES / MAX_MEMORIES`, or enforce a total in a small custom `ResourceLimiter` that sums grown memory across calls. Then correct the doc comment and the README so they state what is enforced.
+
+### WR-10: Sink sends are never raced against shutdown and lock waiting is unbounded, so shutdown can take N x 60 s
+
+**File:** `src/plugins/host/scheduler.rs:211-230` and `:390-392`, `src/plugins/host/sink.rs:87-111`
+**Issue:** The WR-06 fix moved the timeout inside `send_batch` and starts it after the producer lock is held. The scheduler no longer wraps `send_records` in any timeout, and the call is deliberately not raced against `shutdown` ("a stop must not split send from persist"). `self.producer.lock().await` has no bound. With a stuck broker, plugin A holds the lock for 60 s and then fails, plugin B acquires it and holds it for its own 60 s, and so on. Every plugin that was already inside `send_batch` when `shutdown` fired must run its full sequence, so `Host::run` (which joins all tasks with no grace period) can take about (number of plugins x 60 s) to return. Before the fix, the outer timeout covered lock waiting and capped each plugin at 60 s. The README's "cancelling the host returns within seconds" claim is true only for a spinning guest, not for a slow sink.
+**Fix:** Pick the intent and enforce it. For example, add an overall deadline for the lock acquisition (`tokio::time::timeout(LOCK_WAIT, self.producer.lock())`, returning `SinkError("producer busy")`), and document the worst-case shutdown time in the README. Alternatively, race the lock acquisition (not the send) against `shutdown` and return early so no new send starts after cancellation.
 
 ## Info
 
 ### IN-01: `clean_guest_text` leaves Unicode line separators and bidi controls in place
 
-**File:** `src/plugins/host/engine.rs:71-81` (relies on `src/output.rs:49-57`)
-**Issue:** The sanitizer drops only `char::is_control()` characters (Cc). U+2028 and U+2029 (category Zl and Zp), bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and zero-width characters pass through. Some log viewers and terminals treat U+2028 as a line break, so a guest can forge a log line. A bidi override can visually reorder an error message. Escape sequences and CR/LF, which are the main concern, are handled.
-**Fix:** Also map U+2028 and U+2029 to a space, and drop `\u{200B}-\u{200F}`, `\u{202A}-\u{202E}` and `\u{2066}-\u{2069}`. Do it in `clean_guest_text` if changing the shared `sanitize_for_terminal` is out of scope.
+**File:** `src/plugins/host/engine.rs:104-114` (relies on `src/output.rs:49-57`)
+**Issue:** Only `char::is_control()` characters (Cc) are removed. U+2028, U+2029, bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and zero-width characters pass through, so a guest can forge a log line in a viewer that treats U+2028 as a line break or reorder text visually.
+**Fix:** In `clean_guest_text`, map U+2028 and U+2029 to a space and drop the bidi and zero-width ranges.
 
 ### IN-02: Invalid `RUST_LOG` is discarded silently and per-item drop warnings are unbounded
 
-**File:** `src/main.rs:63-69`, `src/plugins/host/map.rs:100-113`
-**Issue:**
-- `log_filter` falls back to the default for an unparsable `RUST_LOG` without telling the operator, so a typo (`fili::plugin=debug`) looks like debug logging silently doing nothing.
-- `map_items` emits one `warn!` per dropped item. A plugin returning many bad items makes one log line per item on every poll.
-**Fix:**
-- Print a one-line stderr note when `RUST_LOG` is non-blank but invalid.
-- Aggregate per-reason drop counts into a single warning per poll (counts only, no content).
+**File:** `src/main.rs:63-69`, `src/plugins/host/map.rs:135-147`
+**Issue:** `log_filter` falls back to the default for an unparsable `RUST_LOG` without telling the operator. `map_items` still emits one `warn!` per dropped item, up to `MAX_ITEMS_PER_POLL` lines per poll, repeated every poll.
+**Fix:** Print a one-line stderr note for a non-blank invalid `RUST_LOG`. Aggregate per-reason drop counts into one warning per poll (counts only).
 
 ### IN-03: The state-file reader treats a missing `cursor` key as a first poll
 
-**File:** `src/plugins/host/cursor.rs:28-33, 131-137`
-**Issue:** `cursor: Option<String>` deserializes a state file with no `cursor` key (for example `{"version":1,"plugin":"a"}` left by manual editing or a buggy tool) as `None`. That silently resets the plugin to a first poll, which the module contract says never happens automatically ("never reset automatically"). A truncated file is still correctly rejected as corrupt.
-**Fix:** Require the key to be present. Use a `#[serde(deserialize_with = ...)]` that rejects a missing field, or deserialize into `Option<Option<String>>` and treat the outer `None` as `corrupt("missing cursor")`.
+**File:** `src/plugins/host/cursor.rs:32-37`, `:135-141`
+**Issue:** `cursor: Option<String>` makes serde deserialize `{"version":1,"plugin":"a"}` as `cursor: None`, which resets the plugin to a first poll. The module contract says a bad file is never reset automatically.
+**Fix:** Require the key: deserialize to `Option<Option<String>>` (or use `deserialize_with`) and treat a missing key as `corrupt("missing cursor")`.
 
 ### IN-04: The core isolation tests are all `#[ignore]` and depend on a manual fixture build
 
-**File:** `src/plugins/host/wasm_tests.rs:33-447`, `src/plugins/host/loader.rs:440-552`
-**Issue:** Every real-wasm test is ignored, and no CI workflow is present in the repository to run them with the prebuilt fixtures (cargo-component 0.21.1, wasm-tools 1.263.0, per `plugins/README.md`). Real-wasm behaviour is therefore unverified by a plain `cargo test`:
-- trap isolation and rebuild;
-- the spinning-guest anti-wedge;
-- WrongWorld classification;
-- the end-to-end cursor round trip.
+**File:** `src/plugins/host/wasm_tests.rs:33-498`
+**Issue:** Every real-wasm test, including the new `wasm_guest_memory_growth_past_the_cap_is_refused_and_isolated`, is ignored, and the repository has no `.github/workflows` directory to run them. A plain `cargo test` verifies the limiter only against `StoreLimits` directly (`engine.rs` tests) and never against a real guest `memory.grow`. `wasm_spinning_guest_...` also depends on 2.5 s of wall time.
+**Fix:** Add a CI job that builds the three fixtures and runs `cargo test -- --ignored wasm_`, or commit the small fixture `.wasm` files. Give the spin test slack.
 
-The default suite covers the same rules only against fakes. The one real-clock test (`wasm_spinning_guest...`) also depends on 2.5 s of wall time, so it can flake on a loaded runner.
-**Fix:** Add a CI job that builds the three fixtures and runs `cargo test -- --ignored plugins::host`. Alternatively, commit the small fixture `.wasm` files. Give the spin test slack, or assert on poll counts after an explicit quiescence point.
+### IN-05: Items over the per-poll cap are lost permanently while an oversize cursor disables the plugin
+
+**File:** `src/plugins/host/map.rs:120-132`, `src/plugins/host/scheduler.rs:367-384`
+**Issue:** An over-cap cursor is treated as a plugin fault and nothing is persisted. An over-cap item list, by contrast, is truncated and the cursor still advances, so a plugin that returns 1001 items loses the last item for good with only a `warn!`. The two caps protect the same boundary but fail in opposite ways. The README documents the behavior ("a plugin should page its own results"), so this is a design choice, not a defect in the code as written.
+**Fix:** Consider the same fault policy as the cursor cap (fail the poll without advancing the cursor), or at least surface the loss in `PluginReport` as its own counter instead of folding it into `dropped`.
+
+### IN-06: Misleading variable name in the `grow` fixture mode
+
+**File:** `plugins/fault-source/src/lib.rs:205-208`
+**Issue:** `sum` is the number of touched pages (`.count()`), not a sum, and the message reads "({sum} pages)". The `for i in (0..block.len()).step_by(4096)` loop is also an index loop that clippy flags in other crates.
+**Fix:** Rename `sum` to `pages`, and iterate with `block.iter_mut().step_by(4096)` setting each element to 1.
 
 ---
 
