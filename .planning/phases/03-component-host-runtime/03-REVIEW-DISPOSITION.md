@@ -55,9 +55,21 @@ findings:
     severity: info
     disposition: open
     title: "Misleading variable name in the `grow` fixture mode"
+  - id: WR-01
+    severity: warning
+    disposition: fixed
+    title: "No resource limits on guest-controlled memory, item count, cursor size or log volume (fixed caps added: 64 MiB memory, 1000 items, 4096 cursor bytes; log rate limit and configurable per-plugin limits remain v2 HOST-06)"
+  - id: WR-03
+    severity: warning
+    disposition: fixed
+    title: "Record key is guest-controlled, unbounded and not counted in the size cap; one bad record wedges the plugin in a duplicate-producing retry loop"
+  - id: WR-06
+    severity: warning
+    disposition: fixed
+    title: "`send_batch` is not cancellation-safe when the sink timeout drops it mid-flight"
 open: 13
-total: 13
-recorded: 2026-11-09T17:38:21.058Z
+total: 16
+recorded: 2026-11-09T17:38:57.640Z
 ---
 
 # Phase 03: Code Review Disposition
@@ -77,6 +89,9 @@ recorded: 2026-11-09T17:38:21.058Z
 | IN-04 | info | open | - |
 | IN-05 | info | open | - |
 | IN-06 | info | open | - |
+| WR-01 | warning | fixed | fixed in 2e7c091 (guest memory, item-count and cursor-size caps); confirmed by the re-review in 03-REVIEW.md (not in the current review) |
+| WR-03 | warning | fixed | fixed in b7c2324 (record key bounded and counted in the record cap); confirmed by the re-review in 03-REVIEW.md (not in the current review) |
+| WR-06 | warning | fixed | fixed in 60d65ec (sink send bounded inside FluvioSink, errors cleared on timeout); confirmed by the re-review in 03-REVIEW.md (not in the current review) |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
