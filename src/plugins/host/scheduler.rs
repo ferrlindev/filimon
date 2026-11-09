@@ -677,4 +677,418 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "{text:?}");
         assert!(!text.contains('\n'), "{text:?}");
     }
+
+    // ── Loop behaviour under paused time ──────────────────────────────────────
+
+    use tempfile::TempDir;
+    use tokio::time::Instant;
+
+    use crate::plugins::host::testing::{
+        FakeEvent, FakeFactory, FakeStep, FlakySink, LogCapture, run_for, spec, wit_item,
+    };
+    use crate::plugins::host::sink::VecSink;
+
+    fn store() -> (TempDir, Arc<CursorStore>) {
+        let dir = TempDir::new().expect("tempdir");
+        let cursors = Arc::new(CursorStore::open(dir.path()).expect("cursor store"));
+        (dir, cursors)
+    }
+
+    fn err_transient() -> FakeStep {
+        FakeStep::PollErr(PollError::Transient("later".to_string()))
+    }
+
+    /// `(alias, failing step, expected log substring)`.
+    type LogCase = (&'static str, fn() -> FakeStep, &'static str);
+
+    /// Interval 300 s, backoff 60 s / 3600 s / x2.
+    fn default_spec(name: &str) -> PluginSpec {
+        spec(name, 300, 60, 3600, 2.0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_transient_backs_off_then_returns_to_interval() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            err_transient(),
+            err_transient(),
+            FakeStep::poll_ok(None),
+            FakeStep::poll_ok(None),
+        ]));
+        let start = Instant::now();
+        let report = run_for(
+            default_spec("t"),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(500),
+        )
+        .await;
+        assert_eq!(factory.poll_offsets(start), vec![0, 60, 180, 480]);
+        assert_eq!(report.failures, 2);
+        assert_eq!(report.polls, 2);
+        assert_eq!(report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_rate_limited_waits_the_larger_of_retry_after_and_step() {
+        for (retry_after, duration, expected) in [(200, 250, 200), (100_000, 3700, 3600)] {
+            let (_dir, cursors) = store();
+            let factory = Arc::new(FakeFactory::new(vec![
+                FakeStep::InitOk,
+                FakeStep::PollErr(PollError::RateLimited(Some(retry_after))),
+                FakeStep::poll_ok(None),
+            ]));
+            let start = Instant::now();
+            run_for(
+                default_spec("rl"),
+                Arc::clone(&factory),
+                Arc::new(VecSink::default()),
+                cursors,
+                secs(duration),
+            )
+            .await;
+            assert_eq!(factory.poll_offsets(start), vec![0, expected]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_success_resets_backoff_fully() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            err_transient(),
+            FakeStep::poll_ok(None),
+            err_transient(),
+            FakeStep::poll_ok(None),
+        ]));
+        let start = Instant::now();
+        run_for(
+            default_spec("r"),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(450),
+        )
+        .await;
+        assert_eq!(factory.poll_offsets(start), vec![0, 60, 360, 420]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_auth_required_is_backed_off_not_disabled() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollErr(PollError::AuthRequired),
+            FakeStep::poll_ok(None),
+        ]));
+        let start = Instant::now();
+        let report = run_for(
+            default_spec("a"),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(100),
+        )
+        .await;
+        assert_eq!(factory.poll_offsets(start), vec![0, 60]);
+        assert_eq!(report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_trap_rebuilds_instance_and_reinits_after_backoff() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::poll_ok(Some(vec![1])),
+            FakeStep::Trap("wasm trap: unreachable".to_string()),
+            FakeStep::InitOk,
+            FakeStep::poll_ok(None),
+        ]));
+        let start = Instant::now();
+        let report = run_for(
+            spec("t", 60, 10, 3600, 2.0),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(100),
+        )
+        .await;
+        assert_eq!(factory.builds(), 2);
+        assert_eq!(factory.inits(), 2);
+        assert_eq!(factory.poll_offsets(start), vec![0, 60, 70]);
+        assert_eq!(factory.poll_cursors()[2], Some(vec![1]));
+        assert_eq!(report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_init_transient_rebuilds_after_backoff() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitErr(PollError::Transient("not ready".to_string())),
+            FakeStep::InitOk,
+            FakeStep::poll_ok(None),
+        ]));
+        let start = Instant::now();
+        let report = run_for(
+            default_spec("i"),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(100),
+        )
+        .await;
+        assert_eq!(factory.builds(), 2);
+        assert_eq!(factory.inits(), 2);
+        assert_eq!(factory.poll_offsets(start), vec![60]);
+        assert_eq!(report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_config_error_in_init_disables() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitErr(PollError::Config(
+            "bad setting".to_string(),
+        ))]));
+        let report = run_for(
+            default_spec("c"),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(100),
+        )
+        .await;
+        let reason = report.disabled.expect("disabled");
+        assert!(reason.contains("bad setting"), "{reason}");
+        assert_eq!(report.polls, 0);
+        assert_eq!(factory.builds(), 1);
+        assert!(factory.poll_cursors().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_fatal_poll_disables_only_that_plugin() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(VecSink::default());
+        let bad = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollErr(PollError::Fatal("dead".to_string())),
+        ]));
+        let good = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let start = Instant::now();
+        let (bad_report, good_report) = tokio::join!(
+            run_for(
+                spec("bad", 60, 60, 3600, 2.0),
+                Arc::clone(&bad),
+                Arc::clone(&sink),
+                Arc::clone(&cursors),
+                secs(200),
+            ),
+            run_for(
+                spec("good", 60, 60, 3600, 2.0),
+                Arc::clone(&good),
+                Arc::clone(&sink),
+                Arc::clone(&cursors),
+                secs(200),
+            ),
+        );
+        assert!(bad_report.disabled.is_some());
+        assert_eq!(bad.poll_offsets(start), vec![0]);
+        assert_eq!(good.poll_offsets(start), vec![0, 60, 120, 180]);
+        assert_eq!(good_report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_two_plugins_back_off_independently() {
+        let (_dir, cursors) = store();
+        let sink = Arc::new(VecSink::default());
+        let mut script = vec![FakeStep::InitOk];
+        script.extend((0..10).map(|_| err_transient()));
+        let a = Arc::new(FakeFactory::new(script));
+        let b = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let start = Instant::now();
+        let _ = tokio::join!(
+            run_for(
+                spec("a", 60, 60, 3600, 2.0),
+                Arc::clone(&a),
+                Arc::clone(&sink),
+                Arc::clone(&cursors),
+                secs(450),
+            ),
+            run_for(
+                spec("b", 60, 60, 3600, 2.0),
+                Arc::clone(&b),
+                Arc::clone(&sink),
+                Arc::clone(&cursors),
+                secs(450),
+            ),
+        );
+        assert_eq!(a.poll_offsets(start), vec![0, 60, 180, 420]);
+        assert_eq!(
+            b.poll_offsets(start),
+            vec![0, 60, 120, 180, 240, 300, 360, 420]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_sink_failure_backs_off_and_repolls_same_cursor() {
+        let (logs, _guard) = LogCapture::start();
+        let (_dir, cursors) = store();
+        let sink = Arc::new(FlakySink::new(1));
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items: vec![wit_item("a")],
+                next_cursor: Some(vec![1]),
+                delay: Duration::ZERO,
+            },
+            FakeStep::PollOk {
+                items: vec![wit_item("b")],
+                next_cursor: Some(vec![2]),
+                delay: Duration::ZERO,
+            },
+        ]));
+        let start = Instant::now();
+        let report = run_for(
+            default_spec("s"),
+            Arc::clone(&factory),
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+        assert_eq!(factory.poll_offsets(start), vec![0, 60]);
+        assert_eq!(factory.poll_cursors(), vec![None, None]);
+        assert_eq!(sink.calls(), 2);
+        assert_eq!(sink.records().len(), 1);
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.items_sent, 1);
+        assert_eq!(cursors.read("s").expect("read"), Some(vec![2]));
+        assert!(logs.text().contains("item sink failed"), "{}", logs.text());
+
+        // A sink that never recovers never moves the persisted cursor.
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items: vec![wit_item("a")],
+                next_cursor: Some(vec![1]),
+                delay: Duration::ZERO,
+            },
+        ]));
+        run_for(
+            default_spec("s2"),
+            Arc::clone(&factory),
+            Arc::new(FlakySink::new(usize::MAX)),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+        assert_eq!(cursors.read("s2").expect("read"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_polls_are_fixed_delay_and_never_overlap() {
+        let (_dir, cursors) = store();
+        let slow = || FakeStep::PollOk {
+            items: vec![],
+            next_cursor: None,
+            delay: secs(10),
+        };
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            slow(),
+            slow(),
+            slow(),
+        ]));
+        let start = Instant::now();
+        run_for(
+            spec("f", 60, 60, 3600, 2.0),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(155),
+        )
+        .await;
+        assert_eq!(factory.poll_offsets(start), vec![0, 70, 140]);
+
+        let polls: Vec<(Instant, Instant)> = factory
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                FakeEvent::Poll { started, ended, .. } => Some((started, ended)),
+                _ => None,
+            })
+            .collect();
+        for pair in polls.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "polls overlapped");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_shutdown_during_backoff_returns_promptly() {
+        let (_dir, cursors) = store();
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk, err_transient()]));
+        let token = CancellationToken::new();
+        let start = Instant::now();
+        let handle = tokio::spawn(run_plugin(
+            default_spec("p"),
+            factory,
+            Arc::new(VecSink::default()),
+            cursors,
+            token.clone(),
+        ));
+        tokio::time::sleep(secs(5)).await;
+        token.cancel();
+        let report = handle.await.expect("plugin task");
+        assert!(start.elapsed() < secs(10), "waited out the backoff");
+        assert_eq!(report.disabled, None);
+        assert_eq!(report.failures, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_logs_name_the_plugin_on_backoff_trap_and_disable() {
+        let (logs, _guard) = LogCapture::start();
+        let cases: [LogCase; 3] = [
+            (
+                "lt",
+                || FakeStep::PollErr(PollError::Transient("flaky\u{1b}[31m text".to_string())),
+                "backing off",
+            ),
+            (
+                "lp",
+                || FakeStep::Trap("trap\u{1b}[2J message".to_string()),
+                "backing off",
+            ),
+            (
+                "lf",
+                || FakeStep::PollErr(PollError::Fatal("dead\u{1b}[0m".to_string())),
+                "disabled until fili restarts",
+            ),
+        ];
+        for (alias, make_step, _) in &cases {
+            let (_dir, cursors) = store();
+            run_for(
+                default_spec(alias),
+                Arc::new(FakeFactory::new(vec![FakeStep::InitOk, make_step()])),
+                Arc::new(VecSink::default()),
+                cursors,
+                secs(10),
+            )
+            .await;
+        }
+
+        let text = logs.text();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        for (alias, _, needle) in &cases {
+            let line = text
+                .lines()
+                .find(|l| l.contains(&format!("plugin={alias}")) && l.contains(needle))
+                .unwrap_or_else(|| panic!("no `{needle}` line for {alias} in:\n{text}"));
+            assert!(
+                line.contains("fili::plugins::host::scheduler"),
+                "wrong target: {line}"
+            );
+        }
+    }
 }
