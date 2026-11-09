@@ -87,7 +87,30 @@ Plans:
   2. A test source component is polled at the interval set in its TOML, and its items appear in a Fluvio topic as `SourceItem` records. After the host is stopped and restarted, polling resumes from the last persisted cursor instead of starting over.
   3. When a component returns an error or reports rate limiting (HTTP 429), the host backs it off using the backoff settings in that plugin's TOML and polls it again after the backoff window.
   4. A component that traps or errors is logged with its plugin name and backed off, while the other plugins keep polling and the `fili` process stays up.
-**Plans**: TBD
+**Plans:** 10 plans
+
+Plans:
+**Wave 1**
+- [ ] 03-01-PLAN.md — Consent gate: the user removes the machine-local `rustup override` (human action; wasmtime 48 LTS needs Rust >= 1.95) (HOST-01..HOST-05, build prerequisite)
+- [ ] 03-02-PLAN.md — `plugins/fault-source` fault-injection fixture component (ok, rate-limited, transient, auth-required, fatal, config, init-fatal, trap, spin) (HOST-03, HOST-05)
+
+**Wave 2** *(blocked on 03-01)*
+- [ ] 03-03-PLAN.md — Root `rust-toolchain.toml` 1.96.0, `rust-version` 1.95, wasmtime 48 / base64 / tokio-util, nested 1.85.0 SmartModule pins proven by `smdk build`, README prerequisites, `.fili-state/` ignore (HOST-01..HOST-05, build prerequisite)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 03-04-PLAN.md — Tracer: a registry-listed stub source is loaded, polled, mapped, produced to a sink and its cursor persisted atomically through every layer; restart resumes from the persisted cursor (HOST-01, HOST-02, HOST-04)
+- [ ] 03-05-PLAN.md — `--state-dir` / `FILI_STATE_DIR` global flag and a stderr tracing subscriber with the corrected `fili::plugins=info` default filter (HOST-02, HOST-05)
+
+**Wave 4** *(blocked on 03-04)*
+- [ ] 03-06-PLAN.md — Pure backoff arithmetic and the outcome-to-action state machine (D-01..D-04), scheduler behaviour under paused time with a fake instance factory (HOST-02, HOST-03, HOST-05)
+- [ ] 03-07-PLAN.md — Registry-only loading proven, fetcher components loaded against the fetcher world, WASI and foreign imports rejected with named errors, wrong-world detection (HOST-01)
+- [ ] 03-08-PLAN.md — Item validation and mapping (drop with content-free warnings, size cap, key `{platform}:{id}`), `FluvioSink`, `TypedProducer::clear_errors`, scratch-topic live tests (HOST-04)
+
+**Wave 5** *(blocked on 03-04 and 03-06)*
+- [ ] 03-09-PLAN.md — Cursor store hardening (versioned file, plugin and version checks, single-instance lock) and the commit-after-flush, corrupt-file and persist-failure policies proven in the scheduler (HOST-02)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [ ] 03-10-PLAN.md — Real-wasm isolation, backoff, disable, panic and spinner tests, the live stub-to-Fluvio restart test, and the `## Host behavior` documentation (HOST-02, HOST-03, HOST-04, HOST-05)
 
 ### Phase 4: Plugin CLI
 **Goal**: Users can inspect, validate, try, and run registered plugins from `fili` without writing code
