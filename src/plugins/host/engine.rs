@@ -137,6 +137,10 @@ impl HostState {
     }
 
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "Phase 5: the HTTP import names the calling plugin for allowlist checks"
+    )]
     pub fn plugin(&self) -> &str {
         &self.plugin
     }

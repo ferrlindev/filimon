@@ -2,8 +2,9 @@
 // plugins/host/mod.rs - The component host runtime
 //
 // Library-style entry points: `Host::load` opens the registry's enabled
-// components, `Host::run` polls each on its own task until the shutdown token
-// fires. Phase 4 owns the CLI surface; nothing here adds a subcommand.
+// components, `Host::run_with_abort` polls each on its own task until the
+// shutdown token fires (the abort token stops it at once). `fili run`
+// (commands/run.rs) is its caller; nothing here adds a subcommand.
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod backoff;
@@ -90,6 +91,13 @@ pub struct Host {
 
 /// What a host run did.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the loaded and failed lists are read by library callers and tests; `fili run` prints the Host accessors before polling"
+    )
+)]
 pub struct HostReport {
     pub loaded_sources: Vec<String>,
     pub loaded_fetchers: Vec<String>,
@@ -158,6 +166,13 @@ impl Host {
 
     /// Sets how long tasks get to stop after shutdown before they are aborted.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "tests shorten the grace; `fili run` uses DEFAULT_SHUTDOWN_GRACE"
+        )
+    )]
     pub fn with_shutdown_grace(mut self, grace: Duration) -> Self {
         self.shutdown_grace = grace;
         self
@@ -167,6 +182,13 @@ impl Host {
     /// task disables itself. A panic in one task is reported for that plugin
     /// only. After `shutdown` the tasks get the shutdown grace, then the ones
     /// still running are aborted (see [`supervise`]).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the library entry point used by tests; `fili run` calls run_with_abort"
+        )
+    )]
     pub async fn run<S: ItemSink>(self, sink: Arc<S>, shutdown: CancellationToken) -> HostReport {
         self.run_with_abort(sink, shutdown, CancellationToken::new())
             .await

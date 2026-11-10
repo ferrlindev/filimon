@@ -169,9 +169,10 @@ A value that holds `'` together with `$` or a backslash cannot be written in
 
 The component host (`src/plugins/host/`) loads plugins from the registry, polls
 each enabled source on its own task, turns what they return into `SourceItem`
-records, produces those to Fluvio and remembers where each plugin stopped. It is
-a library in this phase: `Host::load` and `Host::run`. The `fili` command that
-starts it arrives in Phase 4, which also reads `--state-dir`.
+records, produces those to Fluvio and remembers where each plugin stopped.
+`fili run` starts it, and `fili plugins list`, `check` and `run-once` inspect
+and try plugins without running it (see [Plugin CLI](#plugin-cli)).
+`--state-dir` and `--registry` apply to all of them.
 
 ### Loading
 
@@ -203,6 +204,12 @@ starts it arrives in Phase 4, which also reads `--state-dir`.
 - There is no jitter. The backoff window is not compared with the poll
   interval, so it can be shorter than `poll_interval_secs` (a locked decision,
   D-02).
+- Stopping is bounded. After Ctrl-C or SIGTERM the host waits up to 10 seconds
+  for in-flight sends to finish, then aborts the tasks still running and
+  reports each as `aborted at shutdown`. A second signal during that wait
+  aborts at once. An aborted send may replay its last batch on the next start,
+  because the cursor is written only after the send (at-least-once). A guest
+  that spins inside a call is still dropped promptly when the host stops.
 
 ### Failures
 
@@ -250,6 +257,11 @@ starts it arrives in Phase 4, which also reads `--state-dir`.
   it. To reset a plugin's cursor, stop `fili` and delete its file.
 - A `.lock` file in the state directory is held for the host's lifetime, so two
   `fili` processes cannot share one state directory.
+- Each source also has `<state dir>/<alias>.status.json` with `version`,
+  `plugin`, `at` (RFC 3339, UTC), `ok`, `error` and `items`. The scheduler
+  writes it after every cycle, separately from the cursor file, so a status
+  write can never touch the cursor. `fili plugins list` reads it without taking
+  the lock, which is why it works while `fili run` is up.
 
 ### Items
 
@@ -284,15 +296,18 @@ of control characters and clipped.
   deferred (v2 HOST-06), and there is no CPU limit at all. A guest can still
   log without a rate limit.
 - A guest that loops forever is never terminated while the host runs. It does
-  not block other plugins or shutdown: cancelling the host returns within
-  seconds because the stuck call is dropped. But the spinning plugin itself
-  stays stuck inside its poll and is never polled again.
+  not block other plugins or shutdown: when the host stops, the stuck call is
+  dropped at once. A stuck broker is bounded the same way: the host waits at
+  most 10 seconds for in-flight sends, then aborts them (a second signal aborts
+  at once), and an aborted send may replay its batch on the next start. But the
+  spinning plugin itself stays stuck inside its poll and is never polled again.
 - No dedupe across polls (v2 HOST-07). A plugin that returns the same item twice
   produces it twice, and a replay after a crash can duplicate the last batch.
 - `timeout_secs` and `allowlist` are read from the registry but only enforced
   when real fetch routing lands, not yet.
-- The last poll's status is not persisted. The state file is versioned and
-  tolerant of unknown keys so Phase 4 can add it.
+- The last poll's status is kept in a separate file, `<alias>.status.json`,
+  which only `fili plugins list` reads (see Cursor state). It describes the
+  most recent cycle only; there is no history.
 
 ### Running the host tests
 
@@ -315,6 +330,70 @@ when a test fails. It never touches `filimon-social-items` or the other real
 topics. Group 3 also needs the `stub-source` fixture. Each group filter is a
 single substring on purpose: libtest ORs several filters, so adding a path
 filter beside `wasm_` or `live_` would run the other group as well.
+
+## Plugin CLI
+
+All of these read the registry (`--registry <path>`, default `filimon.toml`, or
+`FILI_REGISTRY`) and, where they touch state, the state directory
+(`--state-dir <path>`, default `.fili-state/` next to the registry, or
+`FILI_STATE_DIR`). Both flags work before or after the subcommand. An empty or
+blank `--state-dir` is a usage error. Exit codes: 0 success, 1 failure, 2 usage
+error (an unknown flag, a missing name). The `fili plugins` commands and
+`fili run` print no banner, so stdout holds only what the command wrote.
+
+### `fili plugins list [--json]`
+
+One row per registered plugin, sources first and then fetchers, each in name
+order: `NAME`, `KIND`, `ENABLED`, `FETCHER` and `LAST POLL`. `LAST POLL` is the
+status file's time and outcome (`ok (3 items)` or `error: <text>`), `-` for a
+source that has not been polled yet, and `n/a` for a fetcher. A status file that
+cannot be read shows as `unreadable (...)`. `--json` prints one compact JSON
+array: `name`, `kind`, `enabled`, `fetcher` and a `last_poll` object with
+`state` (`never`, `not-applicable`, `unreadable`, `ok` or `error`), `at`,
+`items` and `error`. `list` loads no component and no secret, never takes the
+state-directory lock and creates nothing, so it works while `fili run` is up.
+
+### `fili plugins check <name>`
+
+Validates one plugin without polling it: the component is compiled and checked
+against its WIT world with the host's own preflight, and the plugin's TOML and
+secrets go through the same loader as a run (only secret names are printed,
+never values). `init` and `poll` are never called. A disabled source has its
+component checked and its config skipped; a fetcher has no config file. The
+result is a short summary on stdout, any diagnostics on stderr, and exit 1 when
+a part failed.
+
+### `fili plugins run-once <name> [--produce] [--json]`
+
+Polls one enabled source once and prints the items it returned. It is a dry run
+by default: it starts from the saved cursor, reads it without the lock, sends
+nothing, saves nothing and does not create the state directory. `--produce`
+takes the state-directory lock, polls, sends the batch to `filimon-social-items`
+and only then saves the cursor, so the next `run-once` or `fili run` continues
+from there. `--json` prints one `SourceItem` per line on stdout and moves every
+note to stderr. A fetcher, a disabled source or an unknown name is refused
+before any component is loaded.
+
+### `fili run`
+
+Starts the host: it loads the registry strictly (one broken enabled plugin TOML
+stops the command; set `enabled = false` to skip a plugin), refuses a registry
+with no enabled source, takes the state-directory lock (a second `fili run` on
+the same directory fails with `StateDirLocked` and names the directory),
+connects to Fluvio and loads every enabled source component. It then prints the
+state directory, the loaded sources and fetchers, and one line for every
+component that could not be loaded, naming the plugin and its path. If no
+source component could be loaded it exits 1 instead of idling. Otherwise it
+polls each source on its own interval until stopped (see Polling and backoff
+for how stopping works) and prints a summary table sorted by plugin name:
+polls, items sent, items dropped, failures, and a state of `stopped`,
+`disabled: <reason>` or `aborted at shutdown`.
+
+An operator stop (Ctrl-C or SIGTERM) exits 0, even when some tasks had to be
+aborted at shutdown; those are named in a warning. The command exits 1 when
+every plugin ended disabled by a fault, when no source is enabled, when none
+could be loaded, or on any startup error. One plugin's batches reach the sink
+in poll order; the order across plugins is not specified.
 
 ## Contract version
 
