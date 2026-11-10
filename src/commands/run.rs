@@ -18,6 +18,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+use miette::IntoDiagnostic;
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::plugins::state_dir_for;
@@ -27,7 +28,9 @@ use crate::plugins::host::engine::clean_guest_text;
 use crate::plugins::host::loader::PluginKind;
 use crate::plugins::host::scheduler::PluginReport;
 use crate::plugins::host::sink::{FluvioSink, ItemSink};
-use crate::plugins::host::{ABORTED_AT_SHUTDOWN, Host, HostOptions, HostReport};
+use crate::plugins::host::{
+    ABORTED_AT_SHUTDOWN, DEFAULT_SHUTDOWN_GRACE, Host, HostOptions, HostReport,
+};
 
 /// Longest reason shown in the summary's STATE column, in characters.
 const STATE_REASON_CLIP: usize = 80;
@@ -247,14 +250,12 @@ pub async fn run(registry_path: &Path, state_dir_flag: Option<&Path>) -> miette:
 
     let shutdown = CancellationToken::new();
     let abort = CancellationToken::new();
-    let signal_task = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                shutdown.cancel();
-            }
-        }
-    });
+    let signals = OsSignals::new().into_diagnostic()?;
+    let signal_task = tokio::spawn(forward_signals(
+        signals,
+        shutdown.clone(),
+        abort.clone(),
+    ));
 
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
@@ -281,14 +282,74 @@ pub(crate) trait SignalSource: Send + 'static {
     fn next(&mut self) -> impl Future<Output = ()> + Send;
 }
 
-/// Turns stop requests into the two tokens the host understands. Not yet
-/// implemented.
+/// Turns stop requests into the two tokens the host understands (OQ-8): the
+/// first request starts a graceful stop (the host waits up to the shutdown
+/// grace for in-flight sends), the second aborts at once. The task ends after
+/// the second request; a caller whose host ended on its own simply aborts it.
 pub(crate) async fn forward_signals<S: SignalSource>(
-    _source: S,
-    _shutdown: CancellationToken,
-    _abort: CancellationToken,
+    mut source: S,
+    shutdown: CancellationToken,
+    abort: CancellationToken,
 ) {
-    std::future::pending::<()>().await;
+    source.next().await;
+    println!(
+        "[Run] stopping: waiting up to {} s for in-flight sends; press Ctrl+C again to stop now",
+        DEFAULT_SHUTDOWN_GRACE.as_secs()
+    );
+    shutdown.cancel();
+
+    source.next().await;
+    println!("[Run] stopping now: in-flight sends are aborted");
+    abort.cancel();
+}
+
+/// The operating system's stop requests: SIGINT (Ctrl+C) and, on Unix, SIGTERM.
+/// The streams are created once and kept, so a request that arrives between two
+/// calls of `next` is not lost.
+pub(crate) struct OsSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl OsSignals {
+    /// Registers the handlers; must be called inside the runtime.
+    ///
+    /// # Errors
+    /// The io error when a handler cannot be registered.
+    pub(crate) fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+impl SignalSource for OsSignals {
+    #[cfg(unix)]
+    async fn next(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn next(&mut self) {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler could be registered: never report a request that did not happen.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
