@@ -42,9 +42,12 @@ use crate::plugins::host::engine::{HostEngine, clean_guest_text};
 use crate::plugins::host::error::HostError;
 use crate::plugins::host::instance::{InstanceFactory, WasmtimeFactory};
 use crate::plugins::host::loader::{PluginKind, check_component, load_source};
-use crate::plugins::host::once::{PolledOnce, poll_once};
-use crate::plugins::host::scheduler::{CycleOutcome, PluginSpec, describe};
+use crate::plugins::host::once::{CommitFailure, PolledOnce, commit_once, poll_once};
+use crate::plugins::host::scheduler::{
+    CycleOutcome, PluginSpec, describe, record_status, record_status_text,
+};
 use crate::plugins::host::sink::{FluvioSink, ItemSink, SinkRecord};
+use crate::streaming::TOPIC_SOCIAL_ITEMS;
 
 /// Longest error text shown in the human table, in characters.
 const TABLE_ERROR_CLIP: usize = 80;
@@ -609,8 +612,16 @@ async fn finish_run_once<S: ItemSink>(
 ) -> miette::Result<()> {
     let polled = match polled {
         Ok(polled) => polled,
-        Err(outcome) => return Err(miette::miette!("{}", describe(&outcome))),
+        Err(outcome) => {
+            // A failed cycle is left in the status file, but only when
+            // producing: a dry run writes nothing.
+            if let Produce::Yes { cursors, .. } = &produce {
+                record_status(cursors, &spec.name, &outcome, None);
+            }
+            return Err(miette::miette!("{}", describe(&outcome)));
+        }
     };
+    let _ = &err;
     if json {
         return Err(miette::miette!("--json is not available yet"));
     }
@@ -618,9 +629,52 @@ async fn finish_run_once<S: ItemSink>(
     writeln!(out, "{}", polled_line(polled.records.len(), polled.dropped)).into_diagnostic()?;
     match produce {
         Produce::No => writeln!(out, "{DRY_RUN_NOTICE}").into_diagnostic(),
-        Produce::Yes { .. } => {
-            let _ = (spec, err);
-            Err(miette::miette!("--produce is not available yet"))
+        Produce::Yes { sink, cursors } => {
+            commit_and_record(spec, polled, sink, cursors, out).await
+        }
+    }
+}
+
+/// `1 record` or `N records`.
+fn records_noun(count: u64) -> String {
+    if count == 1 {
+        "1 record".to_string()
+    } else {
+        format!("{count} records")
+    }
+}
+
+/// The `--produce` half: send, then save the cursor (D-07), then leave the
+/// cycle's outcome in the plugin's status file so `list` shows it.
+async fn commit_and_record<S: ItemSink>(
+    spec: &PluginSpec,
+    polled: PolledOnce,
+    sink: &S,
+    cursors: &CursorStore,
+    out: &mut impl Write,
+) -> miette::Result<()> {
+    match commit_once(&spec.name, polled, sink, cursors).await {
+        Ok(sent) => {
+            record_status(cursors, &spec.name, &CycleOutcome::PollOk, Some(sent));
+            writeln!(
+                out,
+                "produced {} to {TOPIC_SOCIAL_ITEMS}; cursor saved",
+                records_noun(sent)
+            )
+            .into_diagnostic()
+        }
+        Err(CommitFailure::Sink(text)) => {
+            let outcome = CycleOutcome::SinkFailed(text);
+            record_status(cursors, &spec.name, &outcome, None);
+            Err(miette::miette!("{}", describe(&outcome)))
+        }
+        Err(CommitFailure::Cursor { sent, text }) => {
+            let message = format!(
+                "produced {} but the cursor could not be saved; the next poll will replay them ({text})",
+                records_noun(sent)
+            );
+            record_status_text(cursors, &spec.name, false, Some(message.clone()), Some(sent));
+            Err(miette::miette!("{message}"))
         }
     }
 }
@@ -702,9 +756,6 @@ pub async fn run_once(
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> miette::Result<()> {
-    if produce {
-        return Err(miette::miette!("--produce is not available yet"));
-    }
     let listing = list_registry(registry)?;
     let planned = find_source(&listing, name)?;
     let state_dir = state_dir_for(&listing.base_dir, state_dir_flag)?;

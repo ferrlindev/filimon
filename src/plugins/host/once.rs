@@ -6,6 +6,10 @@
 // persist anything. The size rule for the next cursor and the single place a
 // secret is exposed are the scheduler's own helpers, not copies.
 //
+// `commit_once` is the `--produce` half: it sends the batch with the
+// scheduler's own `send_records` and only then writes the cursor (D-07), so a
+// failing sink never moves the cursor.
+//
 // Nothing here is logged or returned that carries settings, secret values or
 // init arguments: failures are `CycleOutcome`s whose `describe` text is cleaned.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,6 +22,9 @@ use super::scheduler::{
     CycleOutcome, Phase, PluginSpec, expose_secrets, oversize_cursor_outcome, send_records,
 };
 use super::sink::{ItemSink, SinkRecord};
+
+/// Longest error text kept from a failed cursor write, in characters.
+const COMMIT_TEXT_CLIP: usize = 512;
 
 /// What one successful poll returned, ready to print and, when asked, to send.
 #[derive(Debug)]
@@ -106,8 +113,17 @@ pub async fn commit_once<S: ItemSink>(
     sink: &S,
     cursors: &CursorStore,
 ) -> Result<u64, CommitFailure> {
-    let _ = (plugin, polled, sink, cursors);
-    Ok(0)
+    // The send first: a failure leaves the cursor file exactly as it was.
+    let sent = send_records(sink, plugin, polled.records)
+        .await
+        .map_err(CommitFailure::Sink)?;
+    // Only after the sink returned (or was skipped for an empty batch).
+    let written = cursors.write(plugin, polled.next_cursor.as_deref());
+    written.map_err(|e| CommitFailure::Cursor {
+        sent,
+        text: clean_guest_text(&e.to_string(), COMMIT_TEXT_CLIP),
+    })?;
+    Ok(sent)
 }
 
 #[cfg(test)]
