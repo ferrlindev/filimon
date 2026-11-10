@@ -72,10 +72,7 @@ fn list_prints_the_registered_plugins_and_no_banner() {
     assert!(row.starts_with("alpha"), "{row:?}");
     assert!(row.contains("source"), "{row:?}");
     assert!(!text.contains('╔'), "the banner leaked into stdout: {text}");
-    assert!(
-        !state.exists(),
-        "list must not create the state directory"
-    );
+    assert!(!state.exists(), "list must not create the state directory");
 }
 
 #[test]

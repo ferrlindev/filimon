@@ -228,16 +228,27 @@ fn state_dir_for(base_dir: &Path, flag: Option<&Path>) -> miette::Result<PathBuf
 /// # Errors
 /// Returns the registry's diagnostics when `registry` cannot be read or
 /// parsed, a state directory error for an empty `--state-dir`, or an io error
-/// when `out` cannot be written.
+/// when `out` cannot be written. `err` receives one note per registry
+/// name that was skipped because it breaks the name rule.
 pub fn list(
     registry: &Path,
     state_dir_flag: Option<&Path>,
     json: bool,
     out: &mut impl Write,
-    _err: &mut impl Write,
+    err: &mut impl Write,
 ) -> miette::Result<()> {
     let listing = list_registry(registry)?;
     let state_dir = state_dir_for(&listing.base_dir, state_dir_flag)?;
+    for skipped in &listing.skipped {
+        // A note is best effort: an unwritable stderr must not fail the listing.
+        writeln!(
+            err,
+            "skipped [{}.{}]: plugin names may only contain a-z, 0-9, `_` and `-`",
+            skipped.table,
+            clean_guest_text(&skipped.name, 64)
+        )
+        .ok();
+    }
     let rows = collect_list(&listing, &state_dir);
     if json {
         return render_list_json(&rows, out).into_diagnostic();
@@ -276,6 +287,7 @@ pub fn dispatch(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -300,8 +312,14 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let registry = write_registry(dir.path(), &[]);
         let mut out = Vec::new();
-        let error = list(&registry, Some(Path::new("")), false, &mut out, &mut Vec::new())
-            .expect_err("an empty state directory is refused");
+        let error = list(
+            &registry,
+            Some(Path::new("")),
+            false,
+            &mut out,
+            &mut Vec::new(),
+        )
+        .expect_err("an empty state directory is refused");
         let text = error.to_string();
         assert!(text.contains("state directory must not be empty"), "{text}");
         assert!(out.is_empty(), "nothing is printed before the refusal");
@@ -355,9 +373,8 @@ mod tests {
         let cells: Vec<&str> = row.split("  ").filter(|c| !c.trim().is_empty()).collect();
         assert_eq!(&cells[..4], ["stub", "source", "yes", "-"], "{row:?}");
         let last_poll = cells[4].trim();
-        let pattern =
-            regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z ok \(1 item\)$")
-                .expect("regex");
+        let pattern = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z ok \(1 item\)$")
+            .expect("regex");
         assert!(pattern.is_match(last_poll), "{last_poll:?}");
     }
 
@@ -565,7 +582,7 @@ mod tests {
             text.push_str(&source_table(name, true));
         }
         for name in ["b", "a"] {
-            text.push_str(&format!("[fetchers.{name}]\ncomponent = \"{name}.wasm\"\n"));
+            writeln!(text, "[fetchers.{name}]\ncomponent = \"{name}.wasm\"").expect("append");
         }
         let registry = write_registry_text(dir.path(), &text);
         let expected = ["alpha", "mid", "zeta", "a", "b"];
@@ -717,8 +734,15 @@ mod tests {
         );
 
         let (table, _) = run_list(&registry, &state, false);
-        assert!(!table.contains('\u{1b}'), "ESC reached the table: {table:?}");
-        assert_eq!(table.lines().count(), 2, "one header and one row: {table:?}");
+        assert!(
+            !table.contains('\u{1b}'),
+            "ESC reached the table: {table:?}"
+        );
+        assert_eq!(
+            table.lines().count(),
+            2,
+            "one header and one row: {table:?}"
+        );
         assert!(table.contains("red"), "{table:?}");
 
         let (json, _) = run_list(&registry, &state, true);
@@ -767,9 +791,11 @@ mod tests {
         let state = dir.path().join("state");
         let mut text = source_table("fine", true);
         for key in ["Bad Name", "../evil", "esc\\u001bseq"] {
-            text.push_str(&format!(
-                "[sources.\"{key}\"]\ncomponent = \"x.wasm\"\nconfig = \"x.toml\"\n\n"
-            ));
+            writeln!(
+                text,
+                "[sources.\"{key}\"]\ncomponent = \"x.wasm\"\nconfig = \"x.toml\"\n"
+            )
+            .expect("append");
         }
         text.push_str("[fetchers.\"Bad/Fetcher\"]\ncomponent = \"f.wasm\"\n");
         let registry = write_registry_text(dir.path(), &text);
