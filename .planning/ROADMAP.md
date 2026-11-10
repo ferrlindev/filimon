@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Plugin Contract & Configuration** - Versioned WIT package (`source` + `fetcher` worlds) plus the `filimon.toml` registry, per-plugin TOML, and `.env` secret loading with clear errors (completed 2026-11-03)
 - [x] **Phase 2: SourceItem Pipeline** - Unified `SourceItem` envelope; news stays on the WISE chain, social items pass through, and the consumer NER-enriches both into one JSON output (completed 2026-11-09)
 - [x] **Phase 3: Component Host Runtime** - `fili` loads registry-listed components, polls them on schedule, persists cursors, isolates failures, and produces `SourceItem`s to Fluvio (completed 2026-11-10)
-- [ ] **Phase 4: Plugin CLI** - `fili plugins list | check | run-once` and a run command that polls all enabled sources
+- [x] **Phase 4: Plugin CLI** - `fili plugins list | check | run-once` and a run command that polls all enabled sources (completed 2026-11-10)
 - [ ] **Phase 5: Fetcher Layer** - Plugin HTTP routed through a configurable fetcher component, a host-enforced allowlist and timeout, a default TLS-validating fetcher, and an optional crawler hook
 - [ ] **Phase 6: Host-Managed OAuth** - `fili auth login | status | logout` with PKCE, host-side token storage and refresh, and only access tokens passed to plugins
 - [ ] **Phase 7: Reddit & YouTube Plugins** - Two separately built reference `.wasm` source components on the official APIs, each with offline fixture tests
@@ -121,7 +121,7 @@ Plans:
   2. `fili plugins check <name>` reports, without polling, whether the component satisfies its declared WIT world and whether its TOML and required `.env` secrets are valid. A broken component or config exits non-zero with a message naming the problem.
   3. `fili plugins run-once <name>` performs a single poll and prints the returned items. Nothing is produced to Fluvio unless the produce option is given.
   4. The run command polls every enabled source plugin on its interval and produces items to Fluvio until it is stopped.
-**Plans:** 6/6 plans executed
+**Plans:** 6/6 plans complete
 
 Plans:
 **Wave 1**
@@ -196,7 +196,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
-| 4. Plugin CLI | 6/6 | In Progress | - |
+| 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |

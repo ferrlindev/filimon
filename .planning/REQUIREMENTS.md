@@ -50,10 +50,10 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### CLI
 
-- [ ] **CLI-01**: User can run `fili plugins list` to see registered plugins (source + fetcher), enabled state, and last poll status
-- [ ] **CLI-02**: User can run `fili plugins check <name>` to validate a component against its WIT world plus its config/secrets, without polling
-- [ ] **CLI-03**: User can run `fili plugins run-once <name>` to perform a single poll and print returned items (no Fluvio produce unless requested)
-- [ ] **CLI-04**: User can start a run command that polls all enabled source plugins and produces to Fluvio
+- [x] **CLI-01**: User can run `fili plugins list` to see registered plugins (source + fetcher), enabled state, and last poll status
+- [x] **CLI-02**: User can run `fili plugins check <name>` to validate a component against its WIT world plus its config/secrets, without polling
+- [x] **CLI-03**: User can run `fili plugins run-once <name>` to perform a single poll and print returned items (no Fluvio produce unless requested)
+- [x] **CLI-04**: User can start a run command that polls all enabled source plugins and produces to Fluvio
 
 ### Reddit Plugin
 
@@ -149,10 +149,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PIPE-02 | Phase 2 | Complete |
 | PIPE-03 | Phase 2 | Complete |
 | PIPE-04 | Phase 2 | Complete |
-| CLI-01 | Phase 4 | Pending |
-| CLI-02 | Phase 4 | Pending |
-| CLI-03 | Phase 4 | Pending |
-| CLI-04 | Phase 4 | Pending |
+| CLI-01 | Phase 4 | Complete |
+| CLI-02 | Phase 4 | Complete |
+| CLI-03 | Phase 4 | Complete |
+| CLI-04 | Phase 4 | Complete |
 | RDDT-01 | Phase 7 | Pending |
 | RDDT-02 | Phase 7 | Pending |
 | RDDT-03 | Phase 7 | Pending |
