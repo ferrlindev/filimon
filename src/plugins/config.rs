@@ -204,6 +204,46 @@ pub fn load_registry_with_env(
     path: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<LoadedRegistry, ConfigErrors> {
+    load_registry_inner(path, env, None)
+}
+
+/// Loads only the plugin called `name` from the registry at `path`, reading
+/// secrets from the process environment and, when that plugin declares any,
+/// the `.env` next to the registry.
+///
+/// The returned `LoadedRegistry` holds only the named source (fetchers are all
+/// listed, they need no file) and exists to validate one plugin: no other
+/// plugin's file is read, and no other plugin's problem is reported.
+///
+/// # Errors
+/// Returns every problem that concerns the registry as a whole or `name`.
+pub fn load_plugin(path: &Path, name: &str) -> Result<LoadedRegistry, ConfigErrors> {
+    load_plugin_with_env(path, name, &|key| std::env::var(key).ok())
+}
+
+/// Like [`load_plugin`], looking env vars up through `env` before falling
+/// back to the `.env` next to the registry. The returned `LoadedRegistry`
+/// holds only the named source and is for validating that one plugin.
+///
+/// # Errors
+/// Returns every problem that concerns the registry as a whole or `name`.
+pub fn load_plugin_with_env(
+    path: &Path,
+    name: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<LoadedRegistry, ConfigErrors> {
+    load_registry_inner(path, env, Some(name))
+}
+
+/// The shared loader. With `only` set, passes 1 to 3 consider just that
+/// source and registry-level problems are kept only when they concern it.
+fn load_registry_inner(
+    path: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    only: Option<&str>,
+) -> Result<LoadedRegistry, ConfigErrors> {
+    let wanted = |name: &str| only.is_none_or(|only| only == name);
+
     // The registry is read once; its parse result and its diagnostic source
     // both come from this one String. Only registry-level failures stop early.
     let (registry, registry_name, registry_text) = read_registry(path)?;
@@ -218,12 +258,15 @@ pub fn load_registry_with_env(
     // Problems are reported in a fixed order: registry-level problems first,
     // then each enabled, validly named source's problems in name order.
     let mut registry_problems = registry_level_problems(&registry);
+    registry_problems.retain(|problem| problem.plugin().is_none_or(&wanted));
     let mut source_problems: BTreeMap<&str, Vec<ConfigError>> = BTreeMap::new();
 
     // Pass 1: check each enabled source's fetcher reference, then read and
     // type-check its plugin file and range-check its [host] values.
     let mut parsed: BTreeMap<&str, ParsedPlugin> = BTreeMap::new();
-    for (name, entry) in loadable(&registry.sources).filter(|(_, entry)| entry.enabled) {
+    for (name, entry) in
+        loadable(&registry.sources).filter(|(name, entry)| entry.enabled && wanted(name))
+    {
         let bucket = source_problems.entry(name).or_default();
         if let Some(problem) = fetcher_problem(name, entry, &registry.fetchers, registry_src) {
             bucket.push(problem);
@@ -258,7 +301,7 @@ pub fn load_registry_with_env(
 
     // Pass 3: resolve secrets per enabled source and assemble the output.
     let mut sources = BTreeMap::new();
-    for (name, entry) in loadable(&registry.sources) {
+    for (name, entry) in loadable(&registry.sources).filter(|(name, _)| wanted(name)) {
         let plugin = if entry.enabled {
             // A missing entry means its plugin file problem is already recorded.
             let Some(parsed) = parsed.remove(name) else {
@@ -1691,5 +1734,162 @@ config = "alpha.toml"
             matches!(&problems[2], ConfigError::DotenvInvalid { line: Some(4), .. }),
             "{first:?}"
         );
+    }
+
+    // ── Plugin-scoped loading ─────────────────────────────────────────────────
+
+    /// A registry with a valid `good` source, a `bad` source whose plugin TOML
+    /// is malformed and a source called `Bad Name`.
+    fn good_and_bad_registry(dir: &TempDir) {
+        write(
+            dir,
+            "filimon.toml",
+            r#"
+[sources.good]
+component = "good.wasm"
+config = "good.toml"
+
+[sources.bad]
+component = "bad.wasm"
+config = "bad.toml"
+
+[sources."Bad Name"]
+component = "x.wasm"
+config = "x.toml"
+"#,
+        );
+        write(dir, "good.toml", "[host]\npoll_interval_secs = 60\n");
+        write(dir, "bad.toml", "[host\npoll_interval_secs = ");
+    }
+
+    fn scoped(dir: &TempDir, name: &str) -> Result<LoadedRegistry, ConfigErrors> {
+        load_plugin_with_env(&dir.path().join("filimon.toml"), name, &no_env)
+    }
+
+    #[test]
+    fn plugin_only_load_ignores_other_plugins_problems() {
+        let dir = TempDir::new().expect("tempdir");
+        good_and_bad_registry(&dir);
+
+        let registry = scoped(&dir, "good").expect("good is valid on its own");
+
+        let names: Vec<&str> = registry.sources.keys().map(String::as_str).collect();
+        assert_eq!(names, ["good"]);
+        assert!(registry.sources["good"].plugin.is_some());
+        // The unscoped load still sees every problem.
+        assert!(load(&dir).is_err());
+    }
+
+    #[test]
+    fn plugin_only_load_reports_that_plugins_problems() {
+        let dir = TempDir::new().expect("tempdir");
+        good_and_bad_registry(&dir);
+
+        let errors = scoped(&dir, "bad").expect_err("bad has a malformed plugin file");
+
+        assert!(!errors.problems.is_empty());
+        assert!(
+            errors
+                .problems
+                .iter()
+                .all(|problem| problem.plugin() == Some("bad")),
+            "{errors:?}"
+        );
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::PluginFileMalformed { plugin, .. } if plugin == "bad"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn config_error_plugin_names_every_per_plugin_variant() {
+        let src = || NamedSource::new("x.toml", String::new());
+        let span = || SourceSpan::from(0..0);
+        let per_plugin = [
+            ConfigError::PluginFileMissing {
+                plugin: "p".into(),
+                path: "x".into(),
+                reason: "r".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::PluginFileMalformed {
+                plugin: "p".into(),
+                path: "x".into(),
+                message: "m".into(),
+                src: src(),
+                span: None,
+            },
+            ConfigError::InvalidValue {
+                plugin: "p".into(),
+                path: "x".into(),
+                field: "f".into(),
+                message: "m".into(),
+                src: src(),
+                span: None,
+            },
+            ConfigError::MissingSecret {
+                plugin: "p".into(),
+                alias: "a".into(),
+                env_var: "E".into(),
+                dotenv: "d".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::EmptySecret {
+                plugin: "p".into(),
+                alias: "a".into(),
+                env_var: "E".into(),
+                origin: "o".into(),
+                fix: "f".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::UnknownFetcher {
+                plugin: "p".into(),
+                fetcher: "f".into(),
+                defined: "none".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::DisabledFetcher {
+                plugin: "p".into(),
+                fetcher: "f".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::InvalidName {
+                plugin: "p".into(),
+                table: "sources".into(),
+            },
+            ConfigError::DuplicateName { plugin: "p".into() },
+        ];
+        for problem in &per_plugin {
+            assert_eq!(problem.plugin(), Some("p"), "{problem:?}");
+        }
+
+        let registry_level = [
+            ConfigError::RegistryUnreadable {
+                path: "x".into(),
+                reason: "r".into(),
+            },
+            ConfigError::RegistryMalformed {
+                path: "x".into(),
+                message: "m".into(),
+                src: src(),
+                span: None,
+            },
+            ConfigError::DotenvInvalid {
+                path: "x".into(),
+                line: Some(1),
+                reason: "r".into(),
+            },
+        ];
+        for problem in &registry_level {
+            assert_eq!(problem.plugin(), None, "{problem:?}");
+        }
     }
 }

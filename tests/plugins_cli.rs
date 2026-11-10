@@ -39,6 +39,35 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// `text` with whitespace and miette's gutter character removed, so a long
+/// path or sentence that miette wrapped can still be searched for.
+fn squash(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && *c != '│')
+        .collect()
+}
+
+/// Writes a registry with one enabled source `stub` whose plugin file is valid
+/// and whose component file holds `component_bytes`; returns the registry path
+/// and the component path.
+fn write_check_registry(dir: &Path, component_bytes: &[u8]) -> (PathBuf, PathBuf) {
+    let registry = dir.join("filimon.toml");
+    std::fs::write(
+        &registry,
+        "[sources.stub]\ncomponent = \"stub.wasm\"\nconfig = \"stub.toml\"\n",
+    )
+    .expect("write registry");
+    std::fs::write(dir.join("stub.toml"), "[host]\npoll_interval_secs = 60\n")
+        .expect("write plugin toml");
+    let component = dir.join("stub.wasm");
+    std::fs::write(&component, component_bytes).expect("write component");
+    (registry, component)
+}
+
 #[test]
 fn list_prints_the_registered_plugins_and_no_banner() {
     let dir = TempDir::new().expect("tempdir");
@@ -217,4 +246,81 @@ fn plugins_without_a_subcommand_is_a_usage_error() {
     let output = fili().arg("plugins").output().expect("run fili");
 
     assert_eq!(output.status.code(), Some(2));
+}
+
+// ── check ─────────────────────────────────────────────────────────────────────
+
+/// The tracer: the real prebuilt stub source passes `check`, which neither
+/// initialises the guest nor creates the state directory.
+#[test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+fn wasm_check_passes_the_real_stub_source() {
+    let dir = TempDir::new().expect("tempdir");
+    let registry = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/plugins/filimon.toml");
+    let state = dir.path().join("state");
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["plugins", "check", "stub"])
+        .output()
+        .expect("run fili");
+
+    assert!(
+        output.status.success(),
+        "exit {:?}, stderr: {}",
+        output.status.code(),
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    assert!(text.contains("plugin `stub` (source)"), "{text}");
+    let component_line = text
+        .lines()
+        .find(|line| line.contains("component: ok"))
+        .unwrap_or_else(|| panic!("no component line: {text}"));
+    assert!(component_line.contains("`source` world"), "{text}");
+    assert!(text.contains("config: ok"), "{text}");
+    assert!(text.contains("check passed"), "{text}");
+    assert!(
+        !stderr(&output).contains("hello from the stub source"),
+        "the guest's init ran: {}",
+        stderr(&output)
+    );
+    assert!(!state.exists(), "check must not create the state directory");
+}
+
+#[test]
+fn check_garbage_component_exits_nonzero_naming_plugin_and_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let (registry, component) = write_check_registry(dir.path(), b"this is not a wasm component");
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["plugins", "check", "stub"])
+        .output()
+        .expect("run fili");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let err = squash(&stderr(&output));
+    assert!(err.contains("stub"), "{}", stderr(&output));
+    assert!(
+        err.contains(&squash(&component.display().to_string())),
+        "stderr must name the component path: {}",
+        stderr(&output)
+    );
+    assert!(
+        err.contains(&squash("cannot load component")),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("check failed"),
+        "{}",
+        stdout(&output)
+    );
 }

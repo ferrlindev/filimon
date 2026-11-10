@@ -38,7 +38,9 @@ pub enum PluginKind {
 }
 
 impl PluginKind {
-    fn world(self) -> &'static str {
+    /// The WIT world a plugin of this kind must fit.
+    #[must_use]
+    pub fn world(self) -> &'static str {
         match self {
             Self::Source => "source",
             Self::Fetcher => "fetcher",
@@ -143,7 +145,7 @@ fn wrong_world(plugin: &str, kind: PluginKind, path: &Path, error: &wasmtime::Er
     }
 }
 
-fn load_source(
+pub(crate) fn load_source(
     plugin: &str,
     path: &Path,
     host_engine: &HostEngine,
@@ -169,6 +171,28 @@ fn load_fetcher(
         .and_then(FetcherPre::new)
         .map_err(|e| wrong_world(plugin, PluginKind::Fetcher, path, &e))?;
     Ok(pre)
+}
+
+/// Checks that the component at `path` compiles, imports nothing outside
+/// `filimon:plugin/` and fits the world of `kind`, then discards the linked
+/// result. Nothing is instantiated and no guest code runs.
+///
+/// This is the single place the CLI and the host share for "does this
+/// component fit its world", so there is no second checker.
+///
+/// # Errors
+/// Returns `ComponentLoad`, `ForeignImports` or `WrongWorld` for the first
+/// problem found.
+pub fn check_component(
+    kind: PluginKind,
+    name: &str,
+    path: &Path,
+    host_engine: &HostEngine,
+) -> Result<(), HostError> {
+    match kind {
+        PluginKind::Source => load_source(name, path, host_engine).map(drop),
+        PluginKind::Fetcher => load_fetcher(name, path, host_engine).map(drop),
+    }
 }
 
 // ── Import Preflight ──────────────────────────────────────────────────────────

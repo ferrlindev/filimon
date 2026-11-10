@@ -7,6 +7,12 @@
 // file, a secret or a component, never takes the state directory lock and
 // never creates or writes anything, so it is safe while `fili run` is polling.
 //
+// `check <name>` validates one plugin without polling it: its component goes
+// through the host's own preflight (`check_component`) and its TOML and
+// secrets through the plugin-scoped config loader. It never calls guest
+// `init` or `poll`, never takes the state-directory lock and never creates the
+// state directory. Only alias names are printed for secrets, never values.
+//
 // Everything that came from a file is untrusted at print time and passes
 // through `sanitize_for_terminal` or `clean_guest_text`.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,10 +24,13 @@ use miette::IntoDiagnostic;
 
 use crate::cli::PluginsCommand;
 use crate::output::sanitize_for_terminal;
-use crate::plugins::config::{RegistryListing, list_registry};
+use crate::plugins::config::{RegistryListing, list_registry, load_plugin_with_env};
+use crate::plugins::error::ConfigErrors;
 use crate::plugins::host::HostOptions;
 use crate::plugins::host::cursor::{PollStatus, StatusRead, read_status, require_state_dir};
-use crate::plugins::host::engine::clean_guest_text;
+use crate::plugins::host::engine::{HostEngine, clean_guest_text};
+use crate::plugins::host::error::HostError;
+use crate::plugins::host::loader::{PluginKind, check_component};
 
 /// Longest error text shown in the human table, in characters.
 const TABLE_ERROR_CLIP: usize = 80;
@@ -265,6 +274,235 @@ pub fn list(
     render_list(&rows, out).into_diagnostic()
 }
 
+// ── Check ─────────────────────────────────────────────────────────────────────
+
+/// Longest plugin name echoed back in an error, in characters.
+const NAME_ECHO_CLIP: usize = 64;
+
+/// Longest engine error kept in a diagnostic, in characters.
+const ENGINE_REASON_CLIP: usize = 512;
+
+/// Whether the component passed the host's preflight.
+#[derive(Debug)]
+pub enum ComponentCheck {
+    Ok,
+    Failed(HostError),
+}
+
+/// What the check says about a plugin's own TOML and secrets.
+#[derive(Debug)]
+pub enum ConfigCheck {
+    /// The TOML and every declared secret are valid.
+    Ok {
+        poll_interval_secs: u64,
+        /// Alias names only, never values.
+        secrets: Vec<String>,
+    },
+    Failed(ConfigErrors),
+    /// A disabled source: its config is not validated.
+    Skipped,
+    /// A fetcher has no config file.
+    NoConfigFile,
+}
+
+/// The outcome of checking one plugin.
+#[derive(Debug)]
+pub struct CheckReport {
+    pub name: String,
+    pub kind: PluginKind,
+    pub component: ComponentCheck,
+    pub config: ConfigCheck,
+}
+
+impl CheckReport {
+    /// `true` only when no part failed. A skipped or absent config is not a
+    /// failure, and it is printed as such.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        matches!(self.component, ComponentCheck::Ok)
+            && !matches!(self.config, ConfigCheck::Failed(_))
+    }
+}
+
+/// `sources: a, b; fetchers: f`, with `none` for an empty list.
+fn registered_plugins(listing: &RegistryListing) -> String {
+    let join = |names: Vec<&str>| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    format!(
+        "sources: {}; fetchers: {}",
+        join(listing.sources.iter().map(|p| p.name.as_str()).collect()),
+        join(listing.fetchers.iter().map(|p| p.name.as_str()).collect()),
+    )
+}
+
+/// Checks the plugin called `name`: its component against its world, and for a
+/// source its TOML and secrets. `name` is compared exactly, as bytes, against
+/// the registry's names (sources first) and is never used to build a path. The
+/// two halves are independent: a failing component does not stop the config
+/// result from being computed.
+///
+/// # Errors
+/// Returns the registry's diagnostics when it cannot be read, or an error that
+/// lists the registered plugins when `name` is not one of them.
+pub fn run_check(
+    registry: &Path,
+    name: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    engine: &HostEngine,
+) -> miette::Result<CheckReport> {
+    let listing = list_registry(registry)?;
+    let found = listing
+        .sources
+        .iter()
+        .find(|plugin| plugin.name == name)
+        .map(|plugin| (PluginKind::Source, plugin))
+        .or_else(|| {
+            listing
+                .fetchers
+                .iter()
+                .find(|plugin| plugin.name == name)
+                .map(|plugin| (PluginKind::Fetcher, plugin))
+        });
+    let Some((kind, plugin)) = found else {
+        let shown = clean_guest_text(name, NAME_ECHO_CLIP);
+        let path = sanitize_for_terminal(&listing.path.display().to_string());
+        if listing.sources.is_empty() && listing.fetchers.is_empty() {
+            return Err(miette::miette!(
+                "no plugin named `{shown}`: no plugins are registered in {path}"
+            ));
+        }
+        return Err(miette::miette!(
+            "no plugin named `{shown}` in {path} (registered: {})",
+            registered_plugins(&listing)
+        ));
+    };
+
+    let component = match check_component(kind, name, &plugin.component, engine) {
+        Ok(()) => ComponentCheck::Ok,
+        Err(error) => ComponentCheck::Failed(error),
+    };
+
+    let config = match kind {
+        PluginKind::Fetcher => ConfigCheck::NoConfigFile,
+        PluginKind::Source => match load_plugin_with_env(registry, name, env) {
+            Err(errors) => ConfigCheck::Failed(errors),
+            Ok(_) if !plugin.enabled => ConfigCheck::Skipped,
+            Ok(loaded) => match loaded.sources.get(name).and_then(|s| s.plugin.as_ref()) {
+                Some(config) => ConfigCheck::Ok {
+                    poll_interval_secs: config.host.poll_interval.as_secs(),
+                    secrets: config.secrets.keys().cloned().collect(),
+                },
+                None => ConfigCheck::Skipped,
+            },
+        },
+    };
+
+    Ok(CheckReport {
+        name: name.to_string(),
+        kind,
+        component,
+        config,
+    })
+}
+
+/// Writes the check summary: one line per part and a final verdict. Only alias
+/// names are printed for secrets.
+///
+/// # Errors
+/// Returns the write error of `out`.
+pub fn render_check(report: &CheckReport, out: &mut impl Write) -> std::io::Result<()> {
+    let world = report.kind.world();
+    writeln!(
+        out,
+        "plugin `{}` ({world})",
+        sanitize_for_terminal(&report.name)
+    )?;
+    match report.component {
+        ComponentCheck::Ok => writeln!(
+            out,
+            "  component: ok (compiles, imports only filimon:plugin/*, fits the `{world}` world)"
+        )?,
+        ComponentCheck::Failed(_) => writeln!(out, "  component: FAILED")?,
+    }
+    match &report.config {
+        ConfigCheck::Ok {
+            poll_interval_secs,
+            secrets,
+        } => {
+            let aliases = if secrets.is_empty() {
+                "none".to_string()
+            } else {
+                secrets
+                    .iter()
+                    .map(|alias| sanitize_for_terminal(alias))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            writeln!(
+                out,
+                "  config: ok (poll interval {poll_interval_secs}s, secrets: {aliases})"
+            )?;
+        }
+        ConfigCheck::Failed(_) => writeln!(out, "  config: FAILED")?,
+        ConfigCheck::Skipped => writeln!(out, "  config: skipped (plugin is disabled)")?,
+        ConfigCheck::NoConfigFile => {
+            writeln!(out, "  config: none (fetchers have no config file)")?;
+        }
+    }
+    writeln!(
+        out,
+        "{}",
+        if report.passed() {
+            "check passed"
+        } else {
+            "check failed"
+        }
+    )
+}
+
+/// Writes each failing part's diagnostic to `err` in miette's report form.
+/// The diagnostics carry plugin names, paths, field paths, aliases and env var
+/// names only.
+fn write_diagnostics(report: CheckReport, err: &mut impl Write) {
+    if let ComponentCheck::Failed(error) = report.component {
+        writeln!(err, "{:?}", miette::Report::new(error)).ok();
+    }
+    if let ConfigCheck::Failed(errors) = report.config {
+        writeln!(err, "{:?}", miette::Report::new(errors)).ok();
+    }
+}
+
+/// `fili plugins check <name>`: the summary goes to `out`, each failing part's
+/// diagnostic to `err`.
+///
+/// # Errors
+/// Returns an error when the registry cannot be read, `name` is not
+/// registered, the engine cannot start, or any part of the check failed, so
+/// that the process exits non-zero.
+pub fn check(
+    registry: &Path,
+    name: &str,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> miette::Result<()> {
+    let engine = HostEngine::new().map_err(|e| HostError::Engine {
+        reason: clean_guest_text(&format!("{e:#}"), ENGINE_REASON_CLIP),
+    })?;
+    let report = run_check(registry, name, &|key| std::env::var(key).ok(), &engine)?;
+    render_check(&report, out).into_diagnostic()?;
+    if report.passed() {
+        return Ok(());
+    }
+    let shown = sanitize_for_terminal(&report.name);
+    write_diagnostics(report, err);
+    Err(miette::miette!("plugin `{shown}` failed its check"))
+}
+
 /// Runs one `fili plugins` subcommand, writing to stdout.
 ///
 /// # Errors
@@ -281,6 +519,13 @@ pub fn dispatch(
             let stderr = std::io::stderr();
             let mut err = stderr.lock();
             list(registry, state_dir_flag, *json, &mut out, &mut err)
+        }
+        PluginsCommand::Check { name } => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
+            check(registry, name, &mut out, &mut err)
         }
     }
 }
