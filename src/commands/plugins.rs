@@ -226,6 +226,18 @@ mod tests {
         String::from_utf8(out).expect("utf8")
     }
 
+    #[test]
+    fn list_rejects_an_empty_state_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = write_registry(dir.path(), &[]);
+        let mut out = Vec::new();
+        let error = list(&registry, Some(Path::new("")), &mut out)
+            .expect_err("an empty state directory is refused");
+        let text = error.to_string();
+        assert!(text.contains("state directory must not be empty"), "{text}");
+        assert!(out.is_empty(), "nothing is printed before the refusal");
+    }
+
     /// The tracer: a polled plugin's last poll shows up in the list.
     #[tokio::test(start_paused = true)]
     async fn tracer_polled_status_appears_in_the_list() {

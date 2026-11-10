@@ -199,6 +199,52 @@ mod tests {
         assert_eq!(after.state_dir, Some(PathBuf::from("/tmp/s")));
     }
 
+    #[test]
+    fn state_dir_empty_value_is_rejected() {
+        let error = Cli::try_parse_from(["fili", "--state-dir", "", "plugins", "list"])
+            .expect_err("an empty --state-dir is a usage error");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn state_dir_blank_value_is_rejected() {
+        let error = Cli::try_parse_from(["fili", "--state-dir", "   ", "plugins", "list"])
+            .expect_err("a blank --state-dir is a usage error");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn plugins_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["fili", "plugins"]).is_err());
+    }
+
+    #[test]
+    fn plugins_list_parses() {
+        let cli = Cli::try_parse_from(["fili", "plugins", "list"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Plugins {
+                command: PluginsCommand::List
+            }
+        ));
+    }
+
+    #[test]
+    fn state_dir_and_registry_flags_work_after_plugins_list() {
+        let cli = Cli::try_parse_from([
+            "fili",
+            "plugins",
+            "list",
+            "--registry",
+            "conf/filimon.toml",
+            "--state-dir",
+            "/tmp/s",
+        ])
+        .expect("parses");
+        assert_eq!(cli.registry, PathBuf::from("conf/filimon.toml"));
+        assert_eq!(cli.state_dir, Some(PathBuf::from("/tmp/s")));
+    }
+
     /// Default values of a `fili consume` argument, from argument metadata.
     fn consume_arg_defaults(id: &str) -> Vec<String> {
         let command = Cli::command();
