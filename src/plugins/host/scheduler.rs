@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::backoff;
-use super::cursor::{CursorStore, MAX_CURSOR_BYTES};
+use super::cursor::{CursorStore, MAX_CURSOR_BYTES, PollStatus};
 use super::engine::{PollError, clean_guest_text};
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
@@ -208,6 +208,42 @@ fn disable(report: &mut PluginReport, plugin: &str, reason: String) {
     report.disabled = Some(reason);
 }
 
+/// Records the outcome of one cycle in the plugin's `<alias>.status.json` so
+/// `fili plugins list` can show it. `items` is the number of records the sink
+/// accepted this cycle, when it accepted any.
+///
+/// A failed write is one warning and nothing else: it is not a plugin failure,
+/// never changes the cycle's control flow and never touches a cursor file.
+pub(crate) fn record_status(
+    cursors: &CursorStore,
+    plugin: &str,
+    outcome: &CycleOutcome,
+    items: Option<u64>,
+) {
+    let ok = matches!(outcome, CycleOutcome::PollOk);
+    let error = (!ok).then(|| describe(outcome));
+    record_status_text(cursors, plugin, ok, error, items);
+}
+
+/// The text-level form of `record_status`, for a cycle that has no
+/// `CycleOutcome` (a cursor file that could not be read).
+pub(crate) fn record_status_text(
+    cursors: &CursorStore,
+    plugin: &str,
+    ok: bool,
+    error: Option<String>,
+    items: Option<u64>,
+) {
+    let status = PollStatus::now(plugin, ok, error, items);
+    if let Err(e) = cursors.write_status(plugin, &status) {
+        tracing::warn!(
+            plugin = %plugin,
+            "{}",
+            clean_guest_text(&e.to_string(), REPORT_TEXT_CLIP)
+        );
+    }
+}
+
 /// Sends one poll's records. Returns the number of records sent, or a host-side
 /// failure text (never blamed on the plugin).
 ///
@@ -310,6 +346,9 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
         Err(e) => {
             report.failures += 1;
             let reason = clean_guest_text(&e.to_string(), REPORT_TEXT_CLIP);
+            // Leave the disable cause where `list` can show it (OQ-7). The bad
+            // cursor file itself is never touched (D-08).
+            record_status_text(&cursors, &spec.name, false, Some(reason.clone()), None);
             disable(&mut report, &spec.name, reason);
             return report;
         }
@@ -328,6 +367,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
             Ok(instance) => instance,
             Err(e) => {
                 let outcome = CycleOutcome::BuildFailed(e.0);
+                record_status(&cursors, &spec.name, &outcome, None);
                 match settle(&spec, &mut state, &mut report, &shutdown, &outcome).await {
                     Next::Stop => return report,
                     Next::Rebuild | Next::Same => continue 'instances,
@@ -350,6 +390,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
             CallOutcome::InstanceFatal(text) => Some(CycleOutcome::InstanceFatal(text)),
         };
         if let Some(outcome) = init_failure {
+            record_status(&cursors, &spec.name, &outcome, None);
             match settle(&spec, &mut state, &mut report, &shutdown, &outcome).await {
                 Next::Stop => return report,
                 Next::Rebuild | Next::Same => continue 'instances,
@@ -363,6 +404,9 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
                 () = shutdown.cancelled() => return report,
                 polled = instance.poll(cursor.as_deref()) => polled,
             };
+
+            // Records the sink accepted this cycle, for the status file.
+            let mut sent: Option<u64> = None;
 
             let outcome = match polled {
                 // An oversize cursor is a plugin fault: nothing from this poll
@@ -391,6 +435,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
                     // from persist.
                     match send_records(&*sink, &spec.name, mapped.records).await {
                         Ok(count) => {
+                            sent = Some(count);
                             report.items_sent += count;
                             report.dropped += dropped;
 
@@ -421,6 +466,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
                 CallOutcome::InstanceFatal(text) => CycleOutcome::InstanceFatal(text),
             };
 
+            record_status(&cursors, &spec.name, &outcome, sent);
             match settle(&spec, &mut state, &mut report, &shutdown, &outcome).await {
                 Next::Stop => return report,
                 Next::Rebuild => continue 'instances,
@@ -1489,6 +1535,284 @@ mod tests {
             vec![None, Some(vec![1]), Some(vec![1])]
         );
         assert_eq!(cursors.read("q").expect("read"), Some(vec![2]));
+    }
+
+    // ── Status records (OQ-6, OQ-7) ───────────────────────────────────────────
+
+    use crate::plugins::host::cursor::status_path;
+    use crate::plugins::host::instance::InstanceBuildError;
+    use crate::plugins::host::testing::FakeInstance;
+
+    /// `<alias>.status.json` parsed, never asserting on `at`.
+    fn status_json(dir: &TempDir, alias: &str) -> serde_json::Value {
+        let text = std::fs::read_to_string(status_path(dir.path(), alias)).expect("status file");
+        serde_json::from_str(&text).expect("status json")
+    }
+
+    /// Runs one scripted plugin for `duration` seconds on the default spec.
+    async fn run_scripted(
+        alias: &str,
+        steps: Vec<FakeStep>,
+        cursors: &Arc<CursorStore>,
+        duration: u64,
+    ) -> PluginReport {
+        run_for(
+            default_spec(alias),
+            Arc::new(FakeFactory::new(steps)),
+            Arc::new(VecSink::default()),
+            Arc::clone(cursors),
+            secs(duration),
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_ok_with_the_item_count() {
+        let (dir, cursors) = store();
+        let steps = vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items: vec![wit_item("a"), wit_item("b")],
+                next_cursor: None,
+                delay: Duration::ZERO,
+            },
+        ];
+        run_scripted("ok", steps, &cursors, 10).await;
+        let status = status_json(&dir, "ok");
+        assert_eq!(status["plugin"], "ok");
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["items"], 2);
+        assert!(status["error"].is_null(), "{status}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_a_guest_error_and_leaves_the_cursor_file_untouched() {
+        let (dir, cursors) = store();
+        run_scripted("g", vec![FakeStep::InitOk, err_transient()], &cursors, 10).await;
+        let status = status_json(&dir, "g");
+        assert_eq!(status["ok"], false);
+        assert!(status["items"].is_null(), "{status}");
+        let error = status["error"].as_str().expect("error text");
+        assert!(error.starts_with("poll transient:"), "{error}");
+        assert!(
+            !cursors.path_for("g").exists(),
+            "a run that only failed must not create a cursor file"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_a_trap() {
+        let (dir, cursors) = store();
+        let steps = vec![FakeStep::InitOk, FakeStep::Trap("wasm trap".to_string())];
+        run_scripted("t", steps, &cursors, 10).await;
+        let status = status_json(&dir, "t");
+        assert_eq!(status["ok"], false);
+        let error = status["error"].as_str().expect("error text");
+        assert!(error.starts_with("instance fault:"), "{error}");
+    }
+
+    /// Accepts the first batch, then fails every later one, noting what the
+    /// plugin's cursor file held at the first failure.
+    struct FailAfterFirst {
+        inner: VecSink,
+        cursors: Arc<CursorStore>,
+        calls: std::sync::atomic::AtomicUsize,
+        bytes_at_failure: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    impl ItemSink for FailAfterFirst {
+        async fn send_batch(
+            &self,
+            plugin: &str,
+            records: Vec<SinkRecord>,
+        ) -> Result<(), SinkError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return self.inner.send_batch(plugin, records).await;
+            }
+            let bytes = std::fs::read(self.cursors.path_for(plugin)).expect("cursor bytes");
+            *self.bytes_at_failure.lock().expect("bytes") = Some(bytes);
+            Err(SinkError("broker unavailable".to_string()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_a_sink_failure_and_the_cursor_file_stays_byte_identical() {
+        let (dir, cursors) = store();
+        let sink = Arc::new(FailAfterFirst {
+            inner: VecSink::default(),
+            cursors: Arc::clone(&cursors),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bytes_at_failure: std::sync::Mutex::new(None),
+        });
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_item("a", Some(vec![1])),
+            poll_item("b", Some(vec![2])),
+        ]));
+        run_for(
+            default_spec("sf"),
+            factory,
+            Arc::clone(&sink),
+            Arc::clone(&cursors),
+            secs(310),
+        )
+        .await;
+
+        let status = status_json(&dir, "sf");
+        assert_eq!(status["ok"], false);
+        let error = status["error"].as_str().expect("error text");
+        assert!(error.starts_with("item sink failed:"), "{error}");
+
+        let before = sink
+            .bytes_at_failure
+            .lock()
+            .expect("bytes")
+            .clone()
+            .expect("the sink failed once");
+        assert_eq!(
+            std::fs::read(cursors.path_for("sf")).expect("cursor bytes"),
+            before,
+            "a status write changed the cursor file"
+        );
+        assert_eq!(cursors.read("sf").expect("read"), Some(vec![1]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_the_disable_reason() {
+        let (dir, cursors) = store();
+        let steps = vec![
+            FakeStep::InitOk,
+            FakeStep::PollErr(PollError::Fatal("dead".to_string())),
+        ];
+        let report = run_scripted("d", steps, &cursors, 10).await;
+        let reason = report.disabled.expect("disabled");
+        let status = status_json(&dir, "d");
+        assert_eq!(status["ok"], false);
+        assert_eq!(status["error"], reason.as_str());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_an_oversize_cursor() {
+        let (dir, cursors) = store();
+        let steps = vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items: vec![wit_item("a")],
+                next_cursor: Some(vec![7; MAX_CURSOR_BYTES + 1]),
+                delay: Duration::ZERO,
+            },
+        ];
+        run_scripted("big", steps, &cursors, 10).await;
+        let status = status_json(&dir, "big");
+        assert_eq!(status["ok"], false);
+        let error = status["error"].as_str().expect("error text");
+        assert!(error.contains("4096 byte cap"), "{error}");
+        assert!(!cursors.path_for("big").exists(), "cursor must not be written");
+    }
+
+    /// A factory whose every build fails.
+    struct FailingFactory;
+
+    impl InstanceFactory for FailingFactory {
+        type Instance = FakeInstance;
+
+        async fn instantiate(&self, _plugin: &str) -> Result<FakeInstance, InstanceBuildError> {
+            Err(InstanceBuildError("no memory".to_string()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_a_build_failure() {
+        let (dir, cursors) = store();
+        run_for(
+            default_spec("bf"),
+            Arc::new(FailingFactory),
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(10),
+        )
+        .await;
+        let status = status_json(&dir, "bf");
+        assert_eq!(status["ok"], false);
+        assert!(status["items"].is_null(), "{status}");
+        let error = status["error"].as_str().expect("error text");
+        assert!(error.starts_with("instance build failed:"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_an_init_failure() {
+        let (dir, cursors) = store();
+        let steps = vec![FakeStep::InitErr(PollError::Transient(
+            "not ready".to_string(),
+        ))];
+        run_scripted("if", steps, &cursors, 10).await;
+        let status = status_json(&dir, "if");
+        assert_eq!(status["ok"], false);
+        let error = status["error"].as_str().expect("error text");
+        assert!(error.starts_with("init "), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_records_a_corrupt_cursor_disable_and_keeps_the_bad_file() {
+        let (dir, cursors) = store();
+        let garbage: &[u8] = b"{not json \xff\xfe";
+        let path = cursors.path_for("a");
+        std::fs::write(&path, garbage).expect("write garbage");
+        let report = run_scripted("a", vec![FakeStep::InitOk], &cursors, 10).await;
+
+        let reason = report.disabled.expect("a is disabled");
+        let status = status_json(&dir, "a");
+        assert_eq!(status["ok"], false);
+        assert_eq!(status["error"], reason.as_str());
+        assert!(reason.contains("a.json"), "{reason}");
+        assert_eq!(std::fs::read(&path).expect("file"), garbage, "bytes changed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_text_is_cleaned() {
+        let (dir, cursors) = store();
+        let steps = vec![
+            FakeStep::InitOk,
+            FakeStep::PollErr(PollError::Fatal("boom\u{1b}[31m red".to_string())),
+        ];
+        run_scripted("c", steps, &cursors, 10).await;
+        let status = status_json(&dir, "c");
+        let error = status["error"].as_str().expect("error text");
+        assert!(error.contains("boom"), "{error}");
+        assert!(!error.contains('\u{1b}'), "{error:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sched_status_write_failure_does_not_fail_the_cycle() {
+        let (logs, _guard) = LogCapture::start();
+        let (dir, cursors) = store();
+        // A directory where the status file belongs makes every status write fail.
+        std::fs::create_dir(status_path(dir.path(), "w")).expect("directory named w.status.json");
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::poll_ok(Some(vec![1])),
+            FakeStep::poll_ok(Some(vec![2])),
+        ]));
+        let report = run_for(
+            spec("w", 60, 60, 3600, 2.0),
+            factory,
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            secs(100),
+        )
+        .await;
+
+        assert_eq!(report.polls, 2);
+        assert_eq!(report.failures, 0, "a status failure is not a plugin failure");
+        assert_eq!(report.disabled, None);
+        assert_eq!(cursors.read("w").expect("read"), Some(vec![2]));
+        let text = logs.text();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("WARN") && l.contains("plugin=w")),
+            "no warn line naming the plugin in:\n{text}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

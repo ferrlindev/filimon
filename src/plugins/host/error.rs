@@ -97,4 +97,13 @@ pub enum HostError {
         path: String,
         reason: String,
     },
+
+    /// A poll status file could not be written. Never fatal for the plugin.
+    #[error("plugin `{plugin}`: cannot write status file `{path}`: {reason}")]
+    #[diagnostic(code(fili::host::status_write))]
+    StatusWrite {
+        plugin: String,
+        path: String,
+        reason: String,
+    },
 }

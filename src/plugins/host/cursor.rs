@@ -8,9 +8,15 @@
 // unreadable or corrupt file is an error the scheduler turns into a disabled
 // plugin, and it is never reset automatically. The store holds an exclusive
 // lock on `<state_dir>/.lock` so two fili processes cannot share a directory.
+//
+// Next to each cursor file the scheduler leaves `<alias>.status.json`: the
+// outcome of the plugin's latest cycle, for `fili plugins list`. It is a
+// separate file so a status write can never alter or create a cursor, and it
+// is read without the lock and without creating anything.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -39,6 +45,116 @@ struct StateFile {
 /// Name of the lock file inside the state directory.
 const LOCK_FILE: &str = ".lock";
 
+/// Version written into every status file.
+pub const STATUS_VERSION: u32 = 1;
+
+/// Largest status file `read_status` looks at, in bytes.
+pub const MAX_STATUS_BYTES: u64 = 64 * 1024;
+
+/// The outcome of a plugin's latest cycle, as stored in `<alias>.status.json`.
+/// Unknown fields are tolerated on read so later phases can add fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollStatus {
+    pub version: u32,
+    pub plugin: String,
+    /// Wall-clock RFC 3339 UTC time to the second, e.g. `2026-01-02T03:04:05Z`.
+    pub at: String,
+    pub ok: bool,
+    /// The cleaned `describe` text of a failed cycle.
+    pub error: Option<String>,
+    /// Records the sink accepted this cycle, when the cycle sent any.
+    pub items: Option<u64>,
+}
+
+impl PollStatus {
+    /// A status stamped with the current wall-clock time.
+    #[must_use]
+    pub fn now(plugin: &str, ok: bool, error: Option<String>, items: Option<u64>) -> Self {
+        Self {
+            version: STATUS_VERSION,
+            plugin: plugin.to_string(),
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ok,
+            error,
+            items,
+        }
+    }
+}
+
+/// What reading a status file found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusRead {
+    /// No status file: the plugin has not been polled.
+    Missing,
+    Found(PollStatus),
+    /// The file exists but cannot be used. The reason is fixed text plus, at
+    /// most, a cleaned io error or foreign plugin name; never file content.
+    Unreadable(String),
+}
+
+/// Refuses an empty or blank state directory.
+///
+/// # Errors
+/// `HostError::StateDir` when `dir` is empty or only whitespace.
+pub fn require_state_dir(dir: &Path) -> Result<(), HostError> {
+    if dir.as_os_str().is_empty() || dir.to_string_lossy().trim().is_empty() {
+        return Err(HostError::StateDir {
+            path: dir.display().to_string(),
+            reason: "state directory must not be empty".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The status file for `alias` inside `dir`.
+#[must_use]
+pub fn status_path(dir: &Path, alias: &str) -> PathBuf {
+    dir.join(format!("{alias}.status.json"))
+}
+
+/// Reads `alias`'s status file without taking the directory lock, creating
+/// anything or writing anything, so it works while `fili run` holds the lock.
+#[must_use]
+pub fn read_status(dir: &Path, alias: &str) -> StatusRead {
+    let path = status_path(dir, alias);
+    let unreadable = |e: &std::io::Error| {
+        StatusRead::Unreadable(format!(
+            "cannot read status file: {}",
+            clean_guest_text(&e.to_string(), 160)
+        ))
+    };
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StatusRead::Missing,
+        Err(e) => return unreadable(&e),
+    };
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(MAX_STATUS_BYTES + 1).read_to_end(&mut bytes) {
+        return unreadable(&e);
+    }
+    if bytes.len() as u64 > MAX_STATUS_BYTES {
+        return StatusRead::Unreadable(format!(
+            "status file is larger than {MAX_STATUS_BYTES} bytes"
+        ));
+    }
+    let Ok(status) = serde_json::from_slice::<PollStatus>(&bytes) else {
+        return StatusRead::Unreadable("not a valid status file".to_string());
+    };
+    if status.version > STATUS_VERSION {
+        return StatusRead::Unreadable(format!(
+            "unsupported status file version {}",
+            status.version
+        ));
+    }
+    if status.plugin != alias {
+        return StatusRead::Unreadable(format!(
+            "file belongs to plugin `{}`",
+            clean_guest_text(&status.plugin, 64)
+        ));
+    }
+    StatusRead::Found(status)
+}
+
 /// Reads and writes the cursor state files in one directory, and holds the
 /// directory's single-instance lock until dropped.
 #[derive(Debug)]
@@ -54,9 +170,10 @@ impl CursorStore {
     ///
     /// # Errors
     /// Returns `HostError::StateDirLocked` when another process holds the
-    /// lock, and `HostError::StateDir` when the directory or lock file cannot
-    /// be created.
+    /// lock, and `HostError::StateDir` when the directory is empty or blank
+    /// (WR-07), or when the directory or lock file cannot be created.
     pub fn open(dir: &Path) -> Result<Self, HostError> {
+        require_state_dir(dir)?;
         let state_dir_error = |e: &std::io::Error| HostError::StateDir {
             path: dir.display().to_string(),
             reason: e.to_string(),
@@ -164,6 +281,29 @@ impl CursorStore {
         temp.persist(&path).map_err(|e| fail(e.error.to_string()))?;
         // Best effort: make the rename itself durable. Some platforms cannot
         // open a directory, and the data is already safe in the file.
+        if let Ok(dir) = File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Atomically stores `status` as `<alias>.status.json`. Never touches the
+    /// cursor file.
+    ///
+    /// # Errors
+    /// Returns `HostError::StatusWrite` when the file cannot be written.
+    pub fn write_status(&self, alias: &str, status: &PollStatus) -> Result<(), HostError> {
+        let path = status_path(&self.dir, alias);
+        let fail = |reason: String| HostError::StatusWrite {
+            plugin: alias.to_string(),
+            path: path.display().to_string(),
+            reason,
+        };
+        let mut temp =
+            tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| fail(e.to_string()))?;
+        serde_json::to_writer(&mut temp, status).map_err(|e| fail(e.to_string()))?;
+        temp.as_file().sync_all().map_err(|e| fail(e.to_string()))?;
+        temp.persist(&path).map_err(|e| fail(e.error.to_string()))?;
         if let Ok(dir) = File::open(&self.dir) {
             let _ = dir.sync_all();
         }
@@ -365,6 +505,155 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["cursor", "plugin", "version"]);
+    }
+
+    #[test]
+    fn status_write_then_read_round_trips() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        let status = PollStatus::now("stub", true, None, Some(2));
+        store.write_status("stub", &status).expect("write status");
+        assert_eq!(read_status(dir.path(), "stub"), StatusRead::Found(status));
+        assert!(dir.path().join("stub.status.json").is_file());
+    }
+
+    #[test]
+    fn status_read_missing_is_missing_and_creates_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("not-created");
+        assert_eq!(read_status(&state, "stub"), StatusRead::Missing);
+        assert!(!state.exists(), "reading must not create the directory");
+    }
+
+    #[test]
+    fn status_path_is_alias_dot_status_dot_json() {
+        let path = status_path(Path::new("/tmp/state"), "stub");
+        assert!(path.ends_with("stub.status.json"), "{}", path.display());
+    }
+
+    // ── WR-07 and the status guarantees ───────────────────────────────────────
+
+    #[test]
+    fn open_rejects_an_empty_state_dir() {
+        let error = CursorStore::open(Path::new("")).expect_err("empty directory");
+        assert!(matches!(error, HostError::StateDir { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("state directory must not be empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_a_blank_state_dir() {
+        let error = CursorStore::open(Path::new("   ")).expect_err("blank directory");
+        assert!(matches!(error, HostError::StateDir { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("state directory must not be empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn require_state_dir_accepts_a_real_path() {
+        let dir = TempDir::new().expect("tempdir");
+        require_state_dir(dir.path()).expect("a real path is accepted");
+        require_state_dir(Path::new("relative/state")).expect("a relative path is accepted");
+    }
+
+    /// Writes `body` as `alias`'s status file.
+    fn put_status(dir: &Path, alias: &str, body: &[u8]) {
+        std::fs::write(status_path(dir, alias), body).expect("write status file");
+    }
+
+    #[test]
+    fn status_read_garbage_is_unreadable() {
+        let dir = TempDir::new().expect("tempdir");
+        put_status(dir.path(), "a", b"{not json \xff\xfe");
+        put_status(dir.path(), "b", b"");
+        for alias in ["a", "b"] {
+            match read_status(dir.path(), alias) {
+                StatusRead::Unreadable(reason) => {
+                    assert_eq!(reason, "not a valid status file");
+                }
+                other => panic!("{alias}: expected Unreadable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn status_read_over_cap_is_unreadable() {
+        let dir = TempDir::new().expect("tempdir");
+        put_status(dir.path(), "big", &vec![b' '; 65_537]);
+        assert_eq!(
+            read_status(dir.path(), "big"),
+            StatusRead::Unreadable("status file is larger than 65536 bytes".to_string())
+        );
+    }
+
+    #[test]
+    fn status_read_foreign_plugin_or_future_version_is_unreadable() {
+        let dir = TempDir::new().expect("tempdir");
+        put_status(
+            dir.path(),
+            "a",
+            br#"{"version":1,"plugin":"b","at":"x","ok":true,"error":null,"items":null}"#,
+        );
+        put_status(
+            dir.path(),
+            "c",
+            br#"{"version":2,"plugin":"c","at":"x","ok":true,"error":null,"items":null}"#,
+        );
+        assert_eq!(
+            read_status(dir.path(), "a"),
+            StatusRead::Unreadable("file belongs to plugin `b`".to_string())
+        );
+        assert_eq!(
+            read_status(dir.path(), "c"),
+            StatusRead::Unreadable("unsupported status file version 2".to_string())
+        );
+    }
+
+    #[test]
+    fn status_read_is_lock_free_while_the_store_is_open() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open holds the lock");
+        let status = PollStatus::now(
+            "stub",
+            false,
+            Some("poll transient: later".to_string()),
+            None,
+        );
+        store.write_status("stub", &status).expect("write status");
+        assert_eq!(read_status(dir.path(), "stub"), StatusRead::Found(status));
+        assert_eq!(read_status(dir.path(), "other"), StatusRead::Missing);
+    }
+
+    #[test]
+    fn status_write_leaves_the_cursor_file_alone() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        store.write("a", Some(&[1, 2])).expect("write cursor");
+        let before = std::fs::read(store.path_for("a")).expect("bytes");
+
+        store
+            .write_status("a", &PollStatus::now("a", true, None, Some(1)))
+            .expect("status for an alias with a cursor");
+        store
+            .write_status(
+                "b",
+                &PollStatus::now("b", false, Some("x".to_string()), None),
+            )
+            .expect("status for an alias without one");
+
+        assert_eq!(std::fs::read(store.path_for("a")).expect("bytes"), before);
+        assert!(
+            !store.path_for("b").exists(),
+            "a status write never creates a cursor"
+        );
     }
 
     #[test]
