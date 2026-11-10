@@ -138,7 +138,11 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum PluginsCommand {
     /// List the registered plugins with their last poll.
-    List,
+    List {
+        /// Print the rows as one JSON array
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(test)]
@@ -231,7 +235,25 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Plugins {
-                command: PluginsCommand::List
+                command: PluginsCommand::List { json: false }
+            }
+        ));
+    }
+
+    #[test]
+    fn plugins_list_json_flag_parses() {
+        let cli = Cli::try_parse_from(["fili", "plugins", "list", "--json"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Plugins {
+                command: PluginsCommand::List { json: true }
+            }
+        ));
+        let plain = Cli::try_parse_from(["fili", "plugins", "list"]).expect("parses");
+        assert!(matches!(
+            plain.command,
+            Command::Plugins {
+                command: PluginsCommand::List { json: false }
             }
         ));
     }
