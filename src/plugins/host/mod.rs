@@ -388,7 +388,7 @@ mod tests {
         let (_dir, cursors) = open_cursors();
         let shutdown = CancellationToken::new();
         let abort = CancellationToken::new();
-        let grace = Duration::from_secs(60);
+        let grace = Duration::from_mins(1);
         let start = Instant::now();
         let supervisor = tokio::spawn(supervise(
             vec![one_item_plugin("a"), one_item_plugin("b")],
@@ -428,7 +428,7 @@ mod tests {
             cursors,
             CancellationToken::new(),
             abort.clone(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         ));
 
         tokio::time::sleep(Duration::from_secs(2)).await;
