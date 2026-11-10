@@ -96,7 +96,13 @@ pub enum StatusRead {
 ///
 /// # Errors
 /// `HostError::StateDir` when `dir` is empty or only whitespace.
-pub fn require_state_dir(_dir: &Path) -> Result<(), HostError> {
+pub fn require_state_dir(dir: &Path) -> Result<(), HostError> {
+    if dir.as_os_str().is_empty() || dir.to_string_lossy().trim().is_empty() {
+        return Err(HostError::StateDir {
+            path: dir.display().to_string(),
+            reason: "state directory must not be empty".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -164,9 +170,10 @@ impl CursorStore {
     ///
     /// # Errors
     /// Returns `HostError::StateDirLocked` when another process holds the
-    /// lock, and `HostError::StateDir` when the directory or lock file cannot
-    /// be created.
+    /// lock, and `HostError::StateDir` when the directory is empty or blank
+    /// (WR-07), or when the directory or lock file cannot be created.
     pub fn open(dir: &Path) -> Result<Self, HostError> {
+        require_state_dir(dir)?;
         let state_dir_error = |e: &std::io::Error| HostError::StateDir {
             path: dir.display().to_string(),
             reason: e.to_string(),

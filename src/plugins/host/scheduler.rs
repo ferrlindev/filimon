@@ -346,6 +346,9 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
         Err(e) => {
             report.failures += 1;
             let reason = clean_guest_text(&e.to_string(), REPORT_TEXT_CLIP);
+            // Leave the disable cause where `list` can show it (OQ-7). The bad
+            // cursor file itself is never touched (D-08).
+            record_status_text(&cursors, &spec.name, false, Some(reason.clone()), None);
             disable(&mut report, &spec.name, reason);
             return report;
         }
@@ -364,6 +367,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
             Ok(instance) => instance,
             Err(e) => {
                 let outcome = CycleOutcome::BuildFailed(e.0);
+                record_status(&cursors, &spec.name, &outcome, None);
                 match settle(&spec, &mut state, &mut report, &shutdown, &outcome).await {
                     Next::Stop => return report,
                     Next::Rebuild | Next::Same => continue 'instances,
@@ -386,6 +390,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
             CallOutcome::InstanceFatal(text) => Some(CycleOutcome::InstanceFatal(text)),
         };
         if let Some(outcome) = init_failure {
+            record_status(&cursors, &spec.name, &outcome, None);
             match settle(&spec, &mut state, &mut report, &shutdown, &outcome).await {
                 Next::Stop => return report,
                 Next::Rebuild | Next::Same => continue 'instances,

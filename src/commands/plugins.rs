@@ -12,7 +12,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use miette::IntoDiagnostic;
 
@@ -20,7 +20,7 @@ use crate::cli::PluginsCommand;
 use crate::output::sanitize_for_terminal;
 use crate::plugins::config::{RegistryListing, list_registry};
 use crate::plugins::host::HostOptions;
-use crate::plugins::host::cursor::{PollStatus, StatusRead, read_status};
+use crate::plugins::host::cursor::{PollStatus, StatusRead, read_status, require_state_dir};
 use crate::plugins::host::engine::clean_guest_text;
 
 /// Longest error text shown in the human table, in characters.
@@ -162,18 +162,28 @@ pub fn render_list(rows: &[ListRow], out: &mut impl Write) -> std::io::Result<()
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
+/// Resolves the state directory and refuses an empty or blank one, so no
+/// state file can land in the working directory (WR-07). Every command that
+/// touches the state directory resolves it through here.
+fn state_dir_for(base_dir: &Path, flag: Option<&Path>) -> miette::Result<PathBuf> {
+    let dir = HostOptions::resolve_state_dir(base_dir, flag);
+    require_state_dir(&dir)?;
+    Ok(dir)
+}
+
 /// `fili plugins list`.
 ///
 /// # Errors
 /// Returns the registry's diagnostics when `registry` cannot be read or
-/// parsed, or an io error when `out` cannot be written.
+/// parsed, a state directory error for an empty `--state-dir`, or an io error
+/// when `out` cannot be written.
 pub fn list(
     registry: &Path,
     state_dir_flag: Option<&Path>,
     out: &mut impl Write,
 ) -> miette::Result<()> {
     let listing = list_registry(registry)?;
-    let state_dir = HostOptions::resolve_state_dir(&listing.base_dir, state_dir_flag);
+    let state_dir = state_dir_for(&listing.base_dir, state_dir_flag)?;
     let rows = collect_list(&listing, &state_dir);
     if rows.is_empty() {
         writeln!(

@@ -10,6 +10,17 @@ const DEFAULT_REGISTRY: &str = "filimon.toml";
 /// Where `fili consume` writes its JSON output in batch mode.
 pub const DEFAULT_OUTPUT: &str = "output/wise_output.json";
 
+/// A path value that is not empty and not only whitespace. An empty
+/// `--state-dir` would otherwise put the lock and state files in the working
+/// directory (WR-07).
+fn non_blank_path(value: &str) -> Result<PathBuf, String> {
+    if value.trim().is_empty() {
+        Err("must not be empty or blank".to_string())
+    } else {
+        Ok(PathBuf::from(value))
+    }
+}
+
 /// Which sources `fili consume` reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum SourceFilter {
@@ -41,11 +52,7 @@ pub struct Cli {
     pub registry: PathBuf,
 
     /// Directory for per-plugin cursor files. Defaults to `.fili-state/` next to the registry file.
-    #[arg(long, global = true, env = "FILI_STATE_DIR")]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "consumed by the plugin run command in Phase 4")
-    )]
+    #[arg(long, global = true, env = "FILI_STATE_DIR", value_parser = non_blank_path)]
     pub state_dir: Option<PathBuf>,
 
     /// Relevance threshold for filtering [0.0 - 1.0]
