@@ -143,6 +143,13 @@ pub enum PluginsCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Check a plugin's component against its WIT world and validate its config and secrets, without polling
+    Check {
+        /// The registered plugin to check
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[cfg(test)]
@@ -256,6 +263,18 @@ mod tests {
                 command: PluginsCommand::List { json: false }
             }
         ));
+    }
+
+    #[test]
+    fn plugins_check_parses() {
+        let cli = Cli::try_parse_from(["fili", "plugins", "check", "stub"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Plugins {
+                command: PluginsCommand::Check { ref name }
+            } if name == "stub"
+        ));
+        assert!(Cli::try_parse_from(["fili", "plugins", "check"]).is_err());
     }
 
     #[test]

@@ -171,6 +171,28 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// The plugin this problem belongs to, or `None` for a problem that
+    /// concerns the registry or the `.env` as a whole.
+    #[must_use]
+    pub fn plugin(&self) -> Option<&str> {
+        match self {
+            Self::PluginFileMissing { plugin, .. }
+            | Self::PluginFileMalformed { plugin, .. }
+            | Self::InvalidValue { plugin, .. }
+            | Self::MissingSecret { plugin, .. }
+            | Self::EmptySecret { plugin, .. }
+            | Self::UnknownFetcher { plugin, .. }
+            | Self::DisabledFetcher { plugin, .. }
+            | Self::InvalidName { plugin, .. }
+            | Self::DuplicateName { plugin } => Some(plugin),
+            Self::RegistryUnreadable { .. }
+            | Self::RegistryMalformed { .. }
+            | Self::DotenvInvalid { .. } => None,
+        }
+    }
+}
+
 /// Every problem found in one load of the plugin configuration.
 ///
 /// Deliberately carries no diagnostic code, so each `fili::config::` code in a

@@ -7,6 +7,12 @@
 // file, a secret or a component, never takes the state directory lock and
 // never creates or writes anything, so it is safe while `fili run` is polling.
 //
+// `check <name>` validates one plugin without polling it: its component goes
+// through the host's own preflight (`check_component`) and its TOML and
+// secrets through the plugin-scoped config loader. It never calls guest
+// `init` or `poll`, never takes the state-directory lock and never creates the
+// state directory. Only alias names are printed for secrets, never values.
+//
 // Everything that came from a file is untrusted at print time and passes
 // through `sanitize_for_terminal` or `clean_guest_text`.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,10 +24,13 @@ use miette::IntoDiagnostic;
 
 use crate::cli::PluginsCommand;
 use crate::output::sanitize_for_terminal;
-use crate::plugins::config::{RegistryListing, list_registry};
+use crate::plugins::config::{RegistryListing, list_registry, load_plugin_with_env};
+use crate::plugins::error::ConfigErrors;
 use crate::plugins::host::HostOptions;
 use crate::plugins::host::cursor::{PollStatus, StatusRead, read_status, require_state_dir};
-use crate::plugins::host::engine::clean_guest_text;
+use crate::plugins::host::engine::{HostEngine, clean_guest_text};
+use crate::plugins::host::error::HostError;
+use crate::plugins::host::loader::{PluginKind, check_component};
 
 /// Longest error text shown in the human table, in characters.
 const TABLE_ERROR_CLIP: usize = 80;
@@ -265,6 +274,235 @@ pub fn list(
     render_list(&rows, out).into_diagnostic()
 }
 
+// ── Check ─────────────────────────────────────────────────────────────────────
+
+/// Longest plugin name echoed back in an error, in characters.
+const NAME_ECHO_CLIP: usize = 64;
+
+/// Longest engine error kept in a diagnostic, in characters.
+const ENGINE_REASON_CLIP: usize = 512;
+
+/// Whether the component passed the host's preflight.
+#[derive(Debug)]
+pub enum ComponentCheck {
+    Ok,
+    Failed(HostError),
+}
+
+/// What the check says about a plugin's own TOML and secrets.
+#[derive(Debug)]
+pub enum ConfigCheck {
+    /// The TOML and every declared secret are valid.
+    Ok {
+        poll_interval_secs: u64,
+        /// Alias names only, never values.
+        secrets: Vec<String>,
+    },
+    Failed(ConfigErrors),
+    /// A disabled source: its config is not validated.
+    Skipped,
+    /// A fetcher has no config file.
+    NoConfigFile,
+}
+
+/// The outcome of checking one plugin.
+#[derive(Debug)]
+pub struct CheckReport {
+    pub name: String,
+    pub kind: PluginKind,
+    pub component: ComponentCheck,
+    pub config: ConfigCheck,
+}
+
+impl CheckReport {
+    /// `true` only when no part failed. A skipped or absent config is not a
+    /// failure, and it is printed as such.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        matches!(self.component, ComponentCheck::Ok)
+            && !matches!(self.config, ConfigCheck::Failed(_))
+    }
+}
+
+/// `sources: a, b; fetchers: f`, with `none` for an empty list.
+fn registered_plugins(listing: &RegistryListing) -> String {
+    let join = |names: Vec<&str>| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    format!(
+        "sources: {}; fetchers: {}",
+        join(listing.sources.iter().map(|p| p.name.as_str()).collect()),
+        join(listing.fetchers.iter().map(|p| p.name.as_str()).collect()),
+    )
+}
+
+/// Checks the plugin called `name`: its component against its world, and for a
+/// source its TOML and secrets. `name` is compared exactly, as bytes, against
+/// the registry's names (sources first) and is never used to build a path. The
+/// two halves are independent: a failing component does not stop the config
+/// result from being computed.
+///
+/// # Errors
+/// Returns the registry's diagnostics when it cannot be read, or an error that
+/// lists the registered plugins when `name` is not one of them.
+pub fn run_check(
+    registry: &Path,
+    name: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    engine: &HostEngine,
+) -> miette::Result<CheckReport> {
+    let listing = list_registry(registry)?;
+    let found = listing
+        .sources
+        .iter()
+        .find(|plugin| plugin.name == name)
+        .map(|plugin| (PluginKind::Source, plugin))
+        .or_else(|| {
+            listing
+                .fetchers
+                .iter()
+                .find(|plugin| plugin.name == name)
+                .map(|plugin| (PluginKind::Fetcher, plugin))
+        });
+    let Some((kind, plugin)) = found else {
+        let shown = clean_guest_text(name, NAME_ECHO_CLIP);
+        let path = sanitize_for_terminal(&listing.path.display().to_string());
+        if listing.sources.is_empty() && listing.fetchers.is_empty() {
+            return Err(miette::miette!(
+                "no plugin named `{shown}`: no plugins are registered in {path}"
+            ));
+        }
+        return Err(miette::miette!(
+            "no plugin named `{shown}` in {path} (registered: {})",
+            registered_plugins(&listing)
+        ));
+    };
+
+    let component = match check_component(kind, name, &plugin.component, engine) {
+        Ok(()) => ComponentCheck::Ok,
+        Err(error) => ComponentCheck::Failed(error),
+    };
+
+    let config = match kind {
+        PluginKind::Fetcher => ConfigCheck::NoConfigFile,
+        PluginKind::Source => match load_plugin_with_env(registry, name, env) {
+            Err(errors) => ConfigCheck::Failed(errors),
+            Ok(_) if !plugin.enabled => ConfigCheck::Skipped,
+            Ok(loaded) => match loaded.sources.get(name).and_then(|s| s.plugin.as_ref()) {
+                Some(config) => ConfigCheck::Ok {
+                    poll_interval_secs: config.host.poll_interval.as_secs(),
+                    secrets: config.secrets.keys().cloned().collect(),
+                },
+                None => ConfigCheck::Skipped,
+            },
+        },
+    };
+
+    Ok(CheckReport {
+        name: name.to_string(),
+        kind,
+        component,
+        config,
+    })
+}
+
+/// Writes the check summary: one line per part and a final verdict. Only alias
+/// names are printed for secrets.
+///
+/// # Errors
+/// Returns the write error of `out`.
+pub fn render_check(report: &CheckReport, out: &mut impl Write) -> std::io::Result<()> {
+    let world = report.kind.world();
+    writeln!(
+        out,
+        "plugin `{}` ({world})",
+        sanitize_for_terminal(&report.name)
+    )?;
+    match report.component {
+        ComponentCheck::Ok => writeln!(
+            out,
+            "  component: ok (compiles, imports only filimon:plugin/*, fits the `{world}` world)"
+        )?,
+        ComponentCheck::Failed(_) => writeln!(out, "  component: FAILED")?,
+    }
+    match &report.config {
+        ConfigCheck::Ok {
+            poll_interval_secs,
+            secrets,
+        } => {
+            let aliases = if secrets.is_empty() {
+                "none".to_string()
+            } else {
+                secrets
+                    .iter()
+                    .map(|alias| sanitize_for_terminal(alias))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            writeln!(
+                out,
+                "  config: ok (poll interval {poll_interval_secs}s, secrets: {aliases})"
+            )?;
+        }
+        ConfigCheck::Failed(_) => writeln!(out, "  config: FAILED")?,
+        ConfigCheck::Skipped => writeln!(out, "  config: skipped (plugin is disabled)")?,
+        ConfigCheck::NoConfigFile => {
+            writeln!(out, "  config: none (fetchers have no config file)")?;
+        }
+    }
+    writeln!(
+        out,
+        "{}",
+        if report.passed() {
+            "check passed"
+        } else {
+            "check failed"
+        }
+    )
+}
+
+/// Writes each failing part's diagnostic to `err` in miette's report form.
+/// The diagnostics carry plugin names, paths, field paths, aliases and env var
+/// names only.
+fn write_diagnostics(report: CheckReport, err: &mut impl Write) {
+    if let ComponentCheck::Failed(error) = report.component {
+        writeln!(err, "{:?}", miette::Report::new(error)).ok();
+    }
+    if let ConfigCheck::Failed(errors) = report.config {
+        writeln!(err, "{:?}", miette::Report::new(errors)).ok();
+    }
+}
+
+/// `fili plugins check <name>`: the summary goes to `out`, each failing part's
+/// diagnostic to `err`.
+///
+/// # Errors
+/// Returns an error when the registry cannot be read, `name` is not
+/// registered, the engine cannot start, or any part of the check failed, so
+/// that the process exits non-zero.
+pub fn check(
+    registry: &Path,
+    name: &str,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> miette::Result<()> {
+    let engine = HostEngine::new().map_err(|e| HostError::Engine {
+        reason: clean_guest_text(&format!("{e:#}"), ENGINE_REASON_CLIP),
+    })?;
+    let report = run_check(registry, name, &|key| std::env::var(key).ok(), &engine)?;
+    render_check(&report, out).into_diagnostic()?;
+    if report.passed() {
+        return Ok(());
+    }
+    let shown = sanitize_for_terminal(&report.name);
+    write_diagnostics(report, err);
+    Err(miette::miette!("plugin `{shown}` failed its check"))
+}
+
 /// Runs one `fili plugins` subcommand, writing to stdout.
 ///
 /// # Errors
@@ -281,6 +519,13 @@ pub fn dispatch(
             let stderr = std::io::stderr();
             let mut err = stderr.lock();
             list(registry, state_dir_flag, *json, &mut out, &mut err)
+        }
+        PluginsCommand::Check { name } => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
+            check(registry, name, &mut out, &mut err)
         }
     }
 }
@@ -818,5 +1063,441 @@ mod tests {
         assert!(!err.contains('\u{1b}'), "ESC reached stderr: {err:?}");
         assert_eq!(err.lines().count(), 4, "one note per skipped name: {err:?}");
         assert!(!table.contains("Bad"), "notes never go to stdout: {table}");
+    }
+
+    // ── check ────────────────────────────────────────────────────────────────
+
+    use crate::plugins::error::ConfigError;
+    use crate::plugins::host::testing::{WASI_IMPORT_COMPONENT, fixture_wasm};
+
+    const SECRET_VALUE: &str = "hunter2-distinctive";
+    const GARBAGE: &[u8] = b"this is not a wasm component";
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn engine() -> HostEngine {
+        HostEngine::new().expect("engine")
+    }
+
+    /// Runs `check` on `name` with `env` and no secret from the process.
+    fn check_with(
+        registry: &Path,
+        name: &str,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> CheckReport {
+        run_check(registry, name, env, &engine()).expect("the plugin is registered")
+    }
+
+    /// The summary `render_check` prints.
+    fn summary(report: &CheckReport) -> String {
+        let mut out = Vec::new();
+        render_check(report, &mut out).expect("render");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    /// Everything `check` would print to stderr for `report`, with whitespace
+    /// and miette's gutter removed so wrapped lines can be searched.
+    fn diagnostics(report: CheckReport) -> String {
+        let mut err = Vec::new();
+        write_diagnostics(report, &mut err);
+        squash(&String::from_utf8(err).expect("utf8"))
+    }
+
+    fn squash(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect()
+    }
+
+    /// A one-source registry: `stub` with `component_bytes` and `plugin_toml`.
+    fn stub_registry(dir: &Path, component_bytes: &[u8], plugin_toml: &str) -> PathBuf {
+        std::fs::write(dir.join("stub.wasm"), component_bytes).expect("component");
+        std::fs::write(dir.join("stub.toml"), plugin_toml).expect("plugin toml");
+        write_registry_text(dir, &source_table("stub", true))
+    }
+
+    const MINIMAL_TOML: &str = "[host]\npoll_interval_secs = 60\n";
+
+    fn component_error(report: &CheckReport) -> &HostError {
+        match &report.component {
+            ComponentCheck::Failed(error) => error,
+            ComponentCheck::Ok => panic!("expected a component failure: {report:?}"),
+        }
+    }
+
+    fn config_errors(report: &CheckReport) -> &ConfigErrors {
+        match &report.config {
+            ConfigCheck::Failed(errors) => errors,
+            other => panic!("expected a config failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_unknown_name_lists_registered_plugins() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut text = source_table("a", true);
+        text.push_str(&source_table("b", true));
+        text.push_str("[fetchers.f]\ncomponent = \"f.wasm\"\n");
+        let registry = write_registry_text(dir.path(), &text);
+
+        let error = run_check(&registry, "nope", &no_env, &engine()).expect_err("unknown name");
+        let text = error.to_string();
+        assert!(text.contains("`nope`"), "{text}");
+        assert!(text.contains("sources: a, b"), "{text}");
+        assert!(text.contains("fetchers: f"), "{text}");
+
+        let empty = TempDir::new().expect("tempdir");
+        let registry = write_registry_text(empty.path(), "");
+        let error = run_check(&registry, "nope", &no_env, &engine()).expect_err("unknown name");
+        assert!(
+            error.to_string().contains("no plugins are registered"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn check_empty_name_is_unknown_and_never_a_path() {
+        let dir = TempDir::new().expect("tempdir");
+        // A name joined into a path would find these.
+        std::fs::write(dir.path().join(".wasm"), GARBAGE).expect("decoy component");
+        std::fs::write(dir.path().join(".toml"), MINIMAL_TOML).expect("decoy toml");
+        let registry = stub_registry(dir.path(), GARBAGE, MINIMAL_TOML);
+
+        let error = run_check(&registry, "", &no_env, &engine()).expect_err("empty is unknown");
+
+        let text = error.to_string();
+        assert!(text.contains("no plugin named ``"), "{text}");
+        assert!(text.contains("sources: stub"), "{text}");
+    }
+
+    #[test]
+    fn check_name_is_compared_exactly_and_echoed_sanitized() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = stub_registry(dir.path(), GARBAGE, MINIMAL_TOML);
+
+        for name in ["Stub", "../stub", "stüb", "stub ", "stub\u{1b}[31m"] {
+            let error = run_check(&registry, name, &no_env, &engine())
+                .expect_err("only the exact registry key matches");
+            let text = error.to_string();
+            assert!(text.contains("no plugin named"), "{name:?}: {text}");
+            assert!(!text.chars().any(char::is_control), "{name:?}: {text:?}");
+        }
+
+        let long = "x".repeat(200);
+        let text = run_check(&registry, &long, &no_env, &engine())
+            .expect_err("unknown")
+            .to_string();
+        assert!(
+            text.contains(&format!("`{}…`", "x".repeat(64))),
+            "clipped to 64 characters: {text}"
+        );
+        assert!(!text.contains(&"x".repeat(65)), "{text}");
+    }
+
+    #[test]
+    fn check_garbage_component_names_plugin_and_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = stub_registry(dir.path(), GARBAGE, MINIMAL_TOML);
+
+        let report = check_with(&registry, "stub", &no_env);
+
+        assert!(!report.passed());
+        let error = component_error(&report);
+        assert!(
+            matches!(error, HostError::ComponentLoad { .. }),
+            "{error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("`stub`"), "{text}");
+        assert!(
+            text.contains(&dir.path().join("stub.wasm").display().to_string()),
+            "{text}"
+        );
+        assert!(
+            matches!(report.config, ConfigCheck::Ok { .. }),
+            "{report:?}"
+        );
+        assert!(summary(&report).contains("  component: FAILED"));
+        assert!(summary(&report).ends_with("check failed\n"));
+    }
+
+    #[test]
+    fn check_zero_byte_component_is_a_component_load_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = stub_registry(dir.path(), b"", MINIMAL_TOML);
+
+        let report = check_with(&registry, "stub", &no_env);
+
+        let error = component_error(&report);
+        assert!(
+            matches!(error, HostError::ComponentLoad { .. }),
+            "{error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("`stub`"), "{text}");
+        assert!(text.contains("stub.wasm"), "{text}");
+    }
+
+    #[test]
+    fn check_wasi_import_component_names_the_import() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = stub_registry(dir.path(), WASI_IMPORT_COMPONENT, MINIMAL_TOML);
+
+        let report = check_with(&registry, "stub", &no_env);
+
+        let HostError::ForeignImports { imports, .. } = component_error(&report) else {
+            panic!("expected ForeignImports: {report:?}");
+        };
+        assert_eq!(imports, &vec!["wasi:cli/environment@0.2.0".to_string()]);
+    }
+
+    #[test]
+    fn check_bad_toml_and_bad_host_value_name_plugin_and_field() {
+        let dir = TempDir::new().expect("tempdir");
+
+        let registry = stub_registry(dir.path(), GARBAGE, "[host\npoll_interval_secs = ");
+        let report = check_with(&registry, "stub", &no_env);
+        let errors = config_errors(&report);
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::PluginFileMalformed { plugin, path, .. }
+                    if plugin == "stub" && path.ends_with("stub.toml")
+            ),
+            "{errors:?}"
+        );
+        assert!(summary(&report).contains("  config: FAILED"));
+
+        let registry = stub_registry(dir.path(), GARBAGE, "[host]\npoll_interval_secs = 0\n");
+        let report = check_with(&registry, "stub", &no_env);
+        let text = diagnostics(report);
+        assert!(text.contains("stub"), "{text}");
+        assert!(text.contains("poll_interval_secs"), "{text}");
+
+        let registry = stub_registry(
+            dir.path(),
+            GARBAGE,
+            "[host]\npoll_interval_secs = 60\nallowlist = [\"https://x\"]\n",
+        );
+        let report = check_with(&registry, "stub", &no_env);
+        let errors = config_errors(&report);
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::InvalidValue { plugin, field, .. }
+                    if plugin == "stub" && field == "host.allowlist[0]"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn check_missing_secret_names_plugin_alias_and_env_var() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = stub_registry(
+            dir.path(),
+            GARBAGE,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"STUB_TOKEN\"\n",
+        );
+
+        let report = check_with(&registry, "stub", &no_env);
+
+        let errors = config_errors(&report);
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::MissingSecret { plugin, alias, env_var, .. }
+                    if plugin == "stub" && alias == "token" && env_var == "STUB_TOKEN"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn check_reports_an_unknown_fetcher_reference() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("stub.wasm"), GARBAGE).expect("component");
+        std::fs::write(dir.path().join("stub.toml"), MINIMAL_TOML).expect("plugin toml");
+        let registry = write_registry_text(
+            dir.path(),
+            "[sources.stub]\ncomponent = \"stub.wasm\"\nconfig = \"stub.toml\"\nfetcher = \"nope\"\n",
+        );
+
+        let report = check_with(&registry, "stub", &no_env);
+
+        let errors = config_errors(&report);
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::UnknownFetcher { plugin, fetcher, .. }
+                    if plugin == "stub" && fetcher == "nope"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn check_ignores_other_plugins_broken_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut text = source_table("good", true);
+        text.push_str(&source_table("broken", true));
+        text.push_str(&source_table("needy", true));
+        text.push_str("[sources.\"Bad Name\"]\ncomponent = \"x.wasm\"\nconfig = \"x.toml\"\n");
+        let registry = write_registry_text(dir.path(), &text);
+        std::fs::write(dir.path().join("good.toml"), MINIMAL_TOML).expect("good toml");
+        std::fs::write(dir.path().join("broken.toml"), "[host\nnope = ").expect("broken toml");
+        std::fs::write(
+            dir.path().join("needy.toml"),
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"NEEDY_TOKEN\"\n",
+        )
+        .expect("needy toml");
+
+        let report = check_with(&registry, "good", &no_env);
+
+        assert!(
+            matches!(
+                report.config,
+                ConfigCheck::Ok {
+                    poll_interval_secs: 60,
+                    ..
+                }
+            ),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn check_reports_a_dotenv_problem_only_when_the_plugin_needs_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut text = source_table("plain", true);
+        text.push_str(&source_table("needy", true));
+        let registry = write_registry_text(dir.path(), &text);
+        std::fs::write(dir.path().join("plain.toml"), MINIMAL_TOML).expect("plain toml");
+        std::fs::write(
+            dir.path().join("needy.toml"),
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"NEEDY_TOKEN\"\n",
+        )
+        .expect("needy toml");
+        std::fs::write(dir.path().join(".env"), "NEEDY_TOKEN=has a space\n").expect(".env");
+
+        let plain = check_with(&registry, "plain", &no_env);
+        assert!(matches!(plain.config, ConfigCheck::Ok { .. }), "{plain:?}");
+
+        let needy = check_with(&registry, "needy", &no_env);
+        let errors = config_errors(&needy);
+        assert!(
+            errors
+                .problems
+                .iter()
+                .any(|p| matches!(p, ConfigError::DotenvInvalid { line: Some(1), .. })),
+            "{errors:?}"
+        );
+        let text = diagnostics(needy);
+        assert!(text.contains(".env"), "{text}");
+        assert!(
+            !text.contains("hasaspace"),
+            "the .env content leaked: {text}"
+        );
+    }
+
+    #[test]
+    fn check_disabled_source_validates_component_only_and_says_config_skipped() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("off.wasm"), GARBAGE).expect("component");
+        std::fs::write(dir.path().join("f.wasm"), GARBAGE).expect("fetcher component");
+        // `off.toml` does not exist: a disabled source's config is never read.
+        let registry = write_registry_text(
+            dir.path(),
+            &format!(
+                "{}[fetchers.f]\ncomponent = \"f.wasm\"\n",
+                source_table("off", false)
+            ),
+        );
+
+        let off = check_with(&registry, "off", &no_env);
+        assert!(matches!(off.config, ConfigCheck::Skipped), "{off:?}");
+        assert!(
+            matches!(off.component, ComponentCheck::Failed(_)),
+            "{off:?}"
+        );
+        let text = summary(&off);
+        assert!(
+            text.contains("  config: skipped (plugin is disabled)\n"),
+            "{text}"
+        );
+        assert!(text.contains("  component: FAILED\n"), "{text}");
+
+        let fetcher = check_with(&registry, "f", &no_env);
+        assert!(
+            matches!(fetcher.config, ConfigCheck::NoConfigFile),
+            "{fetcher:?}"
+        );
+        let text = summary(&fetcher);
+        assert!(text.starts_with("plugin `f` (fetcher)\n"), "{text}");
+        assert!(
+            text.contains("  config: none (fetchers have no config file)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn check_does_not_print_secret_values() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = stub_registry(
+            dir.path(),
+            GARBAGE,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"STUB_TOKEN\"\nmissing = \"STUB_MISSING\"\n",
+        );
+        let env = |key: &str| (key == "STUB_TOKEN").then(|| SECRET_VALUE.to_string());
+
+        // One secret is set and one is not: the config fails, the component
+        // fails, and both diagnostics are rendered.
+        let report = check_with(&registry, "stub", &env);
+        let shown = summary(&report);
+        let debug = format!("{report:?}");
+        let rendered = diagnostics(report);
+
+        // A passing config with the secret set.
+        let registry = stub_registry(
+            dir.path(),
+            GARBAGE,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"STUB_TOKEN\"\n",
+        );
+        let passing = check_with(&registry, "stub", &env);
+        let passing_summary = summary(&passing);
+        assert!(
+            passing_summary.contains("secrets: token"),
+            "{passing_summary}"
+        );
+        let passing_debug = format!("{passing:?}");
+
+        for text in [&shown, &debug, &rendered, &passing_summary, &passing_debug] {
+            for leaked in [SECRET_VALUE, "hunter2", "distinctive"] {
+                assert!(!text.contains(leaked), "leaked {leaked:?} in: {text}");
+            }
+        }
+        assert!(rendered.contains("STUB_MISSING"), "env var names are shown");
+    }
+
+    #[test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    fn wasm_check_a_fetcher_component_registered_as_a_source_is_a_wrong_world() {
+        let dir = TempDir::new().expect("tempdir");
+        let fetcher = fixture_wasm("stub-fetcher", "stub_fetcher.wasm");
+        let bytes = std::fs::read(fetcher).expect("read fetcher component");
+        let registry = stub_registry(dir.path(), &bytes, MINIMAL_TOML);
+
+        let report = check_with(&registry, "stub", &no_env);
+
+        let error = component_error(&report);
+        assert!(
+            matches!(error, HostError::WrongWorld { kind: "source", .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("`source` world"), "{error}");
+        assert!(!report.passed());
     }
 }
