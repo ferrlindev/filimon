@@ -127,11 +127,14 @@ pub enum Command {
         paths: Vec<PathBuf>,
     },
 
-    /// Inspect, validate, try and run registered plugins.
+    /// Inspect, validate and try registered plugins.
     Plugins {
         #[command(subcommand)]
         command: PluginsCommand,
     },
+
+    /// Poll every enabled source plugin on its interval and produce items to Fluvio until stopped.
+    Run,
 }
 
 /// The `fili plugins` subcommands.

@@ -9,6 +9,8 @@
 //   fili consume         Read news through the SmartModule chain and social items
 //                        from filimon-social-items, merged, and write JSON
 //   fili watch           Watch directories and produce HTML to Fluvio
+//   fili plugins ...     List, check and try registered plugins
+//   fili run             Poll every enabled source plugin and produce to Fluvio
 //
 // Pipeline Architecture (via SmartModules):
 //   filimon-raw-pages → [map-preprocess] → [map-extract] → [filter-relevance] → fili consume
@@ -31,7 +33,7 @@ mod streaming;
 
 use clap::Parser;
 use cli::{Cli, Command};
-use commands::{run_consume, run_plugins, run_produce, run_watch};
+use commands::{run_consume, run_plugin_host, run_plugins, run_produce, run_watch};
 use models::SourceItem;
 use scorer::NerEngine;
 use std::path::{Path, PathBuf};
@@ -79,10 +81,11 @@ fn init_logging() {
 
 // ── Entry Point ───────────────────────────────────────────────────────────────
 
-/// Whether the decorative banner is printed. The `plugins` subcommands print
-/// only their own output, so stdout stays exactly what the command wrote.
+/// Whether the decorative banner is printed. The `plugins` subcommands and
+/// `run` print only their own output, so stdout stays exactly what the command
+/// wrote.
 fn shows_banner(command: &Command) -> bool {
-    !matches!(command, Command::Plugins { .. })
+    !matches!(command, Command::Plugins { .. } | Command::Run)
 }
 
 #[tokio::main]
@@ -124,6 +127,7 @@ async fn main() -> miette::Result<()> {
         Command::Plugins { ref command } => {
             run_plugins(command, &cli.registry, cli.state_dir.as_deref()).await?;
         }
+        Command::Run => run_plugin_host(&cli.registry, cli.state_dir.as_deref()).await?,
     }
 
     Ok(())
@@ -458,6 +462,12 @@ mod tests {
         assert!(!shows_banner(&plugins.command));
         let watch = Cli::try_parse_from(["fili", "watch"]).expect("parses");
         assert!(shows_banner(&watch.command));
+    }
+
+    #[test]
+    fn banner_is_skipped_for_run() {
+        let run = Cli::try_parse_from(["fili", "run"]).expect("parses");
+        assert!(!shows_banner(&run.command));
     }
 
     #[test]

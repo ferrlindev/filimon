@@ -243,7 +243,7 @@ pub fn render_list_json(rows: &[ListRow], out: &mut impl Write) -> std::io::Resu
 /// Resolves the state directory and refuses an empty or blank one, so no
 /// state file can land in the working directory (WR-07). Every command that
 /// touches the state directory resolves it through here.
-fn state_dir_for(base_dir: &Path, flag: Option<&Path>) -> miette::Result<PathBuf> {
+pub(crate) fn state_dir_for(base_dir: &Path, flag: Option<&Path>) -> miette::Result<PathBuf> {
     let dir = HostOptions::resolve_state_dir(base_dir, flag);
     require_state_dir(&dir)?;
     Ok(dir)
