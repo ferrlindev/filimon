@@ -122,7 +122,7 @@ async fn main() -> miette::Result<()> {
             run_file(paths).await?;
         }
         Command::Plugins { ref command } => {
-            run_plugins(command, &cli.registry, cli.state_dir.as_deref())?;
+            run_plugins(command, &cli.registry, cli.state_dir.as_deref()).await?;
         }
     }
 

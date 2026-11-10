@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::backoff;
 use super::cursor::{CursorStore, MAX_CURSOR_BYTES, PollStatus};
-use super::engine::{PollError, clean_guest_text};
+use super::engine::{PollError, PollResponse, clean_guest_text};
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
 use super::sink::{ItemSink, SinkRecord};
@@ -244,13 +244,45 @@ pub(crate) fn record_status_text(
     }
 }
 
+/// The only place a secret value is read: the `(alias, value)` pairs handed to
+/// the guest's `init`. Shared by the scheduler loop and `run-once`, so there is
+/// one exposure site.
+pub(crate) fn expose_secrets(spec: &PluginSpec) -> Vec<(String, String)> {
+    spec.secrets
+        .iter()
+        .map(|(alias, secret)| (alias.clone(), secret.expose().to_string()))
+        .collect()
+}
+
+/// The plugin fault for a `next-cursor` over `MAX_CURSOR_BYTES`, as a poll
+/// error. `None` when the cursor is absent or within the cap.
+fn oversize_cursor_error(response: &PollResponse) -> Option<PollError> {
+    let len = response.next_cursor.as_ref().map_or(0, Vec::len);
+    (len > MAX_CURSOR_BYTES).then(|| {
+        PollError::Fatal(format!(
+            "next-cursor is {len} bytes, over the {MAX_CURSOR_BYTES} byte cap"
+        ))
+    })
+}
+
+/// An oversize cursor is a plugin fault: nothing from the poll is sent and the
+/// cursor is never persisted. It is `fatal` because the same instance and
+/// cursor reproduce it. The scheduler and `run-once` both classify through the
+/// same rule.
+pub(crate) fn oversize_cursor_outcome(response: &PollResponse) -> Option<CycleOutcome> {
+    oversize_cursor_error(response).map(|error| CycleOutcome::Guest {
+        phase: Phase::Poll,
+        error,
+    })
+}
+
 /// Sends one poll's records. Returns the number of records sent, or a host-side
 /// failure text (never blamed on the plugin).
 ///
 /// There is no timeout here: the sink bounds its own wait (`SINK_TIMEOUT` in
 /// `FluvioSink`) so that a slow send cleans up after itself. Dropping the future
 /// from outside would skip that cleanup.
-async fn send_records<S: ItemSink>(
+pub(crate) async fn send_records<S: ItemSink>(
     sink: &S,
     plugin: &str,
     records: Vec<SinkRecord>,
@@ -354,12 +386,8 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
         }
     };
 
-    // The only place a secret value is read.
-    let secrets: Vec<(String, String)> = spec
-        .secrets
-        .iter()
-        .map(|(alias, secret)| (alias.clone(), secret.expose().to_string()))
-        .collect();
+    // The only place a secret value is read (shared with `run-once`).
+    let secrets = expose_secrets(&spec);
 
     'instances: loop {
         // A fresh instance.
@@ -405,27 +433,20 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
                 polled = instance.poll(cursor.as_deref()) => polled,
             };
 
+            // An oversize cursor is a plugin fault (the rule `run-once` shares):
+            // nothing from this poll is sent and the cursor is never persisted.
+            let polled = match polled {
+                CallOutcome::Ok(response) => match oversize_cursor_error(&response) {
+                    Some(error) => CallOutcome::Guest(error),
+                    None => CallOutcome::Ok(response),
+                },
+                other => other,
+            };
+
             // Records the sink accepted this cycle, for the status file.
             let mut sent: Option<u64> = None;
 
             let outcome = match polled {
-                // An oversize cursor is a plugin fault: nothing from this poll
-                // is sent and the cursor is never persisted. It is `fatal`
-                // because the same instance and cursor reproduce it.
-                CallOutcome::Ok(response)
-                    if response
-                        .next_cursor
-                        .as_ref()
-                        .is_some_and(|c| c.len() > MAX_CURSOR_BYTES) =>
-                {
-                    let len = response.next_cursor.as_ref().map_or(0, Vec::len);
-                    CycleOutcome::Guest {
-                        phase: Phase::Poll,
-                        error: PollError::Fatal(format!(
-                            "next-cursor is {len} bytes, over the {MAX_CURSOR_BYTES} byte cap"
-                        )),
-                    }
-                }
                 CallOutcome::Ok(response) => {
                     report.polls += 1;
                     let mapped = map_items(&spec.name, response.items);

@@ -13,6 +13,7 @@ pub mod error;
 pub mod instance;
 pub mod loader;
 pub mod map;
+pub mod once;
 pub mod scheduler;
 pub mod sink;
 

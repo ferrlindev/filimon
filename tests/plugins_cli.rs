@@ -469,3 +469,47 @@ fn wasm_check_passes_the_real_stub_fetcher() {
     assert!(text.contains("config: none"), "{text}");
     assert!(text.contains("check passed"), "{text}");
 }
+
+// ── run-once ──────────────────────────────────────────────────────────────────
+//
+// No test here passes the produce option: it writes to the production topic
+// `filimon-social-items`, so it is covered only with in-memory sinks.
+
+/// The tracer: one dry-run poll of the real stub source prints its item and
+/// leaves the state directory absent.
+#[test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+fn wasm_run_once_stub_dry_run_prints_stub_0_and_creates_no_state() {
+    let dir = TempDir::new().expect("tempdir");
+    let registry = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/plugins/filimon.toml");
+    let state = dir.path().join("state");
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["plugins", "run-once", "stub"])
+        .output()
+        .expect("run fili");
+
+    assert!(
+        output.status.success(),
+        "exit {:?}, stderr: {}",
+        output.status.code(),
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    assert!(text.contains("stub:stub-0"), "{text}");
+    assert!(text.contains("dry run:"), "{text}");
+    assert!(!text.contains('╔'), "the banner leaked into stdout: {text}");
+    assert!(
+        !stderr(&output).to_lowercase().contains("fluvio"),
+        "a dry run must not talk to Fluvio: {}",
+        stderr(&output)
+    );
+    assert!(
+        !state.exists(),
+        "a dry run must not create the state directory"
+    );
+}
