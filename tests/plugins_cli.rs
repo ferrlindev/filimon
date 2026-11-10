@@ -77,3 +77,37 @@ fn list_prints_the_registered_plugins_and_no_banner() {
         "list must not create the state directory"
     );
 }
+
+#[test]
+fn list_json_stdout_parses_as_a_json_array() {
+    let dir = TempDir::new().expect("tempdir");
+    let registry = write_registry(dir.path());
+    let state = dir.path().join("state");
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["plugins", "list", "--json"])
+        .output()
+        .expect("run fili");
+
+    assert!(
+        output.status.success(),
+        "exit {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout.first(), Some(&b'['), "{}", stdout(&output));
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("stdout is one JSON array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    for key in ["name", "kind", "enabled", "fetcher", "last_poll"] {
+        assert!(rows[0].get(key).is_some(), "missing key {key}: {rows:?}");
+    }
+    assert_eq!(rows[0]["name"], "alpha");
+    assert_eq!(rows[0]["kind"], "source");
+    assert_eq!(rows[0]["last_poll"]["state"], "never");
+    assert!(!state.exists(), "list must not create the state directory");
+}

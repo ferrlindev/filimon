@@ -26,6 +26,12 @@ use crate::plugins::host::engine::clean_guest_text;
 /// Longest error text shown in the human table, in characters.
 const TABLE_ERROR_CLIP: usize = 80;
 
+/// Longest error text kept in the JSON output, in characters.
+const JSON_ERROR_CLIP: usize = 512;
+
+/// Longest timestamp text kept in the JSON output, in characters.
+const JSON_AT_CLIP: usize = 64;
+
 /// The table's column headings, in order.
 const HEADINGS: [&str; 5] = ["NAME", "KIND", "ENABLED", "FETCHER", "LAST POLL"];
 
@@ -160,6 +166,52 @@ pub fn render_list(rows: &[ListRow], out: &mut impl Write) -> std::io::Result<()
     Ok(())
 }
 
+/// The `last_poll` object of one JSON row. Every string that came from a file
+/// is cleaned and bounded before it is put into the value.
+fn last_poll_json(last_poll: &LastPoll) -> serde_json::Value {
+    let object = |state: &str, at: Option<&str>, items: Option<u64>, error: Option<&str>| {
+        serde_json::json!({
+            "state": state,
+            "at": at.map(|text| clean_guest_text(text, JSON_AT_CLIP)),
+            "items": items,
+            "error": error.map(|text| clean_guest_text(text, JSON_ERROR_CLIP)),
+        })
+    };
+    match last_poll {
+        LastPoll::Never => object("never", None, None, None),
+        LastPoll::NotApplicable => object("not-applicable", None, None, None),
+        LastPoll::Unreadable(reason) => object("unreadable", None, None, Some(reason)),
+        LastPoll::Status(status) => object(
+            if status.ok { "ok" } else { "error" },
+            Some(&status.at),
+            status.items,
+            status.error.as_deref(),
+        ),
+    }
+}
+
+/// Writes the rows as one compact JSON array followed by a single newline.
+/// Nothing else is ever written to `out` in this mode.
+///
+/// # Errors
+/// Returns the write error of `out`.
+pub fn render_list_json(rows: &[ListRow], out: &mut impl Write) -> std::io::Result<()> {
+    let array: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": sanitize_for_terminal(&row.name),
+                "kind": row.kind,
+                "enabled": row.enabled,
+                "fetcher": row.fetcher.as_deref().map(|name| clean_guest_text(name, 64)),
+                "last_poll": last_poll_json(&row.last_poll),
+            })
+        })
+        .collect();
+    let text = serde_json::Value::Array(array).to_string();
+    writeln!(out, "{text}")
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /// Resolves the state directory and refuses an empty or blank one, so no
@@ -180,11 +232,16 @@ fn state_dir_for(base_dir: &Path, flag: Option<&Path>) -> miette::Result<PathBuf
 pub fn list(
     registry: &Path,
     state_dir_flag: Option<&Path>,
+    json: bool,
     out: &mut impl Write,
+    _err: &mut impl Write,
 ) -> miette::Result<()> {
     let listing = list_registry(registry)?;
     let state_dir = state_dir_for(&listing.base_dir, state_dir_flag)?;
     let rows = collect_list(&listing, &state_dir);
+    if json {
+        return render_list_json(&rows, out).into_diagnostic();
+    }
     if rows.is_empty() {
         writeln!(
             out,
@@ -207,10 +264,12 @@ pub fn dispatch(
     state_dir_flag: Option<&Path>,
 ) -> miette::Result<()> {
     match command {
-        PluginsCommand::List => {
+        PluginsCommand::List { json } => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            list(registry, state_dir_flag, &mut out)
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
+            list(registry, state_dir_flag, *json, &mut out, &mut err)
         }
     }
 }
@@ -241,7 +300,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let registry = write_registry(dir.path(), &[]);
         let mut out = Vec::new();
-        let error = list(&registry, Some(Path::new("")), &mut out)
+        let error = list(&registry, Some(Path::new("")), false, &mut out, &mut Vec::new())
             .expect_err("an empty state directory is refused");
         let text = error.to_string();
         assert!(text.contains("state directory must not be empty"), "{text}");
@@ -300,5 +359,78 @@ mod tests {
             regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z ok \(1 item\)$")
                 .expect("regex");
         assert!(pattern.is_match(last_poll), "{last_poll:?}");
+    }
+
+    /// A registry with source `stub` (polled once by the fakes) and fetcher `f`.
+    #[tokio::test(start_paused = true)]
+    async fn list_json_prints_one_array_with_a_row_per_plugin() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = write_registry(
+            dir.path(),
+            &[TestSource {
+                name: "stub".to_string(),
+                component: PathBuf::from("stub.wasm"),
+                enabled: true,
+                interval_secs: 60,
+                backoff: None,
+                settings: String::new(),
+            }],
+        );
+        let mut text = std::fs::read_to_string(&registry).expect("read registry");
+        text.push_str("[fetchers.f]\ncomponent = \"f.wasm\"\n");
+        std::fs::write(&registry, text).expect("write registry");
+
+        let state = dir.path().join("state");
+        let cursors = Arc::new(CursorStore::open(&state).expect("cursor store"));
+        let factory = Arc::new(FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollOk {
+                items: vec![wit_item("a")],
+                next_cursor: Some(vec![1]),
+                delay: Duration::ZERO,
+            },
+        ]));
+        run_for(
+            spec("stub", 60, 60, 3600, 2.0),
+            factory,
+            Arc::new(VecSink::default()),
+            Arc::clone(&cursors),
+            Duration::from_secs(1),
+        )
+        .await;
+        let at = match read_status(&state, "stub") {
+            StatusRead::Found(status) => status.at,
+            other => panic!("expected a status, got {other:?}"),
+        };
+
+        let listing = list_registry(&registry).expect("listing");
+        let mut out = Vec::new();
+        render_list_json(&collect_list(&listing, &state), &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.ends_with("}]\n"), "one line, one newline: {text:?}");
+        assert_eq!(text.matches('\n').count(), 1, "{text:?}");
+
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "name": "stub",
+                    "kind": "source",
+                    "enabled": true,
+                    "fetcher": null,
+                    "last_poll": {"state": "ok", "at": at, "items": 1, "error": null}
+                },
+                {
+                    "name": "f",
+                    "kind": "fetcher",
+                    "enabled": true,
+                    "fetcher": null,
+                    "last_poll": {
+                        "state": "not-applicable", "at": null, "items": null, "error": null
+                    }
+                }
+            ])
+        );
     }
 }
