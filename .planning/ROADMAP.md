@@ -121,7 +121,7 @@ Plans:
   2. `fili plugins check <name>` reports, without polling, whether the component satisfies its declared WIT world and whether its TOML and required `.env` secrets are valid. A broken component or config exits non-zero with a message naming the problem.
   3. `fili plugins run-once <name>` performs a single poll and prints the returned items. Nothing is produced to Fluvio unless the produce option is given.
   4. The run command polls every enabled source plugin on its interval and produces items to Fluvio until it is stopped.
-**Plans:** 3/6 plans executed
+**Plans:** 4/6 plans executed
 
 Plans:
 **Wave 1**
@@ -132,7 +132,7 @@ Plans:
 - [x] 04-03-PLAN.md — `fili plugins list --json`, complete row coverage, tolerance of broken plugins, lock-free and creates-nothing guarantees, sanitization, exit codes (CLI-01)
 
 **Wave 3** *(blocked on 04-03)*
-- [ ] 04-04-PLAN.md — `fili plugins check <name>`: `check_component` through the host's own preflight, plugin-scoped config and secrets load, no polling, no secret values, exit 1 on any problem (CLI-02)
+- [x] 04-04-PLAN.md — `fili plugins check <name>`: `check_component` through the host's own preflight, plugin-scoped config and secrets load, no polling, no secret values, exit 1 on any problem (CLI-02)
 
 **Wave 4** *(blocked on 04-02 and 04-04)*
 - [ ] 04-05-PLAN.md — `fili plugins run-once <name> [--produce] [--json]`: single-cycle `poll_once`/`commit_once`, dry run by default from the saved cursor, send-then-save under `--produce` (CLI-03)
@@ -196,7 +196,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 1. Plugin Contract & Configuration | 6/6 | Complete    | 2026-11-03 |
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
-| 4. Plugin CLI | 3/6 | In Progress | - |
+| 4. Plugin CLI | 4/6 | In Progress | - |
 | 5. Fetcher Layer | 0/TBD | Not started | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |
