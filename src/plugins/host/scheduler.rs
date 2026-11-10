@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::backoff;
-use super::cursor::{CursorStore, MAX_CURSOR_BYTES};
+use super::cursor::{CursorStore, MAX_CURSOR_BYTES, PollStatus};
 use super::engine::{PollError, clean_guest_text};
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
@@ -208,6 +208,42 @@ fn disable(report: &mut PluginReport, plugin: &str, reason: String) {
     report.disabled = Some(reason);
 }
 
+/// Records the outcome of one cycle in the plugin's `<alias>.status.json` so
+/// `fili plugins list` can show it. `items` is the number of records the sink
+/// accepted this cycle, when it accepted any.
+///
+/// A failed write is one warning and nothing else: it is not a plugin failure,
+/// never changes the cycle's control flow and never touches a cursor file.
+pub(crate) fn record_status(
+    cursors: &CursorStore,
+    plugin: &str,
+    outcome: &CycleOutcome,
+    items: Option<u64>,
+) {
+    let ok = matches!(outcome, CycleOutcome::PollOk);
+    let error = (!ok).then(|| describe(outcome));
+    record_status_text(cursors, plugin, ok, error, items);
+}
+
+/// The text-level form of `record_status`, for a cycle that has no
+/// `CycleOutcome` (a cursor file that could not be read).
+pub(crate) fn record_status_text(
+    cursors: &CursorStore,
+    plugin: &str,
+    ok: bool,
+    error: Option<String>,
+    items: Option<u64>,
+) {
+    let status = PollStatus::now(plugin, ok, error, items);
+    if let Err(e) = cursors.write_status(plugin, &status) {
+        tracing::warn!(
+            plugin = %plugin,
+            "{}",
+            clean_guest_text(&e.to_string(), REPORT_TEXT_CLIP)
+        );
+    }
+}
+
 /// Sends one poll's records. Returns the number of records sent, or a host-side
 /// failure text (never blamed on the plugin).
 ///
@@ -364,6 +400,9 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
                 polled = instance.poll(cursor.as_deref()) => polled,
             };
 
+            // Records the sink accepted this cycle, for the status file.
+            let mut sent: Option<u64> = None;
+
             let outcome = match polled {
                 // An oversize cursor is a plugin fault: nothing from this poll
                 // is sent and the cursor is never persisted. It is `fatal`
@@ -391,6 +430,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
                     // from persist.
                     match send_records(&*sink, &spec.name, mapped.records).await {
                         Ok(count) => {
+                            sent = Some(count);
                             report.items_sent += count;
                             report.dropped += dropped;
 
@@ -421,6 +461,7 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
                 CallOutcome::InstanceFatal(text) => CycleOutcome::InstanceFatal(text),
             };
 
+            record_status(&cursors, &spec.name, &outcome, sent);
             match settle(&spec, &mut state, &mut report, &shutdown, &outcome).await {
                 Next::Stop => return report,
                 Next::Rebuild => continue 'instances,

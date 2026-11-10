@@ -204,24 +204,9 @@ pub fn load_registry_with_env(
     path: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<LoadedRegistry, ConfigErrors> {
-    let registry_name = path.display().to_string();
-
     // The registry is read once; its parse result and its diagnostic source
     // both come from this one String. Only registry-level failures stop early.
-    let registry_text = std::fs::read_to_string(path).map_err(|e| {
-        single(ConfigError::RegistryUnreadable {
-            path: registry_name.clone(),
-            reason: e.to_string(),
-        })
-    })?;
-    let registry: Registry = toml::from_str(&registry_text).map_err(|e| {
-        single(ConfigError::RegistryMalformed {
-            path: registry_name.clone(),
-            message: e.message().to_string(),
-            src: NamedSource::new(&registry_name, registry_text.clone()),
-            span: e.span().map(Into::into),
-        })
-    })?;
+    let (registry, registry_name, registry_text) = read_registry(path)?;
 
     // `Path::new("filimon.toml").parent()` is `Some("")`, which joins correctly.
     let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
@@ -319,6 +304,117 @@ pub fn load_registry_with_env(
         base_dir,
         sources,
         fetchers,
+    })
+}
+
+/// Reads and parses `filimon.toml`. Returns the parsed registry plus its
+/// display name and text, which the diagnostics of later passes need.
+fn read_registry(path: &Path) -> Result<(Registry, String, String), ConfigErrors> {
+    let registry_name = path.display().to_string();
+    let registry_text = std::fs::read_to_string(path).map_err(|e| {
+        single(ConfigError::RegistryUnreadable {
+            path: registry_name.clone(),
+            reason: e.to_string(),
+        })
+    })?;
+    let registry: Registry = toml::from_str(&registry_text).map_err(|e| {
+        single(ConfigError::RegistryMalformed {
+            path: registry_name.clone(),
+            message: e.message().to_string(),
+            src: NamedSource::new(&registry_name, registry_text.clone()),
+            span: e.span().map(Into::into),
+        })
+    })?;
+    Ok((registry, registry_name, registry_text))
+}
+
+// ── Listing ───────────────────────────────────────────────────────────────────
+
+/// What `filimon.toml` alone says about its plugins: no plugin file, no
+/// secret and no `.env` is read.
+#[derive(Debug, Clone)]
+pub struct RegistryListing {
+    /// The registry file as given.
+    pub path: PathBuf,
+    /// The registry file's directory; every relative path resolves against it.
+    pub base_dir: PathBuf,
+    /// Sources with valid names, in name order.
+    pub sources: Vec<ListedPlugin>,
+    /// Fetchers with valid names, in name order.
+    pub fetchers: Vec<ListedPlugin>,
+    /// Names that fail the name rule: excluded from the rows above, so a name
+    /// from the file is never used to build a path.
+    pub skipped: Vec<SkippedName>,
+}
+
+/// One plugin as the registry lists it.
+#[derive(Debug, Clone)]
+pub struct ListedPlugin {
+    pub name: String,
+    pub component: PathBuf,
+    pub enabled: bool,
+    /// A source's `fetcher` reference; always `None` for a fetcher.
+    pub fetcher: Option<String>,
+}
+
+/// A registry name that fails the `[a-z0-9_-]` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedName {
+    /// `"sources"` or `"fetchers"`.
+    pub table: &'static str,
+    pub name: String,
+}
+
+/// Lists the plugins in the registry at `path` from `filimon.toml` alone.
+///
+/// # Errors
+/// Returns `RegistryUnreadable` or `RegistryMalformed` when the registry file
+/// cannot be read or parsed.
+pub fn list_registry(path: &Path) -> Result<RegistryListing, ConfigErrors> {
+    let (registry, _, _) = read_registry(path)?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let mut skipped = Vec::new();
+
+    let mut sources = Vec::new();
+    for (name, entry) in &registry.sources {
+        if !is_valid_name(name) {
+            skipped.push(SkippedName {
+                table: "sources",
+                name: name.clone(),
+            });
+            continue;
+        }
+        sources.push(ListedPlugin {
+            name: name.clone(),
+            component: base_dir.join(entry.component.get_ref()),
+            enabled: entry.enabled,
+            fetcher: entry.fetcher.as_ref().map(|f| f.get_ref().clone()),
+        });
+    }
+
+    let mut fetchers = Vec::new();
+    for (name, entry) in &registry.fetchers {
+        if !is_valid_name(name) {
+            skipped.push(SkippedName {
+                table: "fetchers",
+                name: name.clone(),
+            });
+            continue;
+        }
+        fetchers.push(ListedPlugin {
+            name: name.clone(),
+            component: base_dir.join(entry.component.get_ref()),
+            enabled: entry.enabled,
+            fetcher: None,
+        });
+    }
+
+    Ok(RegistryListing {
+        path: path.to_path_buf(),
+        base_dir,
+        sources,
+        fetchers,
+        skipped,
     })
 }
 

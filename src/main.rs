@@ -31,7 +31,7 @@ mod streaming;
 
 use clap::Parser;
 use cli::{Cli, Command};
-use commands::{run_consume, run_produce, run_watch};
+use commands::{run_consume, run_plugins, run_produce, run_watch};
 use models::SourceItem;
 use scorer::NerEngine;
 use std::path::{Path, PathBuf};
@@ -79,14 +79,22 @@ fn init_logging() {
 
 // ── Entry Point ───────────────────────────────────────────────────────────────
 
+/// Whether the decorative banner is printed. The `plugins` subcommands print
+/// only their own output, so stdout stays exactly what the command wrote.
+fn shows_banner(command: &Command) -> bool {
+    !matches!(command, Command::Plugins { .. })
+}
+
 #[tokio::main]
 async fn main() -> miette::Result<()> {
     let cli = Cli::parse();
     init_logging();
 
-    println!("╔═══════════════════════════════════════════════╗");
-    println!("║  filimon · Fluvio streaming news extractor    ║");
-    println!("╚═══════════════════════════════════════════════╝\n");
+    if shows_banner(&cli.command) {
+        println!("╔═══════════════════════════════════════════════╗");
+        println!("║  filimon · Fluvio streaming news extractor    ║");
+        println!("╚═══════════════════════════════════════════════╝\n");
+    }
 
     match cli.command {
         Command::Produce { ref urls, depth } => {
@@ -112,6 +120,9 @@ async fn main() -> miette::Result<()> {
         }
         Command::File { ref paths } => {
             run_file(paths).await?;
+        }
+        Command::Plugins { ref command } => {
+            run_plugins(command, &cli.registry, cli.state_dir.as_deref())?;
         }
     }
 
@@ -439,6 +450,14 @@ mod tests {
         let out = buf.contents();
         assert!(out.contains("plugin-target-message"), "captured: {out}");
         assert!(!out.contains("other-target-message"), "captured: {out}");
+    }
+
+    #[test]
+    fn banner_is_skipped_for_plugin_commands() {
+        let plugins = Cli::try_parse_from(["fili", "plugins", "list"]).expect("parses");
+        assert!(!shows_banner(&plugins.command));
+        let watch = Cli::try_parse_from(["fili", "watch"]).expect("parses");
+        assert!(shows_banner(&watch.command));
     }
 
     #[test]

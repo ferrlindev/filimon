@@ -119,6 +119,19 @@ pub enum Command {
         #[arg(required = true, value_name = "FILE")]
         paths: Vec<PathBuf>,
     },
+
+    /// Inspect, validate, try and run registered plugins.
+    Plugins {
+        #[command(subcommand)]
+        command: PluginsCommand,
+    },
+}
+
+/// The `fili plugins` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum PluginsCommand {
+    /// List the registered plugins with their last poll.
+    List,
 }
 
 #[cfg(test)]
