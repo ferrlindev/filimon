@@ -322,6 +322,51 @@ mod tests {
     }
 
     #[test]
+    fn run_parses() {
+        let cli = Cli::try_parse_from(["fili", "run"]).expect("parses");
+        assert!(matches!(cli.command, Command::Run));
+        assert!(Cli::try_parse_from(["fili", "run", "extra"]).is_err());
+    }
+
+    #[test]
+    fn run_takes_the_global_flags() {
+        let before = Cli::try_parse_from([
+            "fili",
+            "--registry",
+            "conf/filimon.toml",
+            "--state-dir",
+            "/tmp/s",
+            "run",
+        ])
+        .expect("parses before the subcommand");
+        assert_eq!(before.registry, PathBuf::from("conf/filimon.toml"));
+        assert_eq!(before.state_dir, Some(PathBuf::from("/tmp/s")));
+        assert!(matches!(before.command, Command::Run));
+
+        let after = Cli::try_parse_from([
+            "fili",
+            "run",
+            "--registry",
+            "conf/filimon.toml",
+            "--state-dir",
+            "/tmp/s",
+        ])
+        .expect("parses after the subcommand");
+        assert_eq!(after.registry, PathBuf::from("conf/filimon.toml"));
+        assert_eq!(after.state_dir, Some(PathBuf::from("/tmp/s")));
+        assert!(matches!(after.command, Command::Run));
+    }
+
+    #[test]
+    fn run_rejects_an_empty_state_dir() {
+        for value in ["", "   "] {
+            let error = Cli::try_parse_from(["fili", "--state-dir", value, "run"])
+                .expect_err("an empty or blank --state-dir is a usage error");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation, "{value:?}");
+        }
+    }
+
+    #[test]
     fn state_dir_and_registry_flags_work_after_plugins_list() {
         let cli = Cli::try_parse_from([
             "fili",

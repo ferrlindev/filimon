@@ -218,6 +218,14 @@ fili --ls /tmp/articles watch
 
 # Process local files
 fili file ./samples/article.html
+
+# Inspect, validate and try the registered source plugins (see plugins/README.md)
+fili plugins list
+fili plugins check stub
+fili plugins run-once stub
+
+# Poll every enabled source plugin and produce its items to Fluvio until Ctrl+C
+fili run
 ```
 
 ### `fili consume`
@@ -251,11 +259,14 @@ Commands:
   consume  Consume news (through the news chain modules) and social items from Fluvio into one JSON output, with optional NER enrichment
   watch    Watch directories and produce HTML files to Fluvio
   file     Produce local HTML files to Fluvio
+  plugins  Inspect, validate and try registered plugins (list, check, run-once)
+  run      Poll every enabled source plugin on its interval and produce items to Fluvio until stopped
 
 Options:
   --tokenizer <TOKENIZER>  Path to GLiNER tokenizer.json (for NER on consume) [env: TOKENIZER_PATH]
   --model <MODEL>          Path to GLiNER onnx/model.onnx (for NER on consume) [env: MODEL_PATH]
   --registry <REGISTRY>    Path to the plugin registry (filimon.toml) [env: FILI_REGISTRY]
+  --state-dir <STATE_DIR>  Directory for per-plugin cursor files [env: FILI_STATE_DIR] [default: .fili-state/ next to the registry]
   --threshold <THRESHOLD>  Relevance threshold for filtering [0.0 - 1.0] [default: 0.05]
   --config <CONFIG>        Path to JSON config file for watch mode [default: config.json]
   --ls <LS>                Comma-separated directories to watch (override config files)
@@ -395,7 +406,10 @@ filimon/
 │   ├── models.rs        # Shared data structs (SourceItem, ExtractedArticle, OutputRecord, etc.)
 │   ├── streaming.rs     # Fluvio client wrapper, topic names, news SmartModule chain, preflight
 │   ├── commands/
-│   │   └── consume.rs   # fili consume: merges news (chain) and social streams, NER, JSON output
+│   │   ├── consume.rs   # fili consume: merges news (chain) and social streams, NER, JSON output
+│   │   ├── plugins.rs   # fili plugins list | check | run-once
+│   │   └── run.rs       # fili run: polls every enabled source plugin into Fluvio until stopped
+│   ├── plugins/         # plugin registry, config, secrets and the wasm component host
 │   ├── scorer.rs        # GLiNER NER engine
 │   └── output.rs        # JSON serialization, console output
 ├── smartmodules/

@@ -201,8 +201,18 @@ pub async fn run_with_sink<S: ItemSink>(
         sanitize_for_terminal(&state_dir.display().to_string())
     )
     .ok();
-    writeln!(out, "[Run] loaded sources: {}", name_list(host.loaded_sources())).ok();
-    writeln!(out, "[Run] loaded fetchers: {}", name_list(host.loaded_fetchers())).ok();
+    writeln!(
+        out,
+        "[Run] loaded sources: {}",
+        name_list(host.loaded_sources())
+    )
+    .ok();
+    writeln!(
+        out,
+        "[Run] loaded fetchers: {}",
+        name_list(host.loaded_fetchers())
+    )
+    .ok();
     for failure in host.load_failures() {
         let kind = match failure.kind {
             PluginKind::Source => "source",
@@ -251,11 +261,7 @@ pub async fn run(registry_path: &Path, state_dir_flag: Option<&Path>) -> miette:
     let shutdown = CancellationToken::new();
     let abort = CancellationToken::new();
     let signals = OsSignals::new().into_diagnostic()?;
-    let signal_task = tokio::spawn(forward_signals(
-        signals,
-        shutdown.clone(),
-        abort.clone(),
-    ));
+    let signal_task = tokio::spawn(forward_signals(signals, shutdown.clone(), abort.clone()));
 
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
@@ -366,10 +372,10 @@ mod tests {
     use crate::plugins::host::cursor::CursorStore;
     use crate::plugins::host::sink::live_support::{delete_topic, ready_sink, scratch_topic};
     use crate::plugins::host::sink::{SinkError, SinkRecord, VecSink};
-    use crate::streaming::FluvioStream;
     use crate::plugins::host::testing::{
         TestSource, fixture_wasm, load_test_registry, write_registry,
     };
+    use crate::streaming::FluvioStream;
 
     fn source(name: &str, component: std::path::PathBuf, enabled: bool) -> TestSource {
         TestSource {
@@ -385,7 +391,10 @@ mod tests {
 
     fn report_of(plugins: &[(&str, PluginReport)]) -> HostReport {
         HostReport {
-            loaded_sources: plugins.iter().map(|(name, _)| (*name).to_string()).collect(),
+            loaded_sources: plugins
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
             loaded_fetchers: Vec::new(),
             load_failures: Vec::new(),
             plugins: plugins
@@ -552,7 +561,10 @@ mod tests {
 
         let warning = lines.last().expect("warning line");
         assert!(warning.contains("aborted at shutdown: mid"), "{warning}");
-        assert!(!warning.contains("alpha") && !warning.contains("zeta"), "{warning}");
+        assert!(
+            !warning.contains("alpha") && !warning.contains("zeta"),
+            "{warning}"
+        );
     }
 
     #[test]
@@ -574,7 +586,10 @@ mod tests {
         ]);
         run_outcome(&all_aborted).expect("an operator stop is success");
 
-        let mixed = report_of(&[("a", disabled(ABORTED_AT_SHUTDOWN)), ("b", disabled("boom"))]);
+        let mixed = report_of(&[
+            ("a", disabled(ABORTED_AT_SHUTDOWN)),
+            ("b", disabled("boom")),
+        ]);
         run_outcome(&mixed).expect("one aborted plus one fault is still an operator stop");
 
         run_outcome(&report_of(&[])).expect("an empty report is not a fault");
@@ -646,11 +661,9 @@ mod tests {
     struct ScriptedSignals(tokio::sync::mpsc::UnboundedReceiver<()>);
 
     impl SignalSource for ScriptedSignals {
-        fn next(&mut self) -> impl Future<Output = ()> + Send {
-            async move {
-                if self.0.recv().await.is_none() {
-                    std::future::pending::<()>().await;
-                }
+        async fn next(&mut self) {
+            if self.0.recv().await.is_none() {
+                std::future::pending::<()>().await;
             }
         }
     }
@@ -672,9 +685,15 @@ mod tests {
 
         requests.send(()).expect("first request");
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert!(shutdown.is_cancelled(), "the first request starts a graceful stop");
+        assert!(
+            shutdown.is_cancelled(),
+            "the first request starts a graceful stop"
+        );
         assert!(!abort.is_cancelled(), "the first request must not abort");
-        assert!(!task.is_finished(), "the task keeps waiting for a second request");
+        assert!(
+            !task.is_finished(),
+            "the task keeps waiting for a second request"
+        );
 
         requests.send(()).expect("second request");
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -801,7 +820,11 @@ mod tests {
         let topic = scratch_topic("run").await?;
         let body = std::panic::AssertUnwindSafe(async {
             let tmp = TempDir::new().map_err(|e| miette::miette!("tempdir: {e}"))?;
-            let mut stub = source("stub", fixture_wasm("stub-source", "stub_source.wasm"), true);
+            let mut stub = source(
+                "stub",
+                fixture_wasm("stub-source", "stub_source.wasm"),
+                true,
+            );
             stub.interval_secs = 1;
             let registry = load_test_registry(&write_registry(tmp.path(), &[stub]));
             let state_dir = tmp.path().join(".fili-state");
