@@ -140,19 +140,19 @@ impl Host {
     /// Names of the source plugins that loaded and will be polled.
     #[must_use]
     pub fn loaded_sources(&self) -> &[String] {
-        &[]
+        &self.loaded_sources
     }
 
     /// Names of the fetcher plugins that loaded.
     #[must_use]
     pub fn loaded_fetchers(&self) -> &[String] {
-        &[]
+        &self.loaded_fetchers
     }
 
     /// The components that could not be loaded.
     #[must_use]
     pub fn load_failures(&self) -> &[LoadFailure] {
-        &[]
+        &self.load_failures
     }
 
     /// Sets how long tasks get to stop after shutdown before they are aborted.
@@ -207,8 +207,10 @@ impl Host {
 /// Tasks run exactly as `run_plugin` does. When `shutdown` is cancelled the
 /// supervisor arms a deadline of `grace` from that moment and keeps joining the
 /// tasks that stop on their own, so a healthy stop is never delayed. When the
-/// deadline passes, or `abort` is cancelled after `shutdown`, every task still
+/// deadline passes, or `abort` is cancelled at any time, every task still
 /// running is aborted and reported as disabled with [`ABORTED_AT_SHUTDOWN`].
+/// A stop that is already forced (`abort` cancelled before `shutdown`) needs no
+/// grace: it aborts at once. Nothing is aborted while neither token has fired.
 /// A task that panics keeps the `plugin task panicked` report.
 pub(crate) async fn supervise<F: InstanceFactory, S: ItemSink>(
     plugins: Vec<(PluginSpec, Arc<F>)>,
@@ -252,7 +254,7 @@ pub(crate) async fn supervise<F: InstanceFactory, S: ItemSink>(
             () = shutdown.cancelled(), if deadline.is_none() && !aborted => {
                 deadline = Some(Instant::now() + grace);
             }
-            () = abort.cancelled(), if deadline.is_some() && !aborted => {
+            () = abort.cancelled(), if !aborted => {
                 aborted = true;
                 tasks.abort_all();
             }
