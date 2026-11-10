@@ -324,3 +324,148 @@ fn check_garbage_component_exits_nonzero_naming_plugin_and_path() {
         stdout(&output)
     );
 }
+
+#[test]
+fn check_unknown_plugin_exits_nonzero_and_names_the_registered_ones() {
+    let dir = TempDir::new().expect("tempdir");
+    let (registry, _) = write_check_registry(dir.path(), b"unused");
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["plugins", "check", "nope"])
+        .output()
+        .expect("run fili");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let err = squash(&stderr(&output));
+    assert!(
+        err.contains(&squash("no plugin named `nope`")),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        err.contains(&squash("sources: stub")),
+        "{}",
+        stderr(&output)
+    );
+    assert!(output.stdout.is_empty(), "{}", stdout(&output));
+}
+
+#[test]
+fn check_a_broken_config_exits_nonzero_naming_plugin_and_field() {
+    let dir = TempDir::new().expect("tempdir");
+    let (registry, _) = write_check_registry(dir.path(), b"unused");
+    std::fs::write(
+        dir.path().join("stub.toml"),
+        "[host]\npoll_interval_secs = 0\n",
+    )
+    .expect("broken plugin toml");
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["plugins", "check", "stub"])
+        .output()
+        .expect("run fili");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let err = squash(&stderr(&output));
+    assert!(err.contains("stub"), "{}", stderr(&output));
+    assert!(err.contains("poll_interval_secs"), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("config: FAILED"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn check_never_prints_a_secret_value() {
+    let dir = TempDir::new().expect("tempdir");
+    let (registry, _) = write_check_registry(dir.path(), b"this is not a wasm component");
+    std::fs::write(
+        dir.path().join("stub.toml"),
+        "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"FILI_CHECK_TOKEN\"\nmissing = \"FILI_CHECK_MISSING\"\n",
+    )
+    .expect("plugin toml with secrets");
+    std::fs::write(
+        dir.path().join(".env"),
+        "FILI_CHECK_TOKEN=hunter2-distinctive\n",
+    )
+    .expect("write .env");
+
+    let output = fili()
+        .env_remove("FILI_CHECK_TOKEN")
+        .env_remove("FILI_CHECK_MISSING")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["plugins", "check", "stub"])
+        .output()
+        .expect("run fili");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let err = squash(&stderr(&output));
+    assert!(err.contains("FILI_CHECK_MISSING"), "{}", stderr(&output));
+    for stream in [squash(&stdout(&output)), err] {
+        for leaked in ["hunter2-distinctive", "hunter2", "distinctive"] {
+            assert!(!stream.contains(leaked), "leaked {leaked:?} in: {stream}");
+        }
+    }
+}
+
+#[test]
+fn check_does_not_create_the_state_dir() {
+    let dir = TempDir::new().expect("tempdir");
+    let (registry, _) = write_check_registry(dir.path(), b"this is not a wasm component");
+    let state = dir.path().join("state");
+    let before = std::fs::read_dir(dir.path()).expect("read dir").count();
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["plugins", "check", "stub"])
+        .output()
+        .expect("run fili");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(!state.exists(), "check must not create the state directory");
+    let after = std::fs::read_dir(dir.path()).expect("read dir").count();
+    assert_eq!(before, after, "check must not create anything");
+}
+
+#[test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+fn wasm_check_passes_the_real_stub_fetcher() {
+    let dir = TempDir::new().expect("tempdir");
+    let registry = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/plugins/filimon.toml");
+
+    let output = fili()
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["plugins", "check", "stub-fetcher"])
+        .output()
+        .expect("run fili");
+
+    assert!(
+        output.status.success(),
+        "exit {:?}, stderr: {}",
+        output.status.code(),
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    assert!(text.contains("plugin `stub-fetcher` (fetcher)"), "{text}");
+    assert!(text.contains("`fetcher` world"), "{text}");
+    assert!(text.contains("config: none"), "{text}");
+    assert!(text.contains("check passed"), "{text}");
+}

@@ -260,16 +260,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::plugins::host::testing::{fixture_wasm, load_test_registry};
-
-    /// `(component (import "wasi:cli/environment@0.2.0" (instance)))`, built
-    /// with `wasm-tools parse`.
-    const WASI_IMPORT_COMPONENT: &[u8] = &[
-        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0x07, 0x03, 0x01, 0x42, 0x00, 0x0a, 0x1f,
-        0x01, 0x00, 0x1a, 0x77, 0x61, 0x73, 0x69, 0x3a, 0x63, 0x6c, 0x69, 0x2f, 0x65, 0x6e, 0x76,
-        0x69, 0x72, 0x6f, 0x6e, 0x6d, 0x65, 0x6e, 0x74, 0x40, 0x30, 0x2e, 0x32, 0x2e, 0x30, 0x05,
-        0x00,
-    ];
+    use crate::plugins::host::testing::{WASI_IMPORT_COMPONENT, fixture_wasm, load_test_registry};
 
     const GARBAGE: &[u8] = b"this is not a wasm component";
 
@@ -531,6 +522,76 @@ mod tests {
         assert!(report.sources.contains_key("stub"));
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].name, "bad");
+    }
+
+    // ── check_component ──────────────────────────────────────────────────────
+
+    #[test]
+    fn check_component_reports_garbage_as_a_component_load_failure() {
+        let tmp = TempDir::new().expect("tempdir");
+        let bad = tmp.path().join("bad.wasm");
+        std::fs::write(&bad, GARBAGE).expect("write garbage");
+        let host_engine = HostEngine::new().expect("engine");
+
+        for kind in [PluginKind::Source, PluginKind::Fetcher] {
+            let error =
+                check_component(kind, "bad", &bad, &host_engine).expect_err("garbage fails");
+            assert!(
+                matches!(error, HostError::ComponentLoad { .. }),
+                "{kind:?}: {error:?}"
+            );
+            let text = error.to_string();
+            assert!(text.contains("bad"), "{text}");
+            assert!(text.contains(&bad.display().to_string()), "{text}");
+        }
+    }
+
+    #[test]
+    fn check_component_names_foreign_imports() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wasi = tmp.path().join("wasi.wasm");
+        std::fs::write(&wasi, WASI_IMPORT_COMPONENT).expect("write component");
+        let host_engine = HostEngine::new().expect("engine");
+
+        let error = check_component(PluginKind::Source, "wasi", &wasi, &host_engine)
+            .expect_err("a WASI import is foreign");
+
+        let HostError::ForeignImports { imports, .. } = &error else {
+            panic!("expected ForeignImports, got {error:?}");
+        };
+        assert_eq!(imports, &vec!["wasi:cli/environment@0.2.0".to_string()]);
+    }
+
+    #[test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    fn wasm_check_component_matches_the_declared_world() {
+        let source = fixture_wasm("stub-source", "stub_source.wasm");
+        let fetcher = fixture_wasm("stub-fetcher", "stub_fetcher.wasm");
+        let host_engine = HostEngine::new().expect("engine");
+
+        check_component(PluginKind::Source, "stub", &source, &host_engine)
+            .expect("the stub source fits the source world");
+        check_component(PluginKind::Fetcher, "stub-fetcher", &fetcher, &host_engine)
+            .expect("the stub fetcher fits the fetcher world");
+
+        let error = check_component(PluginKind::Fetcher, "stub", &source, &host_engine)
+            .expect_err("a source is not a fetcher");
+        assert!(
+            matches!(
+                error,
+                HostError::WrongWorld {
+                    kind: "fetcher",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let error = check_component(PluginKind::Source, "stub-fetcher", &fetcher, &host_engine)
+            .expect_err("a fetcher is not a source");
+        assert!(
+            matches!(error, HostError::WrongWorld { kind: "source", .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

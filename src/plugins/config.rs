@@ -1892,4 +1892,99 @@ config = "x.toml"
             assert_eq!(problem.plugin(), None, "{problem:?}");
         }
     }
+
+    /// `plain` declares no secret; `needy` declares one; the `.env` is malformed.
+    fn plain_and_needy_registry(dir: &TempDir) {
+        write(
+            dir,
+            "filimon.toml",
+            r#"
+[sources.plain]
+component = "plain.wasm"
+config = "plain.toml"
+
+[sources.needy]
+component = "needy.wasm"
+config = "needy.toml"
+"#,
+        );
+        write(dir, "plain.toml", "[host]\npoll_interval_secs = 60\n");
+        write(
+            dir,
+            "needy.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"NEEDY_TOKEN\"\n",
+        );
+        write(dir, ".env", "NEEDY_TOKEN=has a space\n");
+    }
+
+    #[test]
+    fn plugin_only_load_reads_dotenv_only_when_the_plugin_declares_secrets() {
+        let dir = TempDir::new().expect("tempdir");
+        plain_and_needy_registry(&dir);
+
+        scoped(&dir, "plain").expect("a malformed .env does not touch a plugin without secrets");
+
+        let errors = scoped(&dir, "needy").expect_err("the plugin that needs the .env fails");
+        assert!(
+            errors
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, ConfigError::DotenvInvalid { line: Some(1), .. })),
+            "{errors:?}"
+        );
+        assert!(!format!("{errors:?}").contains("has a space"));
+    }
+
+    #[test]
+    fn plugin_only_load_of_a_disabled_source_skips_its_config() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.off]\ncomponent = \"off.wasm\"\nconfig = \"missing.toml\"\nenabled = false\n",
+        );
+
+        let registry = scoped(&dir, "off").expect("a disabled source's config is not read");
+
+        let off = &registry.sources["off"];
+        assert!(!off.enabled);
+        assert!(off.plugin.is_none());
+    }
+
+    #[test]
+    fn plugin_only_load_keeps_a_duplicate_name_problem_for_that_name() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            r#"
+[sources.shared]
+component = "shared.wasm"
+config = "shared.toml"
+
+[sources.other]
+component = "other.wasm"
+config = "other.toml"
+
+[fetchers.shared]
+component = "shared-fetcher.wasm"
+
+[fetchers.other]
+component = "other-fetcher.wasm"
+"#,
+        );
+        write(&dir, "shared.toml", "[host]\npoll_interval_secs = 60\n");
+        write(&dir, "other.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let errors = scoped(&dir, "shared").expect_err("the duplicate concerns `shared`");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DuplicateName { plugin } if plugin == "shared"
+            ),
+            "{errors:?}"
+        );
+    }
 }
