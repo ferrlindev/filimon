@@ -150,6 +150,21 @@ pub enum PluginsCommand {
         #[arg(value_name = "NAME")]
         name: String,
     },
+
+    /// Poll one source once and print the items; nothing is produced unless --produce is given
+    RunOnce {
+        /// The registered source to poll
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Send the items to Fluvio and save the cursor (without it the poll is a read-only look)
+        #[arg(long)]
+        produce: bool,
+
+        /// Print one JSON item per line on stdout; notes go to stderr
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(test)]
@@ -275,6 +290,32 @@ mod tests {
             } if name == "stub"
         ));
         assert!(Cli::try_parse_from(["fili", "plugins", "check"]).is_err());
+    }
+
+    #[test]
+    fn plugins_run_once_parses() {
+        let cli = Cli::try_parse_from(["fili", "plugins", "run-once", "stub"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Plugins {
+                command: PluginsCommand::RunOnce { ref name, produce: false, json: false }
+            } if name == "stub"
+        ));
+
+        let both = Cli::try_parse_from(["fili", "plugins", "run-once", "stub", "--produce", "--json"])
+            .expect("parses");
+        assert!(matches!(
+            both.command,
+            Command::Plugins {
+                command: PluginsCommand::RunOnce { produce: true, json: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn plugins_run_once_requires_a_name() {
+        assert!(Cli::try_parse_from(["fili", "plugins", "run-once"]).is_err());
+        assert!(Cli::try_parse_from(["fili", "plugins", "run-once", "--produce"]).is_err());
     }
 
     #[test]

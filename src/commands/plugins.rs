@@ -13,8 +13,14 @@
 // `init` or `poll`, never takes the state-directory lock and never creates the
 // state directory. Only alias names are printed for secrets, never values.
 //
-// Everything that came from a file is untrusted at print time and passes
-// through `sanitize_for_terminal` or `clean_guest_text`.
+// `run-once <name>` polls one source once (instantiate, `init`, `poll`, map)
+// and prints what came back. Without `--produce` it is a read-only look: the
+// saved cursor is read without the lock, nothing is sent, and the state
+// directory is neither created nor modified. With `--produce` the order is
+// fixed: poll, print, send the batch, then write the cursor (D-07).
+//
+// Everything that came from a file or a guest is untrusted at print time and
+// passes through `sanitize_for_terminal` or `clean_guest_text`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::io::Write;
@@ -24,13 +30,21 @@ use miette::IntoDiagnostic;
 
 use crate::cli::PluginsCommand;
 use crate::output::sanitize_for_terminal;
-use crate::plugins::config::{RegistryListing, list_registry, load_plugin_with_env};
+use crate::plugins::config::{
+    ListedPlugin, RegistryListing, list_registry, load_plugin, load_plugin_with_env,
+};
 use crate::plugins::error::ConfigErrors;
 use crate::plugins::host::HostOptions;
-use crate::plugins::host::cursor::{PollStatus, StatusRead, read_status, require_state_dir};
+use crate::plugins::host::cursor::{
+    CursorStore, PollStatus, StatusRead, read_cursor_file, read_status, require_state_dir,
+};
 use crate::plugins::host::engine::{HostEngine, clean_guest_text};
 use crate::plugins::host::error::HostError;
-use crate::plugins::host::loader::{PluginKind, check_component};
+use crate::plugins::host::instance::{InstanceFactory, WasmtimeFactory};
+use crate::plugins::host::loader::{PluginKind, check_component, load_source};
+use crate::plugins::host::once::{PolledOnce, poll_once};
+use crate::plugins::host::scheduler::{CycleOutcome, PluginSpec, describe};
+use crate::plugins::host::sink::{FluvioSink, ItemSink, SinkRecord};
 
 /// Longest error text shown in the human table, in characters.
 const TABLE_ERROR_CLIP: usize = 80;
@@ -340,6 +354,44 @@ fn registered_plugins(listing: &RegistryListing) -> String {
     )
 }
 
+/// Finds the plugin called `name`, sources first. `name` is compared exactly,
+/// as bytes, against the registry's names and is never used to build a path.
+///
+/// # Errors
+/// An error that lists the registered plugins when `name` is not one of them.
+/// The echoed name is sanitized and clipped.
+fn find_plugin<'a>(
+    listing: &'a RegistryListing,
+    name: &str,
+) -> miette::Result<(PluginKind, &'a ListedPlugin)> {
+    let found = listing
+        .sources
+        .iter()
+        .find(|plugin| plugin.name == name)
+        .map(|plugin| (PluginKind::Source, plugin))
+        .or_else(|| {
+            listing
+                .fetchers
+                .iter()
+                .find(|plugin| plugin.name == name)
+                .map(|plugin| (PluginKind::Fetcher, plugin))
+        });
+    let Some(found) = found else {
+        let shown = clean_guest_text(name, NAME_ECHO_CLIP);
+        let path = sanitize_for_terminal(&listing.path.display().to_string());
+        if listing.sources.is_empty() && listing.fetchers.is_empty() {
+            return Err(miette::miette!(
+                "no plugin named `{shown}`: no plugins are registered in {path}"
+            ));
+        }
+        return Err(miette::miette!(
+            "no plugin named `{shown}` in {path} (registered: {})",
+            registered_plugins(listing)
+        ));
+    };
+    Ok(found)
+}
+
 /// Checks the plugin called `name`: its component against its world, and for a
 /// source its TOML and secrets. `name` is compared exactly, as bytes, against
 /// the registry's names (sources first) and is never used to build a path. The
@@ -356,31 +408,7 @@ pub fn run_check(
     engine: &HostEngine,
 ) -> miette::Result<CheckReport> {
     let listing = list_registry(registry)?;
-    let found = listing
-        .sources
-        .iter()
-        .find(|plugin| plugin.name == name)
-        .map(|plugin| (PluginKind::Source, plugin))
-        .or_else(|| {
-            listing
-                .fetchers
-                .iter()
-                .find(|plugin| plugin.name == name)
-                .map(|plugin| (PluginKind::Fetcher, plugin))
-        });
-    let Some((kind, plugin)) = found else {
-        let shown = clean_guest_text(name, NAME_ECHO_CLIP);
-        let path = sanitize_for_terminal(&listing.path.display().to_string());
-        if listing.sources.is_empty() && listing.fetchers.is_empty() {
-            return Err(miette::miette!(
-                "no plugin named `{shown}`: no plugins are registered in {path}"
-            ));
-        }
-        return Err(miette::miette!(
-            "no plugin named `{shown}` in {path} (registered: {})",
-            registered_plugins(&listing)
-        ));
-    };
+    let (kind, plugin) = find_plugin(&listing, name)?;
 
     let component = match check_component(kind, name, &plugin.component, engine) {
         Ok(()) => ComponentCheck::Ok,
@@ -503,11 +531,223 @@ pub fn check(
     Err(miette::miette!("plugin `{shown}` failed its check"))
 }
 
+// ── Run once ──────────────────────────────────────────────────────────────────
+
+/// Longest field value printed in the human output, in characters.
+const ITEM_FIELD_CLIP: usize = 200;
+
+/// The notice printed after a dry run.
+const DRY_RUN_NOTICE: &str = "dry run: nothing was produced and the cursor was not saved (use --produce to produce and save the cursor)";
+
+/// Whether `run-once` sends what it polled.
+pub enum Produce<'a, S: ItemSink> {
+    /// A read-only look: no sink, no cursor store, no status write.
+    No,
+    /// Send the batch, then save the cursor. The store holds the state
+    /// directory lock.
+    Yes {
+        sink: &'a S,
+        cursors: &'a CursorStore,
+    },
+}
+
+/// `polled N items (D dropped)`.
+fn polled_line(count: usize, dropped: usize) -> String {
+    let noun = if count == 1 { "item" } else { "items" };
+    format!("polled {count} {noun} ({dropped} dropped)")
+}
+
+/// One field line: the value cleaned and clipped by characters, `--` when
+/// absent or empty.
+fn field_line(
+    out: &mut impl Write,
+    label: &str,
+    value: Option<&str>,
+) -> std::io::Result<()> {
+    let shown = value
+        .map(|text| clean_guest_text(text, ITEM_FIELD_CLIP))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "--".to_string());
+    writeln!(out, "    {label}: {shown}")
+}
+
+/// Writes one block per record in guest order: `[i/n] <key>`, then the url,
+/// title, author, published and a text preview. Every value is guest text, so
+/// each one is cleaned and clipped; nothing is ever sliced by bytes.
+///
+/// # Errors
+/// Returns the write error of `out`.
+pub fn render_items(records: &[SinkRecord], out: &mut impl Write) -> std::io::Result<()> {
+    let total = records.len();
+    for (index, record) in records.iter().enumerate() {
+        writeln!(
+            out,
+            "[{}/{total}] {}",
+            index + 1,
+            clean_guest_text(&record.key, ITEM_FIELD_CLIP)
+        )?;
+        let item = &record.item;
+        field_line(out, "url", Some(&item.url))?;
+        field_line(out, "title", item.title.as_deref())?;
+        field_line(out, "author", item.author.as_deref())?;
+        field_line(out, "published", item.published.as_deref())?;
+        field_line(out, "text", Some(&item.text))?;
+    }
+    Ok(())
+}
+
+/// Prints a poll's result and, with `Produce::Yes`, commits it. This is the
+/// part of `run-once` that is never interrupted: a stop must not split the send
+/// from the cursor write.
+async fn finish_run_once<S: ItemSink>(
+    spec: &PluginSpec,
+    polled: Result<PolledOnce, CycleOutcome>,
+    produce: Produce<'_, S>,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> miette::Result<()> {
+    let polled = match polled {
+        Ok(polled) => polled,
+        Err(outcome) => return Err(miette::miette!("{}", describe(&outcome))),
+    };
+    if json {
+        return Err(miette::miette!("--json is not available yet"));
+    }
+    render_items(&polled.records, out).into_diagnostic()?;
+    writeln!(out, "{}", polled_line(polled.records.len(), polled.dropped)).into_diagnostic()?;
+    match produce {
+        Produce::No => writeln!(out, "{DRY_RUN_NOTICE}").into_diagnostic(),
+        Produce::Yes { .. } => {
+            let _ = (spec, err);
+            Err(miette::miette!("--produce is not available yet"))
+        }
+    }
+}
+
+/// Polls `spec` once from `cursor` and prints the result. This is the seam the
+/// tests use; `run_once` splits the same two steps around Ctrl-C.
+///
+/// # Errors
+/// The cleaned `describe` text of a failed cycle, or a write error.
+pub async fn execute_run_once<F: InstanceFactory, S: ItemSink>(
+    spec: &PluginSpec,
+    factory: &F,
+    cursor: Option<&[u8]>,
+    produce: Produce<'_, S>,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> miette::Result<()> {
+    let polled = poll_once(spec, factory, cursor).await;
+    finish_run_once(spec, polled, produce, json, out, err).await
+}
+
+/// The plugin `name` as a pollable source, or the reason `run-once` refuses it.
+fn find_source<'a>(
+    listing: &'a RegistryListing,
+    name: &str,
+) -> miette::Result<&'a ListedPlugin> {
+    let (kind, plugin) = find_plugin(listing, name)?;
+    let shown = clean_guest_text(name, NAME_ECHO_CLIP);
+    if kind == PluginKind::Fetcher {
+        return Err(miette::miette!(
+            "`{shown}` is a fetcher; run-once polls sources"
+        ));
+    }
+    if !plugin.enabled {
+        return Err(miette::miette!(
+            "plugin `{shown}` is disabled in filimon.toml; set `enabled = true` to run it"
+        ));
+    }
+    Ok(plugin)
+}
+
+/// Opens the state directory and takes its lock, as `--produce` must: a second
+/// producer on the same directory fails here, before any poll or connection.
+///
+/// # Errors
+/// `StateDirLocked` when another process holds the lock, `StateDir` otherwise.
+fn open_state_store(state_dir: &Path) -> Result<CursorStore, HostError> {
+    CursorStore::open(state_dir)
+}
+
+/// The poll step of `run-once`, raced against Ctrl-C so a spinning guest can be
+/// interrupted. An interrupt is an error (exit 1).
+async fn poll_interruptible<F: InstanceFactory>(
+    spec: &PluginSpec,
+    factory: &F,
+    cursor: Option<&[u8]>,
+) -> miette::Result<Result<PolledOnce, CycleOutcome>> {
+    tokio::select! {
+        polled = poll_once(spec, factory, cursor) => Ok(polled),
+        _ = tokio::signal::ctrl_c() => Err(miette::miette!(
+            "interrupted: nothing was sent and the cursor was not saved"
+        )),
+    }
+}
+
+/// `fili plugins run-once <name>`.
+///
+/// # Errors
+/// An error for an unknown name, a fetcher or a disabled source (before any
+/// component is loaded), a config or component problem, a corrupt cursor file,
+/// a held state-directory lock (`--produce`), a failed cycle, or an interrupt.
+pub async fn run_once(
+    registry: &Path,
+    state_dir_flag: Option<&Path>,
+    name: &str,
+    produce: bool,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> miette::Result<()> {
+    if produce {
+        return Err(miette::miette!("--produce is not available yet"));
+    }
+    let listing = list_registry(registry)?;
+    let planned = find_source(&listing, name)?;
+    let state_dir = state_dir_for(&listing.base_dir, state_dir_flag)?;
+
+    // Only this plugin's own config is loaded (a scoped load).
+    let loaded = load_plugin(registry, name).map_err(miette::Report::new)?;
+    let spec = loaded
+        .sources
+        .get(name)
+        .and_then(PluginSpec::from_loaded)
+        .ok_or_else(|| miette::miette!("plugin `{}` could not be prepared", planned.name))?;
+
+    let engine = HostEngine::new().map_err(|e| HostError::Engine {
+        reason: clean_guest_text(&format!("{e:#}"), ENGINE_REASON_CLIP),
+    })?;
+    let pre = load_source(&spec.name, &planned.component, &engine)?;
+    let factory = WasmtimeFactory::new(engine.engine().clone(), pre);
+
+    if produce {
+        // The lock first, so a second producer fails before any poll or
+        // network connection.
+        let store = open_state_store(&state_dir)?;
+        let cursor = store.read(&spec.name)?;
+        let sink = FluvioSink::connect_social().await?;
+        let polled = poll_interruptible(&spec, &factory, cursor.as_deref()).await?;
+        let produce = Produce::Yes {
+            sink: &sink,
+            cursors: &store,
+        };
+        finish_run_once(&spec, polled, produce, json, out, err).await
+    } else {
+        // Lock-free read: works while `fili run` is up and creates nothing.
+        let cursor = read_cursor_file(&state_dir, &spec.name)?;
+        let polled = poll_interruptible(&spec, &factory, cursor.as_deref()).await?;
+        finish_run_once(&spec, polled, Produce::<FluvioSink>::No, json, out, err).await
+    }
+}
+
 /// Runs one `fili plugins` subcommand, writing to stdout.
 ///
 /// # Errors
 /// Returns whatever the subcommand returns.
-pub fn dispatch(
+pub async fn dispatch(
     command: &PluginsCommand,
     registry: &Path,
     state_dir_flag: Option<&Path>,
@@ -527,6 +767,24 @@ pub fn dispatch(
             let mut err = stderr.lock();
             check(registry, name, &mut out, &mut err)
         }
+        PluginsCommand::RunOnce {
+            name,
+            produce,
+            json,
+        } => {
+            let mut out = std::io::stdout();
+            let mut err = std::io::stderr();
+            run_once(
+                registry,
+                state_dir_flag,
+                name,
+                *produce,
+                *json,
+                &mut out,
+                &mut err,
+            )
+            .await
+        }
     }
 }
 
@@ -541,7 +799,7 @@ mod tests {
 
     use super::*;
     use crate::plugins::host::cursor::CursorStore;
-    use crate::plugins::host::sink::VecSink;
+    use crate::plugins::host::sink::{ItemSink, VecSink};
     use crate::plugins::host::testing::{
         FakeFactory, FakeStep, TestSource, run_for, spec, wit_item, write_registry,
     };
@@ -1480,6 +1738,83 @@ mod tests {
             }
         }
         assert!(rendered.contains("STUB_MISSING"), "env var names are shown");
+    }
+
+    // ── run-once ─────────────────────────────────────────────────────────────
+
+    use crate::plugins::host::engine::WitItem;
+
+    /// A scripted poll answer with `items` and `next_cursor`.
+    fn poll_step(items: Vec<WitItem>, next_cursor: Option<Vec<u8>>) -> FakeStep {
+        FakeStep::PollOk {
+            items,
+            next_cursor,
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// Runs one cycle with the fakes and returns `(result, stdout, stderr)`.
+    async fn run_fake<S: ItemSink>(
+        factory: &FakeFactory,
+        cursor: Option<&[u8]>,
+        produce: Produce<'_, S>,
+        json: bool,
+    ) -> (miette::Result<()>, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = execute_run_once(
+            &spec("fake", 60, 60, 3600, 2.0),
+            factory,
+            cursor,
+            produce,
+            json,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        (
+            result,
+            String::from_utf8(out).expect("utf8 stdout"),
+            String::from_utf8(err).expect("utf8 stderr"),
+        )
+    }
+
+    #[tokio::test]
+    async fn run_once_dry_run_prints_items_and_leaves_the_state_dir_absent() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("a"), wit_item("b")], Some(vec![7])),
+        ]);
+
+        // The dry-run path of `run_once`: a lock-free cursor read, no store.
+        let cursor = read_cursor_file(&state, "fake").expect("a missing directory is a first poll");
+        let (result, out, err) =
+            run_fake(&factory, cursor.as_deref(), Produce::<VecSink>::No, false).await;
+
+        result.expect("dry run succeeds");
+        assert!(out.contains("[1/2] fake:a"), "{out}");
+        assert!(out.contains("[2/2] fake:b"), "{out}");
+        assert!(
+            out.contains("https://example.invalid/fake/a"),
+            "the url is shown: {out}"
+        );
+        assert!(out.contains("polled 2 items (0 dropped)"), "{out}");
+        assert!(out.contains(DRY_RUN_NOTICE), "{out}");
+        assert!(err.is_empty(), "{err}");
+        assert!(!state.exists(), "a dry run must not create the state directory");
+    }
+
+    #[test]
+    fn run_once_notice_and_counts_use_the_documented_wording() {
+        assert_eq!(polled_line(1, 0), "polled 1 item (0 dropped)");
+        assert_eq!(polled_line(0, 0), "polled 0 items (0 dropped)");
+        assert_eq!(polled_line(2, 1), "polled 2 items (1 dropped)");
+        assert_eq!(
+            DRY_RUN_NOTICE,
+            "dry run: nothing was produced and the cursor was not saved (use --produce to produce and save the cursor)"
+        );
     }
 
     #[test]

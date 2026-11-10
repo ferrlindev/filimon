@@ -155,6 +155,60 @@ pub fn read_status(dir: &Path, alias: &str) -> StatusRead {
     StatusRead::Found(status)
 }
 
+/// Reads `alias`'s stored cursor from `dir` without a store: no lock is taken
+/// and nothing is created, written, renamed or deleted, so it works while
+/// `fili run` holds the lock and on a directory that does not exist yet.
+/// `Ok(None)` means a first poll: no file (or no directory), or a file whose
+/// cursor is null.
+///
+/// This is the one parse of the state file; `CursorStore::read` calls it.
+/// A bad file stays as the operator left it (D-08).
+///
+/// # Errors
+/// `CursorUnreadable` for an io failure other than a missing file,
+/// `CursorCorrupt` for invalid JSON or base64, a `plugin` that is not
+/// `alias`, or a `version` newer than this host understands.
+pub fn read_cursor_file(dir: &Path, alias: &str) -> Result<Option<Vec<u8>>, HostError> {
+    let path = dir.join(format!("{alias}.json"));
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(HostError::CursorUnreadable {
+                plugin: alias.to_string(),
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            });
+        }
+    };
+    let corrupt = |reason: &str| HostError::CursorCorrupt {
+        plugin: alias.to_string(),
+        path: path.display().to_string(),
+        reason: reason.to_string(),
+    };
+    let state: StateFile =
+        serde_json::from_slice(&bytes).map_err(|_| corrupt("not a valid state file"))?;
+    if state.version > STATE_VERSION {
+        return Err(corrupt(&format!(
+            "unsupported state file version {}",
+            state.version
+        )));
+    }
+    if state.plugin != alias {
+        return Err(corrupt(&format!(
+            "file belongs to plugin `{}`",
+            clean_guest_text(&state.plugin, 64)
+        )));
+    }
+    match state.cursor {
+        None => Ok(None),
+        Some(encoded) => STANDARD
+            .decode(encoded)
+            .map(Some)
+            .map_err(|_| corrupt("cursor is not valid base64")),
+    }
+}
+
 /// Reads and writes the cursor state files in one directory, and holds the
 /// directory's single-instance lock until dropped.
 #[derive(Debug)]
@@ -218,44 +272,7 @@ impl CursorStore {
     /// `CursorCorrupt` for invalid JSON or base64, a `plugin` that is not
     /// `alias`, or a `version` newer than this host understands.
     pub fn read(&self, alias: &str) -> Result<Option<Vec<u8>>, HostError> {
-        let path = self.path_for(alias);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(HostError::CursorUnreadable {
-                    plugin: alias.to_string(),
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                });
-            }
-        };
-        let corrupt = |reason: &str| HostError::CursorCorrupt {
-            plugin: alias.to_string(),
-            path: path.display().to_string(),
-            reason: reason.to_string(),
-        };
-        let state: StateFile =
-            serde_json::from_slice(&bytes).map_err(|_| corrupt("not a valid state file"))?;
-        if state.version > STATE_VERSION {
-            return Err(corrupt(&format!(
-                "unsupported state file version {}",
-                state.version
-            )));
-        }
-        if state.plugin != alias {
-            return Err(corrupt(&format!(
-                "file belongs to plugin `{}`",
-                clean_guest_text(&state.plugin, 64)
-            )));
-        }
-        match state.cursor {
-            None => Ok(None),
-            Some(encoded) => STANDARD
-                .decode(encoded)
-                .map(Some)
-                .map_err(|_| corrupt("cursor is not valid base64")),
-        }
+        read_cursor_file(&self.dir, alias)
     }
 
     /// Atomically stores `cursor` (`None` makes the next poll a first poll).
@@ -654,6 +671,61 @@ mod tests {
             !store.path_for("b").exists(),
             "a status write never creates a cursor"
         );
+    }
+
+    #[test]
+    fn read_cursor_file_reads_without_a_store_and_a_missing_dir_is_a_first_poll() {
+        let dir = TempDir::new().expect("tempdir");
+        let missing = dir.path().join("not-created");
+        assert_eq!(read_cursor_file(&missing, "stub").expect("read"), None);
+        assert!(!missing.exists(), "reading must not create the directory");
+
+        let state = dir.path().join("state");
+        let store = CursorStore::open(&state).expect("open");
+        store.write("stub", Some(&[4, 2])).expect("write");
+        // The store still holds the lock: the free function takes none.
+        assert_eq!(
+            read_cursor_file(&state, "stub").expect("read"),
+            Some(vec![4, 2])
+        );
+        assert_eq!(read_cursor_file(&state, "other").expect("read"), None);
+    }
+
+    #[test]
+    fn read_cursor_file_reports_corruption_like_the_store() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("open");
+        let cases: [(&str, &str); 4] = [
+            ("{not json", "not a valid state file"),
+            (
+                r#"{"version":2,"plugin":"a","cursor":null}"#,
+                "unsupported state file version 2",
+            ),
+            (
+                r#"{"version":1,"plugin":"b","cursor":null}"#,
+                "file belongs to plugin `b`",
+            ),
+            (
+                r#"{"version":1,"plugin":"a","cursor":"!!!"}"#,
+                "cursor is not valid base64",
+            ),
+        ];
+        for (body, reason) in cases {
+            put(&store, "a", body);
+            let from_file = read_cursor_file(dir.path(), "a").expect_err("corrupt");
+            let from_store = store.read("a").expect_err("corrupt");
+            assert!(
+                matches!(from_file, HostError::CursorCorrupt { .. }),
+                "{from_file}"
+            );
+            assert_eq!(from_file.to_string(), from_store.to_string());
+            assert!(from_file.to_string().contains(reason), "{from_file}");
+            assert_eq!(
+                std::fs::read_to_string(store.path_for("a")).expect("file"),
+                body,
+                "a bad file is never repaired"
+            );
+        }
     }
 
     #[test]
