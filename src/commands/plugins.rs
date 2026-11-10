@@ -433,4 +433,364 @@ mod tests {
             ])
         );
     }
+
+    // ── Helpers for the list coverage tests ──────────────────────────────────
+
+    /// Writes `text` as `filimon.toml` inside `dir` and returns its path.
+    fn write_registry_text(dir: &Path, text: &str) -> PathBuf {
+        let path = dir.join("filimon.toml");
+        std::fs::write(&path, text).expect("write registry");
+        path
+    }
+
+    /// A one-line source table whose files are never opened by `list`.
+    fn source_table(name: &str, enabled: bool) -> String {
+        format!(
+            "[sources.{name}]\ncomponent = \"{name}.wasm\"\nconfig = \"{name}.toml\"\nenabled = {enabled}\n\n"
+        )
+    }
+
+    /// Writes `<alias>.status.json` into `state`, creating the directory.
+    fn write_status_file(state: &Path, alias: &str, body: &str) {
+        std::fs::create_dir_all(state).expect("state dir");
+        std::fs::write(state.join(format!("{alias}.status.json")), body)
+            .expect("write status file");
+    }
+
+    /// A well-formed status file body.
+    fn status_body(
+        alias: &str,
+        at: &str,
+        ok: bool,
+        error: Option<&str>,
+        items: Option<u64>,
+    ) -> String {
+        serde_json::json!({
+            "version": 1,
+            "plugin": alias,
+            "at": at,
+            "ok": ok,
+            "error": error,
+            "items": items,
+        })
+        .to_string()
+    }
+
+    /// The listing's rows for `registry` against `state`.
+    fn rows_for(registry: &Path, state: &Path) -> Vec<ListRow> {
+        let listing = list_registry(registry).expect("listing");
+        collect_list(&listing, state)
+    }
+
+    /// Runs `list` and returns (stdout, stderr).
+    fn run_list(registry: &Path, state: &Path, json: bool) -> (String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        list(registry, Some(state), json, &mut out, &mut err).expect("list succeeds");
+        (
+            String::from_utf8(out).expect("utf8 stdout"),
+            String::from_utf8(err).expect("utf8 stderr"),
+        )
+    }
+
+    /// The first token of every table row after the header.
+    fn table_names(table: &str) -> Vec<&str> {
+        table
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next())
+            .collect()
+    }
+
+    // ── Row coverage ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_rows_cover_every_status_shape() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let mut text = String::new();
+        for (name, enabled) in [
+            ("a_never", true),
+            ("b_off", false),
+            ("c_ok", true),
+            ("d_err", true),
+            ("e_garbage", true),
+            ("f_empty", true),
+        ] {
+            text.push_str(&source_table(name, enabled));
+        }
+        text.push_str("[fetchers.fetch]\ncomponent = \"fetch.wasm\"\n");
+        let registry = write_registry_text(dir.path(), &text);
+        write_status_file(
+            &state,
+            "c_ok",
+            &status_body("c_ok", "2026-01-02T03:04:05Z", true, None, Some(3)),
+        );
+        write_status_file(
+            &state,
+            "d_err",
+            &status_body("d_err", "2026-01-02T03:04:06Z", false, Some("boom"), None),
+        );
+        write_status_file(&state, "e_garbage", "this is not json");
+        write_status_file(&state, "f_empty", "");
+
+        let rows = rows_for(&registry, &state);
+        let cell = |name: &str| {
+            let row = rows
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("row {name}"));
+            cells(row)
+        };
+
+        assert_eq!(cell("a_never")[4], "-");
+        assert_eq!(cell("b_off")[2], "no");
+        assert_eq!(cell("b_off")[4], "-");
+        assert_eq!(cell("c_ok")[2], "yes");
+        assert_eq!(cell("c_ok")[4], "2026-01-02T03:04:05Z ok (3 items)");
+        assert_eq!(cell("d_err")[4], "2026-01-02T03:04:06Z error: boom");
+        assert_eq!(cell("e_garbage")[4], "unreadable (not a valid status file)");
+        assert_eq!(cell("f_empty")[4], "unreadable (not a valid status file)");
+        assert_eq!(cell("fetch")[1], "fetcher");
+        assert_eq!(cell("fetch")[4], "n/a");
+        assert_eq!(rows.len(), 7, "every plugin has a row");
+    }
+
+    #[test]
+    fn list_orders_sources_then_fetchers_by_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let mut text = String::new();
+        for name in ["zeta", "alpha", "mid"] {
+            text.push_str(&source_table(name, true));
+        }
+        for name in ["b", "a"] {
+            text.push_str(&format!("[fetchers.{name}]\ncomponent = \"{name}.wasm\"\n"));
+        }
+        let registry = write_registry_text(dir.path(), &text);
+        let expected = ["alpha", "mid", "zeta", "a", "b"];
+
+        let (table, _) = run_list(&registry, &state, false);
+        assert_eq!(table_names(&table), expected, "{table}");
+
+        let (json, _) = run_list(&registry, &state, true);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let json_names: Vec<&str> = value
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|row| row["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(json_names, expected);
+        let (again, _) = run_list(&registry, &state, true);
+        assert_eq!(again, json, "identical across runs");
+    }
+
+    #[test]
+    fn list_keeps_same_named_source_and_fetcher_as_two_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let mut text = source_table("shared", true);
+        text.push_str("[fetchers.shared]\ncomponent = \"shared.wasm\"\n");
+        let registry = write_registry_text(dir.path(), &text);
+
+        let rows = rows_for(&registry, &state);
+        let kinds: Vec<(&str, &str)> = rows.iter().map(|r| (r.kind, r.name.as_str())).collect();
+        assert_eq!(kinds, [("source", "shared"), ("fetcher", "shared")]);
+    }
+
+    #[test]
+    fn list_never_reads_a_status_file_for_a_fetcher() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let mut text = source_table("shared", true);
+        text.push_str("[fetchers.shared]\ncomponent = \"shared.wasm\"\n");
+        let registry = write_registry_text(dir.path(), &text);
+        write_status_file(
+            &state,
+            "shared",
+            &status_body("shared", "2026-01-02T03:04:05Z", true, None, Some(2)),
+        );
+
+        let rows = rows_for(&registry, &state);
+        assert_eq!(cells(&rows[0])[4], "2026-01-02T03:04:05Z ok (2 items)");
+        assert_eq!(rows[1].kind, "fetcher");
+        assert_eq!(rows[1].last_poll, LastPoll::NotApplicable);
+        assert_eq!(cells(&rows[1])[4], "n/a");
+    }
+
+    #[test]
+    fn list_empty_registry_prints_a_no_plugins_line_and_json_empty_array() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let registry = write_registry_text(dir.path(), "");
+
+        let (table, _) = run_list(&registry, &state, false);
+        assert_eq!(
+            table,
+            format!("No plugins are registered in {}.\n", registry.display())
+        );
+        let (json, _) = run_list(&registry, &state, true);
+        assert_eq!(json, "[]\n");
+    }
+
+    // ── Tolerance of broken things ───────────────────────────────────────────
+
+    #[test]
+    fn list_survives_a_broken_plugin_toml_and_a_missing_component() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let mut text = source_table("bad", true);
+        text.push_str(&source_table("good", true));
+        let registry = write_registry_text(dir.path(), &text);
+        std::fs::write(dir.path().join("bad.toml"), "[host\npoll_interval = ").expect("bad toml");
+        // `bad.wasm` and `good.toml` do not exist at all.
+
+        let (table, _) = run_list(&registry, &state, false);
+        assert_eq!(table_names(&table), ["bad", "good"], "{table}");
+    }
+
+    #[test]
+    fn list_works_while_the_state_dir_lock_is_held() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let registry = write_registry_text(dir.path(), &source_table("held", true));
+        let store = CursorStore::open(&state).expect("hold the lock");
+        write_status_file(
+            &state,
+            "held",
+            &status_body("held", "2026-01-02T03:04:05Z", true, None, Some(3)),
+        );
+
+        let (table, _) = run_list(&registry, &state, false);
+        assert!(table.contains("ok (3 items)"), "{table}");
+        drop(store);
+    }
+
+    #[test]
+    fn list_creates_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let registry = write_registry_text(dir.path(), &source_table("quiet", true));
+        let entries = |path: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(path)
+                .expect("read dir")
+                .map(|e| e.expect("entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = entries(dir.path());
+
+        run_list(&registry, &state, false);
+        run_list(&registry, &state, true);
+
+        assert!(!state.exists(), "state directory must not be created");
+        let after = entries(dir.path());
+        assert_eq!(before, after, "registry directory is unchanged");
+        for name in &after {
+            let name = name.to_string_lossy();
+            assert!(
+                name != ".lock" && name != ".env" && !name.ends_with(".status.json"),
+                "unexpected file {name}"
+            );
+        }
+    }
+
+    // ── Sanitizing and clipping ──────────────────────────────────────────────
+
+    #[test]
+    fn list_sanitizes_status_text_from_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let registry = write_registry_text(dir.path(), &source_table("evil", true));
+        write_status_file(
+            &state,
+            "evil",
+            &status_body(
+                "evil",
+                "2026-01-02\nT03:04:05Z",
+                false,
+                Some("\u{1b}[31mred\nforged row"),
+                None,
+            ),
+        );
+
+        let (table, _) = run_list(&registry, &state, false);
+        assert!(!table.contains('\u{1b}'), "ESC reached the table: {table:?}");
+        assert_eq!(table.lines().count(), 2, "one header and one row: {table:?}");
+        assert!(table.contains("red"), "{table:?}");
+
+        let (json, _) = run_list(&registry, &state, true);
+        assert!(!json.contains('\u{1b}'), "ESC reached the JSON: {json:?}");
+        assert_eq!(json.matches('\n').count(), 1, "{json:?}");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let poll = &value[0]["last_poll"];
+        assert_eq!(poll["state"], "error");
+        for key in ["at", "error"] {
+            let text = poll[key].as_str().expect("string");
+            assert!(
+                !text.chars().any(char::is_control),
+                "{key} holds a control character: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_clips_the_error_in_the_table_but_not_in_json() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let registry = write_registry_text(dir.path(), &source_table("long", true));
+        let long = "x".repeat(300);
+        write_status_file(
+            &state,
+            "long",
+            &status_body("long", "2026-01-02T03:04:05Z", false, Some(&long), None),
+        );
+
+        let (table, _) = run_list(&registry, &state, false);
+        let row = table.lines().nth(1).expect("row");
+        assert!(
+            row.ends_with(&format!("error: {}…", "x".repeat(80))),
+            "{row:?}"
+        );
+
+        let (json, _) = run_list(&registry, &state, true);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let error = value[0]["last_poll"]["error"].as_str().expect("error");
+        assert_eq!(error.chars().count(), 300);
+    }
+
+    #[test]
+    fn list_reports_skipped_invalid_names_and_never_uses_them_as_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let mut text = source_table("fine", true);
+        for key in ["Bad Name", "../evil", "esc\\u001bseq"] {
+            text.push_str(&format!(
+                "[sources.\"{key}\"]\ncomponent = \"x.wasm\"\nconfig = \"x.toml\"\n\n"
+            ));
+        }
+        text.push_str("[fetchers.\"Bad/Fetcher\"]\ncomponent = \"f.wasm\"\n");
+        let registry = write_registry_text(dir.path(), &text);
+        // A status file under an invalid name must never be picked up.
+        write_status_file(
+            &state,
+            "Bad Name",
+            &status_body("Bad Name", "2026-01-02T03:04:05Z", true, None, Some(9)),
+        );
+
+        let (table, err) = run_list(&registry, &state, false);
+        assert_eq!(table_names(&table), ["fine"], "{table}");
+        assert!(!table.contains("9 items"), "{table}");
+
+        assert!(err.contains("sources"), "{err:?}");
+        assert!(err.contains("Bad Name"), "{err:?}");
+        assert!(err.contains("../evil"), "{err:?}");
+        assert!(err.contains("fetchers"), "{err:?}");
+        assert!(err.contains("Bad/Fetcher"), "{err:?}");
+        assert!(!err.contains('\u{1b}'), "ESC reached stderr: {err:?}");
+        assert_eq!(err.lines().count(), 4, "one note per skipped name: {err:?}");
+        assert!(!table.contains("Bad"), "notes never go to stdout: {table}");
+    }
 }
