@@ -2011,6 +2011,382 @@ mod tests {
         assert!(out.is_empty(), "nothing is printed for a failed cycle: {out}");
     }
 
+    // ── run-once output, refusals and guarantees ─────────────────────────────
+
+    use crate::models::SourceItem;
+    use crate::plugins::host::engine::{PollError, PollResponse};
+    use crate::plugins::host::instance::{
+        CallOutcome, InstanceBuildError, PluginInstance,
+    };
+
+    #[tokio::test]
+    async fn run_once_json_prints_one_source_item_per_line_in_guest_order() {
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("c"), wit_item("a"), wit_item("b")], Some(vec![1])),
+        ]);
+
+        let (result, out, err) = run_fake(&factory, None, Produce::<VecSink>::No, true).await;
+
+        result.expect("json dry run succeeds");
+        let items: Vec<SourceItem> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is a SourceItem"))
+            .collect();
+        let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b"], "guest order: {out}");
+        assert!(items.iter().all(|item| item.platform == "fake"));
+        assert_eq!(out.lines().count(), 3, "stdout holds nothing else: {out}");
+        assert!(out.ends_with('\n'));
+        assert!(err.contains("polled 3 items (0 dropped)"), "{err}");
+        assert!(err.contains(DRY_RUN_NOTICE), "{err}");
+        assert!(!out.contains("polled"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn run_once_zero_items_json_writes_nothing_to_stdout() {
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_step(vec![], None)]);
+
+        let (result, out, err) = run_fake(&factory, None, Produce::<VecSink>::No, true).await;
+
+        result.expect("zero items succeed");
+        assert!(out.is_empty(), "stdout must stay empty: {out:?}");
+        assert!(err.contains("polled 0 items (0 dropped)"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_once_json_with_produce_keeps_stdout_machine_readable() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(dir.path());
+        let sink = VecSink::default();
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("a")], Some(vec![2])),
+        ]);
+
+        let produce = Produce::Yes {
+            sink: &sink,
+            cursors: &store,
+        };
+        let (result, out, err) = run_fake(&factory, None, produce, true).await;
+
+        result.expect("json produce succeeds");
+        assert_eq!(out.lines().count(), 1, "{out}");
+        serde_json::from_str::<SourceItem>(out.trim_end()).expect("a SourceItem");
+        assert!(
+            err.contains("produced 1 record to filimon-social-items; cursor saved"),
+            "{err}"
+        );
+        assert!(!err.contains("dry run:"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_once_human_output_is_sanitized_and_clipped_by_characters() {
+        let mut item = wit_item("a");
+        item.text = "é".repeat(300);
+        item.title = Some("red\u{1b}[31m line\nbreak".to_string());
+        item.author = Some("😀".repeat(300));
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_step(vec![item], None)]);
+
+        let (result, out, _err) = run_fake(&factory, None, Produce::<VecSink>::No, false).await;
+
+        result.expect("dry run succeeds");
+        assert!(!out.contains('\u{1b}'), "ESC reached the terminal: {out:?}");
+        assert_eq!(
+            out.lines().count(),
+            8,
+            "header, five fields, count and notice: {out:?}"
+        );
+        let value_of = |label: &str| -> String {
+            out.lines()
+                .find_map(|line| line.strip_prefix(&format!("    {label}: ")))
+                .unwrap_or_else(|| panic!("no {label} line in {out}"))
+                .to_string()
+        };
+        let text = value_of("text");
+        assert_eq!(text.chars().count(), 201, "200 characters and one ellipsis");
+        assert_eq!(text, format!("{}…", "é".repeat(200)));
+        let author = value_of("author");
+        assert_eq!(author, format!("{}…", "😀".repeat(200)));
+        assert!(value_of("title").contains("line break"), "{out:?}");
+        assert_eq!(value_of("published"), "--");
+    }
+
+    #[tokio::test]
+    async fn run_once_keeps_duplicate_keys_in_guest_order_and_reports_dropped() {
+        let mut blank = wit_item("x");
+        blank.id = String::new();
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("a"), wit_item("a"), blank], None),
+        ]);
+
+        let (result, out, _err) = run_fake(&factory, None, Produce::<VecSink>::No, false).await;
+
+        result.expect("dry run succeeds");
+        let one = out.find("[1/2] fake:a").expect("first block");
+        let two = out.find("[2/2] fake:a").expect("second block");
+        assert!(one < two, "{out}");
+        assert!(out.contains("polled 2 items (1 dropped)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn run_once_dry_run_reads_the_saved_cursor_without_the_lock() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let holder = store_in(dir.path());
+        holder.write("fake", Some(&[5])).expect("saved cursor");
+        let before = std::fs::read(holder.path_for("fake")).expect("bytes");
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_step(vec![], Some(vec![8]))]);
+
+        // `holder` still owns the lock: the dry run's read must not need it.
+        let cursor = read_cursor_file(&state, "fake").expect("lock-free read");
+        let (result, _out, _err) =
+            run_fake(&factory, cursor.as_deref(), Produce::<VecSink>::No, false).await;
+
+        result.expect("dry run succeeds while the lock is held");
+        assert_eq!(factory.poll_cursors(), vec![Some(vec![5])]);
+        assert_eq!(std::fs::read(holder.path_for("fake")).expect("bytes"), before);
+        assert!(
+            !state.join("fake.status.json").exists(),
+            "a dry run writes no status file"
+        );
+        drop(holder);
+    }
+
+    /// A registry with one source `stub` (a component that cannot be loaded),
+    /// a valid plugin file and the given state-directory content.
+    fn corrupt_cursor_setup(dir: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let registry = stub_registry(dir, GARBAGE, MINIMAL_TOML);
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        let file = state.join("stub.json");
+        let garbage = b"{not json \xff\xfe".to_vec();
+        std::fs::write(&file, &garbage).expect("garbage cursor");
+        (registry, file, garbage)
+    }
+
+    #[tokio::test]
+    async fn run_once_dry_run_with_a_corrupt_cursor_fails_naming_the_file_and_leaves_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let (registry, file, garbage) = corrupt_cursor_setup(dir.path());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let error = run_once(
+            &registry,
+            Some(&dir.path().join("state")),
+            "stub",
+            false,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect_err("a corrupt cursor file fails the command");
+
+        let text = error.to_string();
+        assert!(text.contains("corrupt"), "{text}");
+        assert!(text.contains("`stub`"), "{text}");
+        assert!(text.contains(&file.display().to_string()), "{text}");
+        assert_eq!(std::fs::read(&file).expect("bytes"), garbage, "bytes changed");
+        assert!(out.is_empty(), "nothing was printed");
+    }
+
+    /// Runs `run_once` on `name` and returns the refusal text.
+    async fn refusal(registry: &Path, state: &Path, name: &str) -> String {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let error = run_once(registry, Some(state), name, false, false, &mut out, &mut err)
+            .await
+            .expect_err("run-once refuses");
+        assert!(out.is_empty(), "nothing printed before a refusal");
+        error.to_string()
+    }
+
+    fn refusal_registry(dir: &Path) -> PathBuf {
+        let mut text = source_table("off", false);
+        text.push_str(&source_table("on", true));
+        text.push_str("[fetchers.f]\ncomponent = \"f.wasm\"\n");
+        write_registry_text(dir, &text)
+    }
+
+    #[tokio::test]
+    async fn run_once_refuses_a_disabled_source() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = refusal_registry(dir.path());
+        let state = dir.path().join("state");
+
+        let text = refusal(&registry, &state, "off").await;
+
+        assert_eq!(
+            text,
+            "plugin `off` is disabled in filimon.toml; set `enabled = true` to run it"
+        );
+        assert!(!state.exists(), "the state directory is untouched");
+    }
+
+    #[tokio::test]
+    async fn run_once_refuses_a_fetcher() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = refusal_registry(dir.path());
+        let state = dir.path().join("state");
+
+        let text = refusal(&registry, &state, "f").await;
+
+        assert_eq!(text, "`f` is a fetcher; run-once polls sources");
+        assert!(!state.exists(), "the state directory is untouched");
+    }
+
+    #[tokio::test]
+    async fn run_once_unknown_name_lists_registered_plugins() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = refusal_registry(dir.path());
+        let state = dir.path().join("state");
+
+        let text = refusal(&registry, &state, "nope\u{1b}[31m").await;
+
+        assert!(text.contains("no plugin named `nope"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("sources: off, on"), "{text}");
+        assert!(text.contains("fetchers: f"), "{text}");
+        assert!(!state.exists(), "the state directory is untouched");
+    }
+
+    // ── Secrets ──────────────────────────────────────────────────────────────
+
+    /// A factory whose instance records the secrets `init` received.
+    struct ProbeFactory {
+        received: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        poll: fn() -> CallOutcome<PollResponse>,
+    }
+
+    struct ProbeInstance {
+        received: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        poll: fn() -> CallOutcome<PollResponse>,
+    }
+
+    impl InstanceFactory for ProbeFactory {
+        type Instance = ProbeInstance;
+
+        async fn instantiate(&self, _plugin: &str) -> Result<ProbeInstance, InstanceBuildError> {
+            Ok(ProbeInstance {
+                received: Arc::clone(&self.received),
+                poll: self.poll,
+            })
+        }
+    }
+
+    impl PluginInstance for ProbeInstance {
+        async fn init(&mut self, _settings: &str, secrets: &[(String, String)]) -> CallOutcome<()> {
+            self.received.lock().expect("received").extend_from_slice(secrets);
+            CallOutcome::Ok(())
+        }
+
+        async fn poll(&mut self, _cursor: Option<&[u8]>) -> CallOutcome<PollResponse> {
+            (self.poll)()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_once_never_prints_secret_values() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = stub_registry(
+            dir.path(),
+            GARBAGE,
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"STUB_TOKEN\"\n",
+        );
+        let env = |key: &str| (key == "STUB_TOKEN").then(|| SECRET_VALUE.to_string());
+        let loaded = crate::plugins::config::load_registry_with_env(&registry, &env)
+            .expect("registry loads with the secret");
+        let spec = PluginSpec::from_loaded(&loaded.sources["stub"]).expect("an enabled source");
+        let state = dir.path().join("state");
+        let store = CursorStore::open(&state).expect("cursor store");
+        let sink = VecSink::default();
+
+        let ok_poll: fn() -> CallOutcome<PollResponse> = || {
+            CallOutcome::Ok(PollResponse {
+                items: vec![wit_item("a")],
+                next_cursor: Some(vec![1]),
+            })
+        };
+        let bad_poll: fn() -> CallOutcome<PollResponse> =
+            || CallOutcome::Guest(PollError::Fatal("boom".to_string()));
+
+        let mut everything = format!("{spec:?}");
+        for poll in [ok_poll, bad_poll] {
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let factory = ProbeFactory {
+                received: Arc::clone(&received),
+                poll,
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let produce = Produce::Yes {
+                sink: &sink,
+                cursors: &store,
+            };
+            let result = execute_run_once(&spec, &factory, None, produce, false, &mut out, &mut err)
+                .await;
+
+            // The guest did get the secret, so the absence below means something.
+            assert_eq!(
+                *received.lock().expect("received"),
+                vec![("token".to_string(), SECRET_VALUE.to_string())]
+            );
+            everything.push_str(&String::from_utf8(out).expect("utf8"));
+            everything.push_str(&String::from_utf8(err).expect("utf8"));
+            if let Err(error) = result {
+                everything.push_str(&format!("{error} {error:?}"));
+            }
+        }
+        everything.push_str(
+            &std::fs::read_to_string(state.join("stub.status.json")).expect("status file"),
+        );
+        for leaked in [SECRET_VALUE, "hunter2", "distinctive"] {
+            assert!(!everything.contains(leaked), "leaked {leaked:?} in: {everything}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    fn wasm_run_once_stub_json_prints_a_social_source_item() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = write_registry(
+            dir.path(),
+            &[TestSource {
+                name: "stub".to_string(),
+                component: fixture_wasm("stub-source", "stub_source.wasm"),
+                enabled: true,
+                interval_secs: 60,
+                backoff: None,
+                settings: "greeting = \"hello\"".to_string(),
+            }],
+        );
+        let state = dir.path().join("state");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        runtime
+            .block_on(run_once(
+                &registry, Some(&state), "stub", false, true, &mut out, &mut err,
+            ))
+            .expect("the real stub polls");
+
+        let text = String::from_utf8(out).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let item: SourceItem = serde_json::from_str(lines[0]).expect("a SourceItem");
+        assert_eq!(item.platform, "stub");
+        assert_eq!(item.id, "stub-0");
+        assert_eq!(item.source_type, crate::models::SourceType::Social);
+        assert!(!state.exists(), "a dry run must not create the state directory");
+    }
+
     #[test]
     fn run_once_notice_and_counts_use_the_documented_wording() {
         assert_eq!(polled_line(1, 0), "polled 1 item (0 dropped)");
