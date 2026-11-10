@@ -140,7 +140,10 @@ mod tests {
         spec("fake", 60, 60, 3600, 2.0)
     }
 
-    fn poll_ok(items: Vec<crate::plugins::host::engine::WitItem>, next: Option<Vec<u8>>) -> FakeStep {
+    fn poll_ok(
+        items: Vec<crate::plugins::host::engine::WitItem>,
+        next: Option<Vec<u8>>,
+    ) -> FakeStep {
         FakeStep::PollOk {
             items,
             next_cursor: next,
@@ -242,7 +245,10 @@ mod tests {
         struct Failing;
         impl InstanceFactory for Failing {
             type Instance = <FakeFactory as InstanceFactory>::Instance;
-            async fn instantiate(&self, _plugin: &str) -> Result<Self::Instance, InstanceBuildError> {
+            async fn instantiate(
+                &self,
+                _plugin: &str,
+            ) -> Result<Self::Instance, InstanceBuildError> {
                 Err(InstanceBuildError("no memory".to_string()))
             }
         }
@@ -250,7 +256,10 @@ mod tests {
         let outcome = poll_once(&once_spec(), &Failing, None)
             .await
             .expect_err("build fails");
-        assert!(matches!(outcome, CycleOutcome::BuildFailed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, CycleOutcome::BuildFailed(_)),
+            "{outcome:?}"
+        );
         assert!(describe(&outcome).starts_with("instance build failed:"));
     }
 
@@ -352,7 +361,10 @@ mod tests {
             "during the send the file still holds the old cursor"
         );
         assert_eq!(sink.inner.records().len(), 2);
-        assert_eq!(read_cursor_file(dir.path(), "fake").expect("read"), Some(vec![2]));
+        assert_eq!(
+            read_cursor_file(dir.path(), "fake").expect("read"),
+            Some(vec![2])
+        );
     }
 
     #[tokio::test]
@@ -402,7 +414,10 @@ mod tests {
 
         assert_eq!(sent, 0);
         assert_eq!(sink.calls(), 0, "an empty list makes no sink call");
-        assert_eq!(read_cursor_file(dir.path(), "fake").expect("read"), Some(vec![9]));
+        assert_eq!(
+            read_cursor_file(dir.path(), "fake").expect("read"),
+            Some(vec![9])
+        );
     }
 
     #[tokio::test]

@@ -562,11 +562,7 @@ fn polled_line(count: usize, dropped: usize) -> String {
 
 /// One field line: the value cleaned and clipped by characters, `--` when
 /// absent or empty.
-fn field_line(
-    out: &mut impl Write,
-    label: &str,
-    value: Option<&str>,
-) -> std::io::Result<()> {
+fn field_line(out: &mut impl Write, label: &str, value: Option<&str>) -> std::io::Result<()> {
     let shown = value
         .map(|text| clean_guest_text(text, ITEM_FIELD_CLIP))
         .filter(|text| !text.is_empty())
@@ -621,18 +617,37 @@ async fn finish_run_once<S: ItemSink>(
             return Err(miette::miette!("{}", describe(&outcome)));
         }
     };
-    let _ = &err;
+    // The items go to `out`; in JSON mode every note goes to `err`, so stdout
+    // holds nothing but one compact `SourceItem` per line.
     if json {
-        return Err(miette::miette!("--json is not available yet"));
+        render_items_json(&polled.records, out)?;
+    } else {
+        render_items(&polled.records, out).into_diagnostic()?;
     }
-    render_items(&polled.records, out).into_diagnostic()?;
-    writeln!(out, "{}", polled_line(polled.records.len(), polled.dropped)).into_diagnostic()?;
+    let notes: &mut dyn Write = if json { err } else { out };
+    writeln!(
+        notes,
+        "{}",
+        polled_line(polled.records.len(), polled.dropped)
+    )
+    .into_diagnostic()?;
     match produce {
-        Produce::No => writeln!(out, "{DRY_RUN_NOTICE}").into_diagnostic(),
+        Produce::No => writeln!(notes, "{DRY_RUN_NOTICE}").into_diagnostic(),
         Produce::Yes { sink, cursors } => {
-            commit_and_record(spec, polled, sink, cursors, out).await
+            commit_and_record(spec, polled, sink, cursors, notes).await
         }
     }
+}
+
+/// Writes each record's `SourceItem` as one compact JSON line, in guest order.
+/// serde escapes every guest string, so no control character reaches stdout
+/// raw.
+fn render_items_json(records: &[SinkRecord], out: &mut impl Write) -> miette::Result<()> {
+    for record in records {
+        let line = serde_json::to_string(&record.item).into_diagnostic()?;
+        writeln!(out, "{line}").into_diagnostic()?;
+    }
+    Ok(())
 }
 
 /// `1 record` or `N records`.
@@ -651,7 +666,7 @@ async fn commit_and_record<S: ItemSink>(
     polled: PolledOnce,
     sink: &S,
     cursors: &CursorStore,
-    out: &mut impl Write,
+    out: &mut dyn Write,
 ) -> miette::Result<()> {
     match commit_once(&spec.name, polled, sink, cursors).await {
         Ok(sent) => {
@@ -673,7 +688,13 @@ async fn commit_and_record<S: ItemSink>(
                 "produced {} but the cursor could not be saved; the next poll will replay them ({text})",
                 records_noun(sent)
             );
-            record_status_text(cursors, &spec.name, false, Some(message.clone()), Some(sent));
+            record_status_text(
+                cursors,
+                &spec.name,
+                false,
+                Some(message.clone()),
+                Some(sent),
+            );
             Err(miette::miette!("{message}"))
         }
     }
@@ -684,6 +705,13 @@ async fn commit_and_record<S: ItemSink>(
 ///
 /// # Errors
 /// The cleaned `describe` text of a failed cycle, or a write error.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the test seam; run_once races the poll and calls the steps"
+    )
+)]
 pub async fn execute_run_once<F: InstanceFactory, S: ItemSink>(
     spec: &PluginSpec,
     factory: &F,
@@ -698,10 +726,7 @@ pub async fn execute_run_once<F: InstanceFactory, S: ItemSink>(
 }
 
 /// The plugin `name` as a pollable source, or the reason `run-once` refuses it.
-fn find_source<'a>(
-    listing: &'a RegistryListing,
-    name: &str,
-) -> miette::Result<&'a ListedPlugin> {
+fn find_source<'a>(listing: &'a RegistryListing, name: &str) -> miette::Result<&'a ListedPlugin> {
     let (kind, plugin) = find_plugin(listing, name)?;
     let shown = clean_guest_text(name, NAME_ECHO_CLIP);
     if kind == PluginKind::Fetcher {
@@ -768,17 +793,25 @@ pub async fn run_once(
         .and_then(PluginSpec::from_loaded)
         .ok_or_else(|| miette::miette!("plugin `{}` could not be prepared", planned.name))?;
 
+    // The starting cursor, before any component is loaded, so a corrupt cursor
+    // file is reported as itself. `--produce` takes the lock first, so a second
+    // producer fails before any poll or network connection; a dry run reads
+    // lock-free, which works while `fili run` is up and creates nothing.
+    let (store, cursor) = if produce {
+        let store = open_state_store(&state_dir)?;
+        let cursor = store.read(&spec.name)?;
+        (Some(store), cursor)
+    } else {
+        (None, read_cursor_file(&state_dir, &spec.name)?)
+    };
+
     let engine = HostEngine::new().map_err(|e| HostError::Engine {
         reason: clean_guest_text(&format!("{e:#}"), ENGINE_REASON_CLIP),
     })?;
     let pre = load_source(&spec.name, &planned.component, &engine)?;
     let factory = WasmtimeFactory::new(engine.engine().clone(), pre);
 
-    if produce {
-        // The lock first, so a second producer fails before any poll or
-        // network connection.
-        let store = open_state_store(&state_dir)?;
-        let cursor = store.read(&spec.name)?;
+    if let Some(store) = store {
         let sink = FluvioSink::connect_social().await?;
         let polled = poll_interruptible(&spec, &factory, cursor.as_deref()).await?;
         let produce = Produce::Yes {
@@ -787,8 +820,6 @@ pub async fn run_once(
         };
         finish_run_once(&spec, polled, produce, json, out, err).await
     } else {
-        // Lock-free read: works while `fili run` is up and creates nothing.
-        let cursor = read_cursor_file(&state_dir, &spec.name)?;
         let polled = poll_interruptible(&spec, &factory, cursor.as_deref()).await?;
         finish_run_once(&spec, polled, Produce::<FluvioSink>::No, json, out, err).await
     }
@@ -1854,7 +1885,10 @@ mod tests {
         assert!(out.contains("polled 2 items (0 dropped)"), "{out}");
         assert!(out.contains(DRY_RUN_NOTICE), "{out}");
         assert!(err.is_empty(), "{err}");
-        assert!(!state.exists(), "a dry run must not create the state directory");
+        assert!(
+            !state.exists(),
+            "a dry run must not create the state directory"
+        );
     }
 
     fn store_in(dir: &Path) -> CursorStore {
@@ -1972,8 +2006,7 @@ mod tests {
         let sink = FlakySink::new(0);
         let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_step(vec![], Some(vec![6]))]);
 
-        let (result, out, _err) =
-            run_fake(&factory, None, Produce::<VecSink>::No, false).await;
+        let (result, out, _err) = run_fake(&factory, None, Produce::<VecSink>::No, false).await;
         result.expect("zero items succeed");
         assert!(out.contains("polled 0 items (0 dropped)"), "{out}");
         assert!(!out.contains("[1/"), "no blocks: {out}");
@@ -2008,22 +2041,26 @@ mod tests {
         let text = result.expect_err("a failed cycle fails").to_string();
         assert!(text.contains("poll fatal error: boom"), "{text}");
         assert!(!text.contains('\u{1b}'), "{text:?}");
-        assert!(out.is_empty(), "nothing is printed for a failed cycle: {out}");
+        assert!(
+            out.is_empty(),
+            "nothing is printed for a failed cycle: {out}"
+        );
     }
 
     // ── run-once output, refusals and guarantees ─────────────────────────────
 
     use crate::models::SourceItem;
     use crate::plugins::host::engine::{PollError, PollResponse};
-    use crate::plugins::host::instance::{
-        CallOutcome, InstanceBuildError, PluginInstance,
-    };
+    use crate::plugins::host::instance::{CallOutcome, InstanceBuildError, PluginInstance};
 
     #[tokio::test]
     async fn run_once_json_prints_one_source_item_per_line_in_guest_order() {
         let factory = FakeFactory::new(vec![
             FakeStep::InitOk,
-            poll_step(vec![wit_item("c"), wit_item("a"), wit_item("b")], Some(vec![1])),
+            poll_step(
+                vec![wit_item("c"), wit_item("a"), wit_item("b")],
+                Some(vec![1]),
+            ),
         ]);
 
         let (result, out, err) = run_fake(&factory, None, Produce::<VecSink>::No, true).await;
@@ -2146,7 +2183,10 @@ mod tests {
 
         result.expect("dry run succeeds while the lock is held");
         assert_eq!(factory.poll_cursors(), vec![Some(vec![5])]);
-        assert_eq!(std::fs::read(holder.path_for("fake")).expect("bytes"), before);
+        assert_eq!(
+            std::fs::read(holder.path_for("fake")).expect("bytes"),
+            before
+        );
         assert!(
             !state.join("fake.status.json").exists(),
             "a dry run writes no status file"
@@ -2189,7 +2229,11 @@ mod tests {
         assert!(text.contains("corrupt"), "{text}");
         assert!(text.contains("`stub`"), "{text}");
         assert!(text.contains(&file.display().to_string()), "{text}");
-        assert_eq!(std::fs::read(&file).expect("bytes"), garbage, "bytes changed");
+        assert_eq!(
+            std::fs::read(&file).expect("bytes"),
+            garbage,
+            "bytes changed"
+        );
         assert!(out.is_empty(), "nothing was printed");
     }
 
@@ -2197,9 +2241,17 @@ mod tests {
     async fn refusal(registry: &Path, state: &Path, name: &str) -> String {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let error = run_once(registry, Some(state), name, false, false, &mut out, &mut err)
-            .await
-            .expect_err("run-once refuses");
+        let error = run_once(
+            registry,
+            Some(state),
+            name,
+            false,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect_err("run-once refuses");
         assert!(out.is_empty(), "nothing printed before a refusal");
         error.to_string()
     }
@@ -2279,7 +2331,10 @@ mod tests {
 
     impl PluginInstance for ProbeInstance {
         async fn init(&mut self, _settings: &str, secrets: &[(String, String)]) -> CallOutcome<()> {
-            self.received.lock().expect("received").extend_from_slice(secrets);
+            self.received
+                .lock()
+                .expect("received")
+                .extend_from_slice(secrets);
             CallOutcome::Ok(())
         }
 
@@ -2326,8 +2381,8 @@ mod tests {
                 sink: &sink,
                 cursors: &store,
             };
-            let result = execute_run_once(&spec, &factory, None, produce, false, &mut out, &mut err)
-                .await;
+            let result =
+                execute_run_once(&spec, &factory, None, produce, false, &mut out, &mut err).await;
 
             // The guest did get the secret, so the absence below means something.
             assert_eq!(
@@ -2337,14 +2392,17 @@ mod tests {
             everything.push_str(&String::from_utf8(out).expect("utf8"));
             everything.push_str(&String::from_utf8(err).expect("utf8"));
             if let Err(error) = result {
-                everything.push_str(&format!("{error} {error:?}"));
+                write!(everything, "{error} {error:?}").expect("write to a string");
             }
         }
         everything.push_str(
             &std::fs::read_to_string(state.join("stub.status.json")).expect("status file"),
         );
         for leaked in [SECRET_VALUE, "hunter2", "distinctive"] {
-            assert!(!everything.contains(leaked), "leaked {leaked:?} in: {everything}");
+            assert!(
+                !everything.contains(leaked),
+                "leaked {leaked:?} in: {everything}"
+            );
         }
     }
 
@@ -2373,7 +2431,13 @@ mod tests {
         let mut err = Vec::new();
         runtime
             .block_on(run_once(
-                &registry, Some(&state), "stub", false, true, &mut out, &mut err,
+                &registry,
+                Some(&state),
+                "stub",
+                false,
+                true,
+                &mut out,
+                &mut err,
             ))
             .expect("the real stub polls");
 
@@ -2384,7 +2448,10 @@ mod tests {
         assert_eq!(item.platform, "stub");
         assert_eq!(item.id, "stub-0");
         assert_eq!(item.source_type, crate::models::SourceType::Social);
-        assert!(!state.exists(), "a dry run must not create the state directory");
+        assert!(
+            !state.exists(),
+            "a dry run must not create the state directory"
+        );
     }
 
     #[test]
