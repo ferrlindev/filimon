@@ -10,10 +10,14 @@
 // init arguments: failures are `CycleOutcome`s whose `describe` text is cleaned.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use super::cursor::CursorStore;
+use super::engine::clean_guest_text;
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
-use super::scheduler::{CycleOutcome, Phase, PluginSpec, expose_secrets, oversize_cursor_outcome};
-use super::sink::SinkRecord;
+use super::scheduler::{
+    CycleOutcome, Phase, PluginSpec, expose_secrets, oversize_cursor_outcome, send_records,
+};
+use super::sink::{ItemSink, SinkRecord};
 
 /// What one successful poll returned, ready to print and, when asked, to send.
 #[derive(Debug)]
@@ -76,6 +80,34 @@ pub async fn poll_once<F: InstanceFactory>(
         dropped: mapped.dropped,
         next_cursor: response.next_cursor,
     })
+}
+
+/// Why committing a polled batch failed.
+#[derive(Debug)]
+pub enum CommitFailure {
+    /// The sink failed; the cursor was not touched. The text is cleaned.
+    Sink(String),
+    /// The batch was sent, but the cursor could not be written, so the next
+    /// poll replays it. `sent` is how many records were delivered.
+    Cursor { sent: u64, text: String },
+}
+
+/// Sends `polled`'s records and only then writes its cursor (D-07).
+///
+/// With no records the sink is not called and the cursor is still written.
+/// Returns the number of records sent.
+///
+/// # Errors
+/// `CommitFailure::Sink` when the sink fails (the cursor file is untouched),
+/// `CommitFailure::Cursor` when the send succeeded but the cursor write failed.
+pub async fn commit_once<S: ItemSink>(
+    plugin: &str,
+    polled: PolledOnce,
+    sink: &S,
+    cursors: &CursorStore,
+) -> Result<u64, CommitFailure> {
+    let _ = (plugin, polled, sink, cursors);
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -234,5 +266,146 @@ mod tests {
         };
         let shared = oversize_cursor_outcome(&response).expect("over the cap");
         assert_eq!(describe(&shared), describe(&outcome));
+    }
+
+    // ── commit_once (D-07) ────────────────────────────────────────────────────
+
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use tempfile::TempDir;
+
+    use crate::plugins::host::cursor::read_cursor_file;
+    use crate::plugins::host::sink::{SinkError, VecSink};
+    use crate::plugins::host::testing::FlakySink;
+
+    /// A poll result with one record per id and the given next cursor.
+    fn polled(ids: &[&str], next_cursor: Option<Vec<u8>>) -> PolledOnce {
+        let mapped = map_items("fake", ids.iter().map(|id| wit_item(id)).collect());
+        PolledOnce {
+            records: mapped.records,
+            dropped: mapped.dropped,
+            next_cursor,
+        }
+    }
+
+    fn open_store() -> (TempDir, CursorStore) {
+        let dir = TempDir::new().expect("tempdir");
+        let store = CursorStore::open(dir.path()).expect("cursor store");
+        (dir, store)
+    }
+
+    /// A sink that records what the plugin's cursor file held at the moment
+    /// each batch arrived, to prove the cursor is written after the send.
+    struct InspectingSink {
+        inner: VecSink,
+        dir: PathBuf,
+        seen: Mutex<Vec<Option<Vec<u8>>>>,
+    }
+
+    impl ItemSink for InspectingSink {
+        async fn send_batch(
+            &self,
+            plugin: &str,
+            records: Vec<SinkRecord>,
+        ) -> Result<(), SinkError> {
+            let on_disk = read_cursor_file(&self.dir, plugin).expect("cursor file readable");
+            self.seen.lock().expect("seen").push(on_disk);
+            self.inner.send_batch(plugin, records).await
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_sends_then_writes_the_cursor_in_that_order() {
+        let (dir, store) = open_store();
+        store.write("fake", Some(&[1])).expect("old cursor");
+        let sink = InspectingSink {
+            inner: VecSink::default(),
+            dir: dir.path().to_path_buf(),
+            seen: Mutex::new(Vec::new()),
+        };
+
+        let sent = commit_once("fake", polled(&["a", "b"], Some(vec![2])), &sink, &store)
+            .await
+            .expect("commit");
+
+        assert_eq!(sent, 2);
+        assert_eq!(
+            *sink.seen.lock().expect("seen"),
+            vec![Some(vec![1])],
+            "during the send the file still holds the old cursor"
+        );
+        assert_eq!(sink.inner.records().len(), 2);
+        assert_eq!(read_cursor_file(dir.path(), "fake").expect("read"), Some(vec![2]));
+    }
+
+    #[tokio::test]
+    async fn commit_sink_failure_leaves_the_cursor_file_byte_identical() {
+        let (dir, store) = open_store();
+        store.write("fake", Some(&[1])).expect("old cursor");
+        let path = store.path_for("fake");
+        let before = std::fs::read(&path).expect("bytes");
+
+        let failure = commit_once(
+            "fake",
+            polled(&["a"], Some(vec![2])),
+            &FlakySink::new(usize::MAX),
+            &store,
+        )
+        .await
+        .expect_err("the sink fails");
+
+        let CommitFailure::Sink(text) = failure else {
+            panic!("expected a sink failure, got {failure:?}");
+        };
+        assert!(text.contains("broker unavailable"), "{text}");
+        assert_eq!(std::fs::read(&path).expect("bytes"), before);
+
+        // With no cursor file before, none is created.
+        let (_dir2, store2) = open_store();
+        commit_once(
+            "fake",
+            polled(&["a"], Some(vec![2])),
+            &FlakySink::new(usize::MAX),
+            &store2,
+        )
+        .await
+        .expect_err("the sink fails");
+        assert!(!store2.path_for("fake").exists());
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn commit_with_zero_items_skips_the_sink_and_still_writes_the_cursor() {
+        let (dir, store) = open_store();
+        let sink = FlakySink::new(0);
+
+        let sent = commit_once("fake", polled(&[], Some(vec![9])), &sink, &store)
+            .await
+            .expect("commit");
+
+        assert_eq!(sent, 0);
+        assert_eq!(sink.calls(), 0, "an empty list makes no sink call");
+        assert_eq!(read_cursor_file(dir.path(), "fake").expect("read"), Some(vec![9]));
+    }
+
+    #[tokio::test]
+    async fn commit_cursor_write_failure_reports_how_many_records_were_sent() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let store = CursorStore::open(&state).expect("cursor store");
+        std::fs::remove_dir_all(&state).expect("remove the state directory");
+        let sink = VecSink::default();
+
+        let failure = commit_once("fake", polled(&["a", "b"], Some(vec![5])), &sink, &store)
+            .await
+            .expect_err("the cursor cannot be written");
+
+        let CommitFailure::Cursor { sent, text } = failure else {
+            panic!("expected a cursor failure, got {failure:?}");
+        };
+        assert_eq!(sent, 2);
+        assert!(text.contains("fake"), "{text}");
+        assert_eq!(sink.records().len(), 2, "the batch was delivered");
     }
 }

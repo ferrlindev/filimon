@@ -801,7 +801,7 @@ mod tests {
     use crate::plugins::host::cursor::CursorStore;
     use crate::plugins::host::sink::{ItemSink, VecSink};
     use crate::plugins::host::testing::{
-        FakeFactory, FakeStep, TestSource, run_for, spec, wit_item, write_registry,
+        FakeFactory, FakeStep, FlakySink, TestSource, run_for, spec, wit_item, write_registry,
     };
 
     fn rendered(rows: &[ListRow]) -> String {
@@ -1804,6 +1804,160 @@ mod tests {
         assert!(out.contains(DRY_RUN_NOTICE), "{out}");
         assert!(err.is_empty(), "{err}");
         assert!(!state.exists(), "a dry run must not create the state directory");
+    }
+
+    fn store_in(dir: &Path) -> CursorStore {
+        CursorStore::open(&dir.join("state")).expect("cursor store")
+    }
+
+    #[tokio::test]
+    async fn run_once_produce_sends_then_saves_the_cursor_and_records_status() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(dir.path());
+        let sink = VecSink::default();
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("a"), wit_item("b")], Some(vec![4])),
+        ]);
+
+        let produce = Produce::Yes {
+            sink: &sink,
+            cursors: &store,
+        };
+        let (result, out, _err) = run_fake(&factory, None, produce, false).await;
+
+        result.expect("produce succeeds");
+        assert_eq!(sink.records().len(), 2, "both records were sent");
+        assert!(
+            out.contains("produced 2 records to filimon-social-items; cursor saved"),
+            "{out}"
+        );
+        assert!(!out.contains("dry run:"), "{out}");
+        assert_eq!(
+            read_cursor_file(&dir.path().join("state"), "fake").expect("read"),
+            Some(vec![4])
+        );
+        match read_status(&dir.path().join("state"), "fake") {
+            StatusRead::Found(status) => {
+                assert!(status.ok, "{status:?}");
+                assert_eq!(status.items, Some(2));
+            }
+            other => panic!("expected a status file, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_once_produce_with_a_failing_sink_exits_nonzero_and_keeps_the_cursor() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let store = store_in(dir.path());
+        store.write("fake", Some(&[1])).expect("old cursor");
+        let cursor_file = store.path_for("fake");
+        let before = std::fs::read(&cursor_file).expect("bytes");
+        let sink = FlakySink::new(usize::MAX);
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("a")], Some(vec![9])),
+        ]);
+
+        let produce = Produce::Yes {
+            sink: &sink,
+            cursors: &store,
+        };
+        let (result, _out, _err) = run_fake(&factory, Some(&[1]), produce, false).await;
+
+        let error = result.expect_err("a failing sink fails the command");
+        assert!(error.to_string().contains("item sink failed"), "{error}");
+        assert_eq!(std::fs::read(&cursor_file).expect("bytes"), before);
+        match read_status(&state, "fake") {
+            StatusRead::Found(status) => assert!(!status.ok, "{status:?}"),
+            other => panic!("expected a status file, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_once_produce_reports_a_cursor_that_could_not_be_saved() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let store = store_in(dir.path());
+        std::fs::remove_dir_all(&state).expect("remove the state directory");
+        let sink = VecSink::default();
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("a"), wit_item("b")], Some(vec![4])),
+        ]);
+
+        let produce = Produce::Yes {
+            sink: &sink,
+            cursors: &store,
+        };
+        let (result, _out, _err) = run_fake(&factory, None, produce, false).await;
+
+        let text = result.expect_err("the cursor cannot be saved").to_string();
+        assert!(text.contains("2 records"), "{text}");
+        assert!(text.contains("cursor could not be saved"), "{text}");
+        assert!(text.contains("replay"), "{text}");
+        assert_eq!(sink.records().len(), 2);
+    }
+
+    #[test]
+    fn run_once_produce_is_refused_while_another_process_holds_the_state_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+        let holder = CursorStore::open(&state).expect("another process holds the lock");
+
+        let error = open_state_store(&state).expect_err("the lock is held");
+
+        assert!(matches!(error, HostError::StateDirLocked { .. }), "{error}");
+        assert!(error.to_string().contains(&state.display().to_string()));
+        drop(holder);
+        open_state_store(&state).expect("free again once the holder is gone");
+    }
+
+    #[tokio::test]
+    async fn run_once_zero_items_is_a_clean_success() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(dir.path());
+        let sink = FlakySink::new(0);
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_step(vec![], Some(vec![6]))]);
+
+        let (result, out, _err) =
+            run_fake(&factory, None, Produce::<VecSink>::No, false).await;
+        result.expect("zero items succeed");
+        assert!(out.contains("polled 0 items (0 dropped)"), "{out}");
+        assert!(!out.contains("[1/"), "no blocks: {out}");
+
+        // With --produce the sink is not called and the cursor is still saved.
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_step(vec![], Some(vec![6]))]);
+        let produce = Produce::Yes {
+            sink: &sink,
+            cursors: &store,
+        };
+        let (result, out, _err) = run_fake(&factory, None, produce, false).await;
+        result.expect("zero items succeed with produce");
+        assert_eq!(sink.calls(), 0);
+        assert!(out.contains("produced 0 records"), "{out}");
+        assert_eq!(
+            read_cursor_file(&dir.path().join("state"), "fake").expect("read"),
+            Some(vec![6])
+        );
+    }
+
+    #[tokio::test]
+    async fn run_once_failed_cycle_prints_the_describe_text_and_fails() {
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            FakeStep::PollErr(crate::plugins::host::engine::PollError::Fatal(
+                "boom\u{1b}[31m".to_string(),
+            )),
+        ]);
+
+        let (result, out, _err) = run_fake(&factory, None, Produce::<VecSink>::No, false).await;
+
+        let text = result.expect_err("a failed cycle fails").to_string();
+        assert!(text.contains("poll fatal error: boom"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(out.is_empty(), "nothing is printed for a failed cycle: {out}");
     }
 
     #[test]
