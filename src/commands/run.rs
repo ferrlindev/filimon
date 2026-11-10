@@ -13,6 +13,7 @@
 // secrets or item content.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::future::Future;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -271,6 +272,25 @@ pub async fn run(registry_path: &Path, state_dir_flag: Option<&Path>) -> miette:
     run_outcome(&result?)
 }
 
+// ── Stop Requests ─────────────────────────────────────────────────────────────
+
+/// Where stop requests come from. Each call to `next` returns when one more
+/// request has arrived; the real source is the operating system, tests script
+/// it.
+pub(crate) trait SignalSource: Send + 'static {
+    fn next(&mut self) -> impl Future<Output = ()> + Send;
+}
+
+/// Turns stop requests into the two tokens the host understands. Not yet
+/// implemented.
+pub(crate) async fn forward_signals<S: SignalSource>(
+    _source: S,
+    _shutdown: CancellationToken,
+    _abort: CancellationToken,
+) {
+    std::future::pending::<()>().await;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -281,8 +301,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::models::SourceItem;
     use crate::plugins::host::cursor::CursorStore;
-    use crate::plugins::host::sink::VecSink;
+    use crate::plugins::host::sink::live_support::{delete_topic, ready_sink, scratch_topic};
+    use crate::plugins::host::sink::{SinkError, SinkRecord, VecSink};
+    use crate::streaming::FluvioStream;
     use crate::plugins::host::testing::{
         TestSource, fixture_wasm, load_test_registry, write_registry,
     };
@@ -554,5 +577,213 @@ mod tests {
         assert!(state.join("stub2.json").is_file());
         assert!(!state.join("off.json").exists());
         assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    }
+
+    // ── Stop requests ────────────────────────────────────────────────────────
+
+    /// A signal source scripted through a channel: one message is one request.
+    struct ScriptedSignals(tokio::sync::mpsc::UnboundedReceiver<()>);
+
+    impl SignalSource for ScriptedSignals {
+        fn next(&mut self) -> impl Future<Output = ()> + Send {
+            async move {
+                if self.0.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forward_signals_first_cancels_shutdown_and_second_aborts() {
+        let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let task = tokio::spawn(forward_signals(
+            ScriptedSignals(receiver),
+            shutdown.clone(),
+            abort.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!shutdown.is_cancelled(), "no request yet");
+        assert!(!abort.is_cancelled(), "no request yet");
+
+        requests.send(()).expect("first request");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(shutdown.is_cancelled(), "the first request starts a graceful stop");
+        assert!(!abort.is_cancelled(), "the first request must not abort");
+        assert!(!task.is_finished(), "the task keeps waiting for a second request");
+
+        requests.send(()).expect("second request");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the task returns after the second request")
+            .expect("join");
+        assert!(abort.is_cancelled(), "the second request aborts at once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forward_signals_ignores_a_cancelled_shutdown_when_the_host_ended_on_its_own() {
+        let (_requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let task = tokio::spawn(forward_signals(
+            ScriptedSignals(receiver),
+            shutdown.clone(),
+            abort.clone(),
+        ));
+
+        // The host ended on its own after a minute and the caller drops the task.
+        tokio::time::sleep(Duration::from_mins(1)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(!shutdown.is_cancelled());
+        assert!(!abort.is_cancelled());
+    }
+
+    // ── Cluster-backed run ───────────────────────────────────────────────────
+
+    /// Delegates to a `FluvioSink` and counts the records it delivered.
+    struct CountingSink {
+        inner: FluvioSink,
+        delivered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ItemSink for CountingSink {
+        async fn send_batch(
+            &self,
+            plugin: &str,
+            records: Vec<SinkRecord>,
+        ) -> Result<(), SinkError> {
+            let count = records.len();
+            self.inner.send_batch(plugin, records).await?;
+            self.delivered
+                .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl CountingSink {
+        fn delivered(&self) -> usize {
+            self.delivered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Runs the command-level function over `registry` into `topic` until at
+    /// least `at_least` records were delivered (30 s limit), then stops it the
+    /// way an operator would (the shutdown token) and returns the total.
+    async fn run_until_delivered(
+        registry: &LoadedRegistry,
+        state_dir: &Path,
+        topic: &str,
+        at_least: usize,
+    ) -> miette::Result<usize> {
+        let sink = Arc::new(CountingSink {
+            inner: ready_sink(topic).await?,
+            delivered: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let shutdown = CancellationToken::new();
+        let watcher = {
+            let sink = Arc::clone(&sink);
+            let shutdown = shutdown.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                while sink.delivered() < at_least && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                shutdown.cancel();
+            }
+        };
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (result, ()) = tokio::join!(
+            run_with_sink(
+                registry,
+                Some(state_dir),
+                Arc::clone(&sink),
+                shutdown.clone(),
+                CancellationToken::new(),
+                &mut out,
+                &mut err,
+            ),
+            watcher
+        );
+        let report = result?;
+        if sink.delivered() < at_least {
+            return Err(miette::miette!(
+                "only {} of {at_least} records were produced within 30 s",
+                sink.delivered()
+            ));
+        }
+        let stub = report
+            .plugins
+            .get("stub")
+            .ok_or_else(|| miette::miette!("no report for stub"))?;
+        if let Some(reason) = &stub.disabled {
+            return Err(miette::miette!("stub was disabled: {reason}"));
+        }
+        Ok(sink.delivered())
+    }
+
+    /// CLI-04 on a real cluster: the command-level run produces the real stub's
+    /// records to a scratch topic, and a stop and restart on the same state
+    /// directory continues the sequence with no gap and no repeat. Only a
+    /// scratch topic is ever named; the production sink is never connected.
+    #[tokio::test]
+    #[ignore = "needs a local Fluvio cluster and plugin fixtures: see plugins/README.md"]
+    async fn live_run_with_sink_produces_to_a_scratch_topic_and_restart_resumes()
+    -> miette::Result<()> {
+        use futures_util::{FutureExt, StreamExt};
+
+        let topic = scratch_topic("run").await?;
+        let body = std::panic::AssertUnwindSafe(async {
+            let tmp = TempDir::new().map_err(|e| miette::miette!("tempdir: {e}"))?;
+            let mut stub = source("stub", fixture_wasm("stub-source", "stub_source.wasm"), true);
+            stub.interval_secs = 1;
+            let registry = load_test_registry(&write_registry(tmp.path(), &[stub]));
+            let state_dir = tmp.path().join(".fili-state");
+
+            let n1 = run_until_delivered(&registry, &state_dir, &topic, 2).await?;
+            let n2 = run_until_delivered(&registry, &state_dir, &topic, 1).await?;
+            assert!(n1 >= 2, "run 1 produced {n1}");
+            assert!(n2 >= 1, "run 2 produced {n2}");
+            let total = n1 + n2;
+
+            let stream = FluvioStream::connect().await?;
+            let mut records = stream
+                .topic_stream(&topic, fluvio::Offset::beginning(), Vec::new())
+                .await?;
+            let mut ids = Vec::new();
+            for _ in 0..total {
+                let got = tokio::time::timeout(Duration::from_secs(15), records.next())
+                    .await
+                    .map_err(|_| miette::miette!("timed out reading back {total} records"))?
+                    .ok_or_else(|| miette::miette!("stream ended early"))?
+                    .map_err(|e| miette::miette!("stream error: {e:?}"))?;
+                let item: SourceItem =
+                    serde_json::from_slice(got.value()).expect("value is a SourceItem");
+                assert_eq!(item.platform, "stub");
+                let key = got.key().map(|k| String::from_utf8_lossy(k).into_owned());
+                assert_eq!(key, Some(format!("stub:{}", item.id)));
+                ids.push(item.id);
+            }
+
+            // No gap and no repeat across the restart.
+            let expected: Vec<String> = (0..total).map(|n| format!("stub-{n}")).collect();
+            assert_eq!(ids, expected, "n1 = {n1}, n2 = {n2}");
+            Ok::<(), miette::Report>(())
+        })
+        .catch_unwind()
+        .await;
+        let deleted = delete_topic(&topic).await;
+        match body {
+            Ok(outcome) => {
+                outcome?;
+                deleted
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }
