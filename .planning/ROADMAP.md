@@ -149,7 +149,7 @@ Plans:
   2. The host rejects, with a clear error, any request to a domain outside the source's allowlist and any request that exceeds its timeout. This holds for both the default fetcher and a custom fetcher.
   3. The bundled default HTTP fetcher component makes real HTTPS requests with TLS certificate validation on: a request to a host with an invalid certificate fails. The crawler's disabled certificate validation is not carried over.
   4. With the crawler configured to use a fetcher component, `fili produce <url>` fetches pages through that component and articles still reach the consumer.
-**Plans:** 7/8 plans executed
+**Plans:** 8/8 plans executed
 
 Plans:
 **Wave 1**
@@ -168,7 +168,7 @@ Plans:
 - [x] 05-07-PLAN.md — `[crawler]` registry table and `fili produce` through a fetcher component under the seed-host allowlist, with no silent fallback to the built-in client (FETCH-04)
 
 **Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 05-08-PLAN.md — READMEs, WIT doc comments and sample registry describe the fetcher layer as built; full-phase verification sweep (FETCH-01..FETCH-04)
+- [x] 05-08-PLAN.md — READMEs, WIT doc comments and sample registry describe the fetcher layer as built; full-phase verification sweep (FETCH-01..FETCH-04)
 
 ### Phase 6: Host-Managed OAuth
 **Goal**: Users can log in to a plugin's platform once through OAuth 2.0 PKCE. The host keeps tokens fresh and passes plugins only current access tokens
@@ -216,7 +216,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
-| 5. Fetcher Layer | 7/8 | In Progress | - |
+| 5. Fetcher Layer | 8/8 | In Progress | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
