@@ -24,3 +24,8 @@ research assumptions about the live API (A9 to A13) stay unconfirmed.
 | File | Content |
 |------|---------|
 | `playlist_page.json` | `playlistItems.list` for `UU_x5XG1OV2P6uZZ5FSM9Ttw`: three videos, newest first. The first has a `contentDetails.videoPublishedAt` that differs from its `snippet.publishedAt`, the second has no `videoPublishedAt` and no `videoOwnerChannelTitle`, the third is ordinary |
+| `playlist_newer.json` | `playlist_page.json` plus two newer videos (`vidNew00004`, `vidNew00005`) placed first, as the API lists newest first; used for the later-poll case |
+| `playlist_empty.json` | A playlist with no entries: `items` is an empty array |
+| `playlist_placeholders.json` | One ordinary upload plus entries titled `Private video` and `Deleted video` and one entry with no `videoId`; the placeholders are newer than the ordinary entry |
+
+The `quotaExceeded`, 401 and malformed-JSON fixtures arrive in plan 07-08.

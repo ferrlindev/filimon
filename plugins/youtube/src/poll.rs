@@ -4,10 +4,11 @@
 //! never a silent gap. Nothing here logs or echoes a url, header, key, token or
 //! body.
 
-use crate::api::{self, Auth, Item};
-use crate::cursor::{self, Cursor};
+use crate::api::{self, Auth, Entry, Item};
+use crate::cursor;
 use crate::http::{Http, HttpError};
 use crate::settings::{FIRST_POLL_LIMIT, Settings};
+use std::collections::HashSet;
 
 /// What a successful poll returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,13 +65,35 @@ pub fn poll(
         (None, None) => return Err(PollError::AuthRequired),
     };
 
-    let (old, _undecodable) = cursor::decode(cursor);
-    let mut next = Cursor::default();
-    let mut items: Vec<Item> = Vec::new();
+    let mut warnings = Vec::new();
+    let (old, undecodable) = cursor::decode(cursor);
+    if undecodable {
+        warnings.push("cursor could not be decoded; treating this as a first poll".to_string());
+    }
 
-    for playlist in settings.playlists() {
+    let playlists = settings.playlists();
+    let playlist_ids: Vec<&str> = playlists.iter().map(|p| p.playlist_id.as_str()).collect();
+    // Marks of playlists that are no longer configured are dropped; the marks
+    // of configured playlists carry forward unless a newer video replaces them.
+    let mut next = old.clone();
+    next.retain_feeds(&playlist_ids);
+
+    let later_limit = Settings::later_page_limit(playlists.len());
+    let mut items: Vec<Item> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut skipped: usize = 0;
+
+    for playlist in &playlists {
         let mark = old.mark(&playlist.playlist_id);
-        let request = api::playlist_request(&playlist.playlist_id, FIRST_POLL_LIMIT, auth);
+        // D-10: the first poll of a playlist is one small page; later polls
+        // return only newer videos, so they take the largest page that keeps a
+        // whole poll under the host's item cap.
+        let limit = if mark.is_some() {
+            later_limit
+        } else {
+            FIRST_POLL_LIMIT
+        };
+        let request = api::playlist_request(&playlist.playlist_id, limit, auth);
         let response = http.get(&request).map_err(map_http_error)?;
         if response.status != 200 {
             return Err(PollError::Transient(format!(
@@ -78,39 +101,62 @@ pub fn poll(
                 response.status
             )));
         }
-        let page = api::parse_playlist_page(&response.body)
-            .map_err(|_| PollError::Transient("YouTube answer could not be parsed".to_string()))?;
+        let page = api::parse_playlist_page(&response.body).map_err(|_| {
+            PollError::Transient("YouTube answer is not a readable playlist page".to_string())
+        })?;
+        skipped += page.skipped;
 
         // Strictly newer than the mark by publication instant: `>=` would
-        // re-emit a same-instant sibling on every poll.
-        let mut fresh: Vec<(i64, String, Item)> = page
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                let time = entry.published_ms?;
-                let id = entry.video_id.clone()?;
-                let item = api::video_to_item(entry)?;
-                Some((time, id, item))
-            })
-            .filter(|(time, _, _)| mark.is_none_or(|(mark_time, _)| *time > *mark_time))
-            .collect();
-        fresh.sort_by(|(ta, ia, _), (tb, ib, _)| ta.cmp(tb).then_with(|| ia.cmp(ib)));
-
-        match fresh.last() {
-            Some((time, id, _)) => next.set(&playlist.playlist_id, *time, id),
-            None => {
-                if let Some((time, id)) = mark {
-                    next.set(&playlist.playlist_id, *time, id);
+        // re-emit a same-instant sibling on every poll. An entry without a
+        // usable time cannot be compared, so it is skipped and counted.
+        let mut newer: Vec<(i64, &Entry)> = Vec::new();
+        for entry in &page.entries {
+            match entry.published_ms {
+                None => skipped += 1,
+                Some(time) if mark.is_none_or(|(mark_time, _)| time > *mark_time) => {
+                    newer.push((time, entry));
                 }
+                Some(_) => {}
             }
         }
-        items.extend(fresh.into_iter().map(|(_, _, item)| item));
+
+        // The mark covers every newer entry, placeholders included, so a
+        // private or deleted video does not keep the window open (Pitfall 8).
+        let newest = newer
+            .iter()
+            .map(|(time, entry)| (*time, entry.video_id.clone().unwrap_or_default()))
+            .max();
+        if let Some((time, id)) = newest {
+            next.set(&playlist.playlist_id, time, &id);
+        }
+
+        skipped += newer
+            .iter()
+            .filter(|(_, entry)| entry.is_placeholder())
+            .count();
+        let mut fresh: Vec<(i64, Item)> = newer
+            .iter()
+            .filter_map(|(time, entry)| Some((*time, api::video_to_item(entry)?)))
+            .collect();
+        fresh.sort_by(|(ta, a), (tb, b)| ta.cmp(tb).then_with(|| a.id.cmp(&b.id)));
+        for (_, item) in fresh {
+            // The same video can appear in two playlists.
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+            }
+        }
+    }
+
+    if skipped > 0 {
+        warnings.push(format!(
+            "skipped {skipped} private, deleted or unreadable playlist entries"
+        ));
     }
 
     let next_cursor = cursor::encode(&next).map_err(PollError::Fatal)?;
     Ok(PollOutcome {
         items,
         next_cursor: Some(next_cursor),
-        warnings: Vec::new(),
+        warnings,
     })
 }
