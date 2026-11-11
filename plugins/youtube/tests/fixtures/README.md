@@ -6,10 +6,14 @@ credentials are available offline (D-21). The shapes are schema-faithful
 (`items` with `snippet` and `contentDetails`, `etag`, `thumbnails`, `position`,
 `pageInfo`), but the ids, titles and timestamps are invented.
 
-Plan 07-12 holds the real-capture checkpoint: it replaces these files with real
-responses, using the curl recipe in
-`.planning/phases/07-reddit-youtube-plugins/07-RESEARCH.md`. Until then the
-research assumptions about the live API (A9 to A13) stay unconfirmed.
+Plan 07-12 offered the real-capture checkpoint (D-21): the user replied
+`synthetic`, so no fixture was replaced and every file below keeps the
+`synthetic` label (accepted D-21 fallback; no real capture was made, offered and
+declined or unavailable). The research assumptions about the live API (A11, the
+`x-goog-api-key` header, and A13, the Google error JSON nesting, among A9 to A13)
+therefore remain UNCONFIRMED by a real capture. To replace a fixture later, use
+the curl recipe in `.planning/phases/07-reddit-youtube-plugins/07-RESEARCH.md`;
+live execution against the real APIs is Phase 8 (TEST-03).
 
 ## Convention
 
@@ -31,8 +35,7 @@ research assumptions about the live API (A9 to A13) stay unconfirmed.
 
 ## Provenance of each file
 
-Every file below is **synthetic** until plan 07-12 replaces it with a real
-capture.
+Every file below is **synthetic** (plan 07-12 confirmed no real capture was made).
 
 | Fixture | Provenance | How it was produced |
 |---------|------------|---------------------|
