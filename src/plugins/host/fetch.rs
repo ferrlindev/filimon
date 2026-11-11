@@ -32,6 +32,9 @@ const FAILURE_TEXT_CLIP: usize = 512;
 /// Largest response body the host hands to a plugin, in bytes (8 MiB).
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Most redirects one `send` follows before it fails.
+pub const MAX_REDIRECTS: usize = 5;
+
 /// Longest text kept from a transport failure, in characters.
 const TRANSPORT_TEXT_CLIP: usize = 256;
 
@@ -157,6 +160,17 @@ impl FetchPolicy {
         // The url is never echoed back: it is guest data and may carry secrets.
         let url = url::Url::parse(text)
             .map_err(|_| types::FetchError::InvalidRequest("url cannot be parsed".to_string()))?;
+        self.check_url(&url)?;
+        Ok(url)
+    }
+
+    /// Judges one parsed url: scheme, host and allowlist. A redirect target
+    /// is judged by exactly the same rules as the first url.
+    ///
+    /// # Errors
+    /// `InvalidRequest` for a scheme or host that cannot be used and `Denied`
+    /// for a host outside the allowlist.
+    pub fn check_url(&self, url: &url::Url) -> Result<(), types::FetchError> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(types::FetchError::InvalidRequest(
                 "only http and https urls are allowed".to_string(),
@@ -175,7 +189,7 @@ impl FetchPolicy {
                 "host `{host}` is not in the allowlist of `{consumer}`"
             )));
         }
-        Ok(url)
+        Ok(())
     }
 }
 
@@ -255,17 +269,72 @@ impl Egress {
         policy: &FetchPolicy,
         request: types::Request,
     ) -> Result<types::Response, types::FetchError> {
-        let url = policy.check(&request)?;
-        let method = to_method(&request.method)?;
-        let headers = to_header_map(&request.headers)?;
+        let mut url = policy.check(&request)?;
+        let mut method = to_method(&request.method)?;
+        let mut headers = request.headers;
+        let mut body = request.body;
+        // Reject a header that cannot be sent before any connection.
+        to_header_map(&headers)?;
         let client = self.client()?;
 
-        let mut builder = client.request(method.clone(), url.clone()).headers(headers);
-        if let Some(body) = request.body {
-            builder = builder.body(body);
-        }
-        let mut response = builder.send().await.map_err(map_error)?;
-        let status = response.status().as_u16();
+        let mut hops = 0;
+        let (mut response, status) = loop {
+            let mut builder = client
+                .request(method.clone(), url.clone())
+                .headers(to_header_map(&headers)?);
+            if let Some(bytes) = &body {
+                builder = builder.body(bytes.clone());
+            }
+            let response = builder.send().await.map_err(map_error)?;
+            let status = response.status().as_u16();
+
+            let location = if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                response.headers().get(reqwest::header::LOCATION)
+            } else {
+                None
+            };
+            // Anything but a redirect with a Location is returned as is.
+            let Some(location) = location else {
+                break (response, status);
+            };
+            if hops >= MAX_REDIRECTS {
+                return Err(types::FetchError::Transport(format!(
+                    "too many redirects (limit {MAX_REDIRECTS})"
+                )));
+            }
+            let target = location
+                .to_str()
+                .ok()
+                .and_then(|text| url.join(text).ok())
+                .ok_or_else(|| {
+                    types::FetchError::Transport(
+                        "redirect location is not a valid url".to_string(),
+                    )
+                })?;
+            // The same rules as the first url; a refusal makes no connection.
+            policy.check_url(&target)?;
+
+            if status == 303
+                || (matches!(status, 301 | 302) && method == reqwest::Method::POST)
+            {
+                if method != reqwest::Method::HEAD {
+                    method = reqwest::Method::GET;
+                }
+                body = None;
+                drop_headers(&mut headers, &["content-type", "content-length", "content-encoding"]);
+            }
+            if target.origin() != url.origin() {
+                drop_headers(&mut headers, &["authorization", "cookie", "proxy-authorization"]);
+            }
+            tracing::debug!(
+                consumer = %policy.consumer(),
+                from = %url.host_str().unwrap_or_default(),
+                to = %target.host_str().unwrap_or_default(),
+                "outbound redirect followed"
+            );
+            url = target;
+            hops += 1;
+        };
 
         let headers = response
             .headers()
@@ -278,24 +347,7 @@ impl Egress {
             })
             .collect();
 
-        let too_big = || {
-            types::FetchError::Transport(format!(
-                "response body exceeds {MAX_RESPONSE_BYTES} bytes"
-            ))
-        };
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(too_big());
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(map_error)? {
-            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(too_big());
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = read_capped(&mut response).await?;
 
         tracing::debug!(
             consumer = %policy.consumer(),
@@ -313,6 +365,34 @@ impl Egress {
     }
 }
 
+/// Removes every header named in `names`, in any letter case.
+fn drop_headers(headers: &mut Vec<(String, String)>, names: &[&str]) {
+    headers.retain(|(name, _)| !names.iter().any(|dropped| name.eq_ignore_ascii_case(dropped)));
+}
+
+/// Reads the body chunk by chunk, never holding more than the cap: a declared
+/// length over it fails at once, and an undeclared one fails as soon as the
+/// running total would pass it.
+async fn read_capped(response: &mut reqwest::Response) -> Result<Vec<u8>, types::FetchError> {
+    let too_big = || {
+        types::FetchError::Transport(format!("response body exceeds {MAX_RESPONSE_BYTES} bytes"))
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_error)? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn to_method(method: &types::Method) -> Result<reqwest::Method, types::FetchError> {
     Ok(match method {
         types::Method::Get => reqwest::Method::GET,
@@ -322,8 +402,22 @@ fn to_method(method: &types::Method) -> Result<reqwest::Method, types::FetchErro
         types::Method::Patch => reqwest::Method::PATCH,
         types::Method::Delete => reqwest::Method::DELETE,
         types::Method::Options => reqwest::Method::OPTIONS,
-        types::Method::Other(text) => reqwest::Method::from_bytes(text.as_bytes())
-            .map_err(|_| types::FetchError::InvalidRequest("method is not valid".to_string()))?,
+        types::Method::Other(text) => {
+            let method = reqwest::Method::from_bytes(text.as_bytes()).map_err(|_| {
+                types::FetchError::InvalidRequest("method is not valid".to_string())
+            })?;
+            // CONNECT opens a tunnel and TRACE echoes request headers; neither
+            // is something a plugin may ask the host to do, in any letter case.
+            if ["CONNECT", "TRACE"]
+                .iter()
+                .any(|refused| method.as_str().eq_ignore_ascii_case(refused))
+            {
+                return Err(types::FetchError::InvalidRequest(
+                    "method is not allowed".to_string(),
+                ));
+            }
+            method
+        }
     })
 }
 
