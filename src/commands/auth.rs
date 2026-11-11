@@ -357,7 +357,9 @@ pub fn collect_status(
         };
         match store.read() {
             Ok(None) => match probe.declares {
-                OAuthDeclared::Yes => rows.push(row(StatusState::NotLoggedIn, None, None)),
+                OAuthDeclared::Yes | OAuthDeclared::AppOnly => {
+                    rows.push(row(StatusState::NotLoggedIn, None, None));
+                }
                 OAuthDeclared::No => {}
                 OAuthDeclared::Unknown(_) => {
                     // A note is best effort: an unwritable stderr must not fail status.
@@ -822,6 +824,33 @@ mod tests {
         assert!(!dir.path().join(".fili-state").exists());
     }
 
+    /// A plugin file for the app-only grant; its secret variable is unset
+    /// everywhere, so a strict load of it fails.
+    const APP_ONLY_PLUGIN_TOML: &str = "[host]\npoll_interval_secs = 60\n\n[host.oauth]\ngrant = \"client_credentials\"\ntoken_url = \"https://auth.example/token\"\nclient_id = \"c\"\nclient_secret_env = \"FILI_AUTH_TEST_APP_ONLY_SECRET_UNSET\"\n";
+
+    #[tokio::test]
+    async fn login_refuses_a_client_credentials_plugin_before_loading_secrets() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = registry_with(
+            dir.path(),
+            &source_table("stub", true),
+            APP_ONLY_PLUGIN_TOML,
+        );
+        let state = dir.path().join("state");
+
+        let (text, created) = refused(&registry, &state, "stub").await;
+
+        assert!(text.contains("plugin `stub`"), "{text}");
+        assert!(text.contains("client_credentials"), "{text}");
+        assert!(text.contains("nothing to log in to"), "{text}");
+        assert!(
+            !text.contains("FILI_AUTH_TEST_APP_ONLY_SECRET_UNSET"),
+            "the missing-secret diagnostic must not show: {text}"
+        );
+        assert!(!created, "no state directory was created");
+        assert!(!dir.path().join(".fili-state").exists());
+    }
+
     // ── perform_login ────────────────────────────────────────────────────────
 
     /// "Visits" an authorize URL the way a browser would: a raw GET of
@@ -1226,6 +1255,86 @@ mod tests {
         assert!(nologin["expires_at"].is_null() && nologin["has_refresh_token"].is_null());
         for secret in ["AT-SENTINEL-S", "RT-SENTINEL-S"] {
             assert!(!out.contains(secret), "{out}");
+        }
+    }
+
+    /// A registry with one app-only plugin and one code-flow plugin, plus a
+    /// stale token file of the app-only alias holding sentinel tokens.
+    fn app_only_registry(dir: &Path) -> (PathBuf, PathBuf) {
+        let registry = registry_of(
+            dir,
+            &[
+                ("appy", Some(APP_ONLY_PLUGIN_TOML)),
+                ("coder", Some(OAUTH_PLUGIN_TOML)),
+            ],
+        );
+        let state = dir.join("state");
+        put_login(
+            &state,
+            "appy",
+            "AT-SENTINEL-A",
+            Some("RT-SENTINEL-A"),
+            unix_now() + 3600,
+            false,
+        );
+        (registry, state)
+    }
+
+    #[test]
+    fn status_lists_an_app_only_plugin_without_reading_a_token_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let (registry, state) = app_only_registry(dir.path());
+
+        let (out, err) = run_status(&registry, &state, false);
+
+        let cells = row_cells(&out, "appy");
+        assert_eq!(cells, ["appy", "app-only", "-", "-"], "{out}");
+        assert_eq!(row_cells(&out, "coder")[1], "not-logged-in", "{out}");
+        assert!(
+            !out.lines().any(|line| line.contains("fili auth login appy")),
+            "no attention hint for an app-only row: {out}"
+        );
+        for secret in ["AT-SENTINEL-A", "RT-SENTINEL-A"] {
+            assert!(!out.contains(secret) && !err.contains(secret), "{out}{err}");
+        }
+    }
+
+    #[test]
+    fn status_json_shows_app_only_with_null_expiry_and_refresh() {
+        let dir = TempDir::new().expect("tempdir");
+        let (registry, state) = app_only_registry(dir.path());
+
+        let (out, err) = run_status(&registry, &state, true);
+
+        let value: serde_json::Value = serde_json::from_str(&out).expect("one JSON value");
+        let rows = value.as_array().expect("an array");
+        let row = rows
+            .iter()
+            .find(|row| row["plugin"] == "appy")
+            .expect("the app-only row");
+        assert_eq!(row["state"], "app-only", "{out}");
+        assert!(row["expires_at"].is_null(), "{out}");
+        assert!(row["has_refresh_token"].is_null(), "{out}");
+        assert!(row["detail"].is_null(), "{out}");
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "detail",
+                "expires_at",
+                "has_refresh_token",
+                "plugin",
+                "state"
+            ]
+        );
+        for secret in ["AT-SENTINEL-A", "RT-SENTINEL-A"] {
+            assert!(!out.contains(secret) && !err.contains(secret), "{out}{err}");
         }
     }
 

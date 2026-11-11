@@ -20,6 +20,14 @@ const OAUTH_PLUGIN: &str = "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
     token_url = \"https://auth.example/token\"\n\
     scopes = [\"read\"]\nclient_id = \"c\"\n";
 
+/// An app-only plugin: `grant = "client_credentials"` and a secret variable
+/// that no test sets. `auth` never opens the component.
+const APP_ONLY_PLUGIN: &str = "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
+    grant = \"client_credentials\"\n\
+    token_url = \"https://auth.example/token\"\n\
+    client_id = \"c\"\n\
+    client_secret_env = \"FILI_AUTH_CLI_APP_ONLY_SECRET_UNSET\"\n";
+
 /// A plugin that declares no `[host.oauth]`.
 const PLAIN_PLUGIN: &str = "[host]\npoll_interval_secs = 60\n";
 
@@ -231,7 +239,54 @@ fn login_for_a_plugin_without_host_oauth_exits_nonzero_naming_the_plugin() {
     assert!(!state.exists(), "login must not create the state directory");
 }
 
+#[test]
+fn login_on_a_client_credentials_plugin_is_refused_with_exit_1_and_creates_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let registry = write_registry(dir.path(), &[("appy", APP_ONLY_PLUGIN)], false);
+    let state = dir.path().join("state");
+
+    let output = run_auth(&registry, &state, &["login", "appy", "--no-browser"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = squash(&stderr(&output));
+    assert!(text.contains("plugin`appy`"), "{text}");
+    assert!(text.contains("client_credentials"), "{text}");
+    assert!(text.contains("nothingtologinto"), "{text}");
+    assert!(
+        !text.contains("FILI_AUTH_CLI_APP_ONLY_SECRET_UNSET"),
+        "the missing-secret diagnostic must not show: {text}"
+    );
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(!state.exists(), "login must not create the state directory");
+}
+
 // ── Status ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn status_json_shows_app_only() {
+    let dir = TempDir::new().expect("tempdir");
+    let registry = write_registry(dir.path(), &[("appy", APP_ONLY_PLUGIN)], false);
+    let state = dir.path().join("state");
+    // A stale token file of the same alias must be ignored and never shown.
+    put_login(&state, "appy", Some(REFRESH_SENTINEL), now() + 3600, false);
+
+    let output = run_auth(&registry, &state, &["status", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "exit {:?}, stderr: {}",
+        output.status.code(),
+        stderr(&output)
+    );
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("stdout is one JSON array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["plugin"], "appy");
+    assert_eq!(rows[0]["state"], "app-only", "{rows:?}");
+    assert!(rows[0]["expires_at"].is_null(), "{rows:?}");
+    assert!(rows[0]["has_refresh_token"].is_null(), "{rows:?}");
+    assert_no_tokens(&output);
+}
 
 #[test]
 fn status_prints_each_state_without_token_values_and_no_banner() {
