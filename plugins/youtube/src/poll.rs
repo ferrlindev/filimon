@@ -95,11 +95,13 @@ pub fn poll(
         };
         let request = api::playlist_request(&playlist.playlist_id, limit, auth);
         let response = http.get(&request).map_err(map_http_error)?;
-        if response.status != 200 {
-            return Err(PollError::Transient(format!(
-                "YouTube HTTP {}",
-                response.status
-            )));
+        // Every non-2xx response is a typed error, never a quiet empty page.
+        // No retry or sleep: the host's backoff waits and the next poll starts
+        // clean (a quota error carries no cursor, so nothing needs resetting).
+        if let Some(error) =
+            api::classify_youtube(response.status, &response.body, &playlist.channel_id)
+        {
+            return Err(error);
         }
         let page = api::parse_playlist_page(&response.body).map_err(|_| {
             PollError::Transient("YouTube answer is not a readable playlist page".to_string())

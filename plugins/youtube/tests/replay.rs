@@ -575,3 +575,256 @@ fn only_the_official_api_host_and_playlist_items_are_ever_requested() {
         assert!(!request.url.contains("/search") && !request.url.contains("/videos"));
     }
 }
+
+// ── Plan 07-08 Task 2: credential modes and the low-cost request sweep ──────
+
+/// A strict recording mock: it answers every request with an empty page and
+/// fails on the first request that breaks a request rule (host, endpoint,
+/// credential header count, accept header, credential in the url).
+struct StrictHttp {
+    requests: RefCell<Vec<HttpRequest>>,
+    secrets: Vec<String>,
+}
+
+impl StrictHttp {
+    fn new(secrets: &[&str]) -> Self {
+        StrictHttp {
+            requests: RefCell::new(Vec::new()),
+            secrets: secrets.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.requests.borrow().len()
+    }
+}
+
+impl Http for StrictHttp {
+    fn get(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let url = &request.url;
+        assert!(
+            url.starts_with("https://www.googleapis.com/youtube/v3/playlistItems?"),
+            "unexpected endpoint {url}"
+        );
+        let path = url.split('?').next().unwrap();
+        assert!(
+            path.split('/')
+                .all(|segment| segment != "search" && segment != "videos"),
+            "expensive endpoint {url}"
+        );
+        for secret in &self.secrets {
+            assert!(!url.contains(secret.as_str()), "credential in the url");
+        }
+        let header = |name: &str| youtube_source::http::header(&request.headers, name);
+        assert_eq!(header("accept"), Some("application/json"));
+        let credentials = request
+            .headers
+            .iter()
+            .filter(|(name, _)| {
+                name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("x-goog-api-key")
+            })
+            .count();
+        assert_eq!(credentials, 1, "exactly one credential header per request");
+        self.requests.borrow_mut().push(request.clone());
+        Ok(page(Vec::new()))
+    }
+}
+
+#[test]
+fn an_access_token_is_preferred_over_the_api_key_and_sent_as_bearer() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page"))]);
+    poll(&http, &one_channel(), Some(KEY), None, Some("TOKEN-1")).expect("poll");
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    let header = |name: &str| youtube_source::http::header(&requests[0].headers, name);
+    assert_eq!(header("authorization"), Some("Bearer TOKEN-1"));
+    assert_eq!(header("x-goog-api-key"), None);
+    assert!(!requests[0].url.contains("TOKEN-1") && !requests[0].url.contains(KEY));
+}
+
+#[test]
+fn without_a_token_the_api_key_header_is_used() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page"))]);
+    poll(&http, &one_channel(), Some(KEY), None, None).expect("poll");
+    let requests = http.requests();
+    let header = |name: &str| youtube_source::http::header(&requests[0].headers, name);
+    assert_eq!(header("x-goog-api-key"), Some(KEY));
+    assert_eq!(header("authorization"), None);
+}
+
+fn many_channels(count: usize) -> Settings {
+    let list: Vec<String> = (0..count).map(|i| format!("\"UC{i:0>22}\"")).collect();
+    settings(&format!("channels = [{}]\n", list.join(", ")))
+}
+
+#[test]
+fn only_playlistitems_requests_are_ever_made_and_each_poll_costs_one_unit_per_playlist() {
+    for count in [1, 3, youtube_source::cursor::MAX_FEEDS] {
+        let settings = many_channels(count);
+        for (key, token) in [(Some(KEY), None), (Some(KEY), Some("TOKEN-1")), (None, Some("TOKEN-1"))]
+        {
+            let http = StrictHttp::new(&[KEY, "TOKEN-1"]);
+            // First poll, then a later poll with the cursor the first returned.
+            let first = poll(&http, &settings, key, None, token).expect("first poll");
+            assert_eq!(http.count(), count, "first poll of {count} channels");
+            poll(&http, &settings, key, first.next_cursor.as_deref(), token).expect("later poll");
+            assert_eq!(http.count(), 2 * count, "two polls of {count} channels");
+        }
+    }
+}
+
+// ── Plan 07-08 Task 1: response classification (D-15, YTUB-03) ───────────────
+
+const QUOTA_TEXT: &str = "YouTube quota exceeded (quotaExceeded): daily Data API quota exhausted; resets at midnight Pacific";
+
+/// A Google error envelope with `status` and (optionally) one error `reason`.
+fn error_response(status: u16, reason: Option<&str>) -> HttpResponse {
+    let errors: Vec<Value> = reason
+        .map(|reason| serde_json::json!({ "domain": "youtube.test", "reason": reason }))
+        .into_iter()
+        .collect();
+    let body = serde_json::json!({
+        "error": { "code": status, "message": "synthetic", "errors": errors }
+    });
+    HttpResponse {
+        status,
+        headers: Vec::new(),
+        body: serde_json::to_vec(&body).expect("json"),
+    }
+}
+
+fn poll_error(response: HttpResponse) -> PollError {
+    let http = ScriptedHttp::new(vec![Ok(response)]);
+    poll(&http, &one_channel(), Some(KEY), None, None).unwrap_err()
+}
+
+#[test]
+fn quota_exceeded_403_is_a_named_transient_with_the_exact_d15_text() {
+    let error = poll_error(fixture("quota_exceeded_403"));
+    assert_eq!(error, PollError::Transient(QUOTA_TEXT.to_string()));
+}
+
+#[test]
+fn daily_limit_exceeded_uses_the_same_named_error() {
+    let error = poll_error(error_response(403, Some("dailyLimitExceeded")));
+    assert_eq!(error, PollError::Transient(QUOTA_TEXT.to_string()));
+}
+
+#[test]
+fn quota_recovers_on_the_next_poll_without_a_restart() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("quota_exceeded_403")),
+        Ok(fixture("playlist_page")),
+    ]);
+    let settings = one_channel();
+    let first = poll(&http, &settings, Some(KEY), None, None);
+    assert!(matches!(first, Err(PollError::Transient(_))), "{first:?}");
+    let second = poll(&http, &settings, Some(KEY), None, None).expect("recovered");
+    assert_eq!(second.items.len(), 3);
+}
+
+#[test]
+fn no_retry_after_a_quota_error() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("quota_exceeded_403")),
+        Ok(fixture("playlist_page")),
+        Ok(fixture("playlist_page")),
+    ]);
+    let three = settings(&format!(
+        "channels = [\"{CHANNEL}\", \"{}\", \"UC{}\"]\n",
+        channel_b(),
+        "c".repeat(22)
+    ));
+    let result = poll(&http, &three, Some(KEY), None, None);
+    assert!(matches!(result, Err(PollError::Transient(_))), "{result:?}");
+    assert_eq!(http.requests().len(), 1);
+}
+
+#[test]
+fn rate_limit_exceeded_and_429_are_rate_limited_none() {
+    assert_eq!(
+        poll_error(error_response(429, None)),
+        PollError::RateLimited(None)
+    );
+    for reason in ["rateLimitExceeded", "userRateLimitExceeded"] {
+        assert_eq!(
+            poll_error(error_response(403, Some(reason))),
+            PollError::RateLimited(None),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn http_401_is_auth_required() {
+    assert_eq!(poll_error(fixture("unauthorized_401")), PollError::AuthRequired);
+}
+
+#[test]
+fn bad_key_and_disabled_api_and_forbidden_are_config_errors_naming_the_credential() {
+    let PollError::Config(text) = poll_error(error_response(400, Some("keyInvalid"))) else {
+        panic!("expected Config for keyInvalid");
+    };
+    assert!(text.contains("api_key"), "{text}");
+
+    let PollError::Config(text) = poll_error(error_response(403, Some("accessNotConfigured")))
+    else {
+        panic!("expected Config for accessNotConfigured");
+    };
+    assert!(text.contains("not enabled"), "{text}");
+
+    for reason in ["forbidden", "insufficientPermissions"] {
+        let PollError::Config(text) = poll_error(error_response(403, Some(reason))) else {
+            panic!("expected Config for {reason}");
+        };
+        assert!(text.contains(reason), "{text}");
+    }
+}
+
+#[test]
+fn http_404_names_the_channel_entry() {
+    let PollError::Config(text) = poll_error(error_response(404, Some("playlistNotFound"))) else {
+        panic!("expected Config for 404");
+    };
+    assert!(text.contains("channels"), "{text}");
+    assert!(text.contains(CHANNEL), "{text}");
+    assert!(text.contains("404"), "{text}");
+}
+
+#[test]
+fn http_5xx_is_transient() {
+    for status in [500_u16, 502, 503] {
+        let PollError::Transient(text) = poll_error(error_response(status, None)) else {
+            panic!("expected Transient for {status}");
+        };
+        assert!(text.contains(&status.to_string()), "{text}");
+    }
+}
+
+#[test]
+fn malformed_json_is_transient_without_echoing_the_body() {
+    // `malformed.json` has no meta file, so it arrives with status 200.
+    let response = fixture("malformed");
+    assert_eq!(response.status, 200);
+    let PollError::Transient(text) = poll_error(response) else {
+        panic!("expected Transient");
+    };
+    assert!(!text.contains("SENTINELTRUNCATED"), "{text}");
+}
+
+#[test]
+fn every_error_status_maps_to_an_error_never_an_empty_success() {
+    for status in [301_u16, 302, 400, 401, 403, 404, 408, 429, 500, 502, 503] {
+        // An empty, otherwise well-formed page: it would be an `Ok` with no
+        // items if the status were ignored.
+        let response = HttpResponse {
+            status,
+            headers: Vec::new(),
+            body: br#"{"items":[]}"#.to_vec(),
+        };
+        let http = ScriptedHttp::new(vec![Ok(response)]);
+        let result = poll(&http, &one_channel(), Some(KEY), None, None);
+        assert!(result.is_err(), "status {status} gave {result:?}");
+    }
+}
