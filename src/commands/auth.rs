@@ -291,7 +291,32 @@ pub struct StatusRow {
     pub has_refresh_token: Option<bool>,
 }
 
-/// The rows `status` shows.
+impl StatusState {
+    /// The label shown in the STATE column and the JSON `state` key.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::LoggedIn => "logged-in",
+            Self::Expired => "expired",
+            Self::NeedsLogin => "needs-login",
+            Self::NotLoggedIn => "not-logged-in",
+            Self::Unreadable(_) => "unreadable",
+        }
+    }
+}
+
+/// The table's column headings, in order.
+const STATUS_HEADINGS: [&str; 4] = ["PLUGIN", "STATE", "EXPIRES", "REFRESH"];
+
+/// Longest unreadable-file detail kept, in characters.
+const DETAIL_CLIP: usize = 240;
+
+/// The rows `status` shows, in registry name order. Each plugin's login is
+/// read with `TokenStore::read`: no lock is taken and nothing is created, so
+/// this works while `fili run` holds the state directory.
+///
+/// A row exists when the plugin declares `[host.oauth]`, or has a token file
+/// whatever its config says. A plugin whose config could not be read and that
+/// has no token file is skipped with a note on `err`.
 #[must_use]
 pub fn collect_status(
     report: &OAuthProbeReport,
@@ -299,39 +324,203 @@ pub fn collect_status(
     now: i64,
     err: &mut impl Write,
 ) -> Vec<StatusRow> {
-    let _ = (report, state_dir, now, err);
-    todo!("RED stub")
+    let mut rows = Vec::new();
+    for probe in &report.sources {
+        let store = TokenStore::new(state_dir, &probe.name);
+        let row = |state, expires_at, has_refresh_token| StatusRow {
+            plugin: probe.name.clone(),
+            state,
+            expires_at,
+            has_refresh_token,
+        };
+        match store.read() {
+            Ok(None) => match probe.declares {
+                OAuthDeclared::Yes => rows.push(row(StatusState::NotLoggedIn, None, None)),
+                OAuthDeclared::No => {}
+                OAuthDeclared::Unknown(_) => {
+                    // A note is best effort: an unwritable stderr must not fail status.
+                    writeln!(
+                        err,
+                        "skipped plugin `{}`: its config could not be read",
+                        clean_guest_text(&probe.name, NAME_ECHO_CLIP)
+                    )
+                    .ok();
+                }
+            },
+            Ok(Some(tokens)) => {
+                let state = if tokens.needs_login {
+                    StatusState::NeedsLogin
+                } else if tokens.expires_at > now {
+                    StatusState::LoggedIn
+                } else {
+                    StatusState::Expired
+                };
+                rows.push(row(
+                    state,
+                    Some(tokens.expires_at),
+                    Some(tokens.refresh_token.is_some()),
+                ));
+            }
+            Err(error) => rows.push(row(
+                StatusState::Unreadable(clean_guest_text(&error.to_string(), DETAIL_CLIP)),
+                None,
+                None,
+            )),
+        }
+    }
+    rows
 }
 
-/// Relative expiry text.
+/// A relative description of `expires_at` against `now`: `in 2h 5m`, `now` or
+/// `3m 0s ago`. The two largest units are shown, zero components included.
 #[must_use]
 pub fn describe_expiry(expires_at: i64, now: i64) -> String {
-    let _ = (expires_at, now);
-    todo!("RED stub")
+    let delta = expires_at.saturating_sub(now);
+    let span = |seconds: u64| {
+        let (days, hours, minutes) = (
+            seconds / 86_400,
+            seconds % 86_400 / 3_600,
+            seconds % 3_600 / 60,
+        );
+        if seconds >= 86_400 {
+            format!("{days}d {hours}h")
+        } else if seconds >= 3_600 {
+            format!("{hours}h {minutes}m")
+        } else if seconds >= 60 {
+            format!("{minutes}m {}s", seconds % 60)
+        } else {
+            format!("{seconds}s")
+        }
+    };
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Equal => "now".to_string(),
+        std::cmp::Ordering::Greater => format!("in {}", span(delta.unsigned_abs())),
+        std::cmp::Ordering::Less => format!("{} ago", span(delta.unsigned_abs())),
+    }
 }
 
-/// The human table.
+/// An RFC 3339 UTC time for `unix_seconds`, or `None` when it cannot be
+/// represented.
+fn rfc3339_opt(unix_seconds: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(unix_seconds, 0)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// One row's four cells.
+fn status_cells(row: &StatusRow, now: i64) -> [String; 4] {
+    let expires = row.expires_at.and_then(|at| {
+        rfc3339_opt(at).map(|text| format!("{} ({text})", describe_expiry(at, now)))
+    });
+    [
+        sanitize_for_terminal(&row.plugin),
+        row.state.label().to_string(),
+        expires.unwrap_or_else(|| "-".to_string()),
+        match row.has_refresh_token {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        }
+        .to_string(),
+    ]
+}
+
+/// Writes the human table, then one line per row that needs the user's
+/// attention. Columns are left-aligned and padded to the widest cell with two
+/// spaces between them; the last column is not padded, so no line ends in a
+/// space. Nothing here is built from a token.
 ///
 /// # Errors
 /// Returns the write error of `out`.
 pub fn render_status(rows: &[StatusRow], now: i64, out: &mut impl Write) -> std::io::Result<()> {
-    let _ = (rows, now, out);
-    todo!("RED stub")
+    let table: Vec<[String; 4]> = rows.iter().map(|row| status_cells(row, now)).collect();
+    let mut widths = STATUS_HEADINGS.map(|heading| heading.chars().count());
+    for row in &table {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |cells: [&str; 4]| {
+        let mut text = String::new();
+        for (index, cell) in cells.iter().enumerate() {
+            text.push_str(cell);
+            if index + 1 < cells.len() {
+                text.push_str(&" ".repeat(widths[index] - cell.chars().count() + 2));
+            }
+        }
+        text
+    };
+
+    writeln!(out, "{}", line(STATUS_HEADINGS))?;
+    for cells in &table {
+        writeln!(
+            out,
+            "{}",
+            line([
+                cells[0].as_str(),
+                cells[1].as_str(),
+                cells[2].as_str(),
+                cells[3].as_str()
+            ])
+        )?;
+    }
+
+    for row in rows {
+        let plugin = sanitize_for_terminal(&row.plugin);
+        match &row.state {
+            StatusState::NeedsLogin => {
+                writeln!(
+                    out,
+                    "`{plugin}`: run `fili auth login {plugin}` to log in again"
+                )?;
+            }
+            StatusState::Expired if row.has_refresh_token == Some(false) => {
+                writeln!(
+                    out,
+                    "`{plugin}`: run `fili auth login {plugin}` to log in again"
+                )?;
+            }
+            StatusState::Unreadable(detail) => {
+                writeln!(out, "`{plugin}`: {}", sanitize_for_terminal(detail))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
-/// The JSON array.
+/// Writes the rows as one compact JSON array and a newline, and nothing else.
+/// Every object has exactly the keys `plugin`, `state`, `expires_at`,
+/// `has_refresh_token` and `detail`; no key can hold a token.
 ///
 /// # Errors
 /// Returns the write error of `out`.
 pub fn render_status_json(rows: &[StatusRow], out: &mut impl Write) -> std::io::Result<()> {
-    let _ = (rows, out);
-    todo!("RED stub")
+    let array: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "plugin": sanitize_for_terminal(&row.plugin),
+                "state": row.state.label(),
+                "expires_at": row.expires_at.and_then(rfc3339_opt),
+                "has_refresh_token": row.has_refresh_token,
+                "detail": match &row.state {
+                    StatusState::Unreadable(detail) => Some(sanitize_for_terminal(detail)),
+                    _ => None,
+                },
+            })
+        })
+        .collect();
+    writeln!(out, "{}", serde_json::Value::Array(array))
 }
 
-/// `fili auth status`.
+/// `fili auth status`: every source that declares `[host.oauth]` or has a
+/// stored login, with its login state and expiry. It never takes the state
+/// directory lock, never creates anything and never reads `.env` or a
+/// secret, so it works beside a running `fili run`.
 ///
 /// # Errors
-/// The registry's diagnostics, a state directory error, or an io error.
+/// The registry's diagnostics, a state directory error for an empty
+/// `--state-dir`, or an io error when `out` cannot be written.
 pub fn status(
     registry: &Path,
     state_dir_flag: Option<&Path>,
@@ -339,8 +528,23 @@ pub fn status(
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> miette::Result<()> {
-    let _ = (registry, state_dir_flag, json, out, err);
-    todo!("RED stub")
+    let report = probe_oauth_sources(registry)?;
+    let state_dir = state_dir_for(&report.base_dir, state_dir_flag)?;
+    let now = chrono::Utc::now().timestamp();
+    let rows = collect_status(&report, &state_dir, now, err);
+    if json {
+        return render_status_json(&rows, out).into_diagnostic();
+    }
+    if rows.is_empty() {
+        writeln!(
+            out,
+            "No registered plugin declares [host.oauth] or has a stored login in {}.",
+            sanitize_for_terminal(&state_dir.display().to_string())
+        )
+        .into_diagnostic()?;
+        return Ok(());
+    }
+    render_status(&rows, now, out).into_diagnostic()
 }
 
 #[cfg(test)]
@@ -674,8 +878,7 @@ mod tests {
         for (name, plugin_toml) in sources {
             text.push_str(&source_table(name, true));
             if let Some(plugin_toml) = plugin_toml {
-                std::fs::write(dir.join(format!("{name}.toml")), plugin_toml)
-                    .expect("plugin toml");
+                std::fs::write(dir.join(format!("{name}.toml")), plugin_toml).expect("plugin toml");
             }
         }
         let path = dir.join("filimon.toml");
@@ -740,9 +943,30 @@ mod tests {
         );
         let state = dir.join("state");
         let now = unix_now();
-        put_login(&state, "fresh", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now + 3600, false);
-        put_login(&state, "stale", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now - 180, false);
-        put_login(&state, "reauth", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now + 3600, true);
+        put_login(
+            &state,
+            "fresh",
+            "AT-SENTINEL-S",
+            Some("RT-SENTINEL-S"),
+            now + 3600,
+            false,
+        );
+        put_login(
+            &state,
+            "stale",
+            "AT-SENTINEL-S",
+            Some("RT-SENTINEL-S"),
+            now - 180,
+            false,
+        );
+        put_login(
+            &state,
+            "reauth",
+            "AT-SENTINEL-S",
+            Some("RT-SENTINEL-S"),
+            now + 3600,
+            true,
+        );
         std::fs::create_dir_all(state.join("auth")).expect("auth dir");
         std::fs::write(
             state.join("auth").join("broken.json"),
@@ -799,17 +1023,29 @@ mod tests {
             keys.sort_unstable();
             assert_eq!(
                 keys,
-                ["detail", "expires_at", "has_refresh_token", "plugin", "state"]
+                [
+                    "detail",
+                    "expires_at",
+                    "has_refresh_token",
+                    "plugin",
+                    "state"
+                ]
             );
         }
-        let fresh = rows.iter().find(|row| row["plugin"] == "fresh").expect("fresh");
+        let fresh = rows
+            .iter()
+            .find(|row| row["plugin"] == "fresh")
+            .expect("fresh");
         assert_eq!(fresh["state"], "logged-in");
         assert_eq!(fresh["has_refresh_token"], true);
         assert!(
             chrono::DateTime::parse_from_rfc3339(fresh["expires_at"].as_str().expect("text"))
                 .is_ok()
         );
-        let nologin = rows.iter().find(|row| row["plugin"] == "nologin").expect("row");
+        let nologin = rows
+            .iter()
+            .find(|row| row["plugin"] == "nologin")
+            .expect("row");
         assert!(nologin["expires_at"].is_null() && nologin["has_refresh_token"].is_null());
         for secret in ["AT-SENTINEL-S", "RT-SENTINEL-S"] {
             assert!(!out.contains(secret), "{out}");
@@ -842,7 +1078,14 @@ mod tests {
         );
         let state = dir.path().join("state");
         let now = unix_now();
-        put_login(&state, "renewable", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now - 600, false);
+        put_login(
+            &state,
+            "renewable",
+            "AT-SENTINEL-S",
+            Some("RT-SENTINEL-S"),
+            now - 600,
+            false,
+        );
         put_login(&state, "terminal", "AT-SENTINEL-S", None, now - 600, false);
 
         let (out, _) = run_status(&registry, &state, false);
@@ -915,7 +1158,14 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let registry = registry_of(dir.path(), &[("loose", Some(OAUTH_PLUGIN_TOML))]);
         let state = dir.path().join("state");
-        put_login(&state, "loose", "AT-SENTINEL-S", None, unix_now() + 3600, false);
+        put_login(
+            &state,
+            "loose",
+            "AT-SENTINEL-S",
+            None,
+            unix_now() + 3600,
+            false,
+        );
         let file = state.join("auth").join("loose.json");
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
@@ -974,7 +1224,11 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("garbled-with-login"), "{err}");
-        assert_eq!(row_cells(&out, "garbled-with-login")[1], "logged-in", "{out}");
+        assert_eq!(
+            row_cells(&out, "garbled-with-login")[1],
+            "logged-in",
+            "{out}"
+        );
     }
 
     #[test]

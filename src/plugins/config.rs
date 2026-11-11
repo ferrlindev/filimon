@@ -689,8 +689,33 @@ struct HostView {
 /// `RegistryUnreadable` or `RegistryMalformed` when the registry file cannot
 /// be read or parsed.
 pub fn probe_oauth_sources(path: &Path) -> Result<OAuthProbeReport, ConfigErrors> {
-    let _ = path;
-    todo!("RED stub")
+    let (registry, _, _) = read_registry(path)?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let sources = loadable(&registry.sources)
+        .map(|(name, entry)| {
+            let plugin_path = base_dir.join(entry.config.get_ref());
+            let declares = match std::fs::read_to_string(&plugin_path) {
+                Err(_) => OAuthDeclared::Unknown("the plugin file cannot be read".to_string()),
+                Ok(text) => match toml::from_str::<OAuthView>(&text) {
+                    Err(_) => {
+                        OAuthDeclared::Unknown("the plugin file is not valid TOML".to_string())
+                    }
+                    Ok(view) => {
+                        if view.host.and_then(|host| host.oauth).is_some() {
+                            OAuthDeclared::Yes
+                        } else {
+                            OAuthDeclared::No
+                        }
+                    }
+                },
+            };
+            OAuthProbe {
+                name: name.to_string(),
+                declares,
+            }
+        })
+        .collect();
+    Ok(OAuthProbeReport { base_dir, sources })
 }
 
 /// Resolves a parsed plugin's secrets and builds its `PluginConfig`.
@@ -3378,7 +3403,11 @@ component = "other-fetcher.wasm"
         write(&dir, "filimon.toml", &registry);
         write(&dir, "declared.toml", OAUTH_PLUGIN);
         write(&dir, "plain.toml", "[host]\npoll_interval_secs = 60\n");
-        write(&dir, "broken.toml", "this is = = not toml SECRET-FILE-CONTENT\n");
+        write(
+            &dir,
+            "broken.toml",
+            "this is = = not toml SECRET-FILE-CONTENT\n",
+        );
         write(&dir, "off.toml", OAUTH_PLUGIN);
 
         let report = probe_oauth_sources(&dir.path().join("filimon.toml")).expect("probe");
