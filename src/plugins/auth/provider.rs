@@ -11,8 +11,20 @@
 //   no file                      -> NotLoggedIn   (poll with none, hint once)
 //   file flagged `needs_login`   -> NeedsLogin    (poll with none, hint once)
 //   at least 60 s of life left   -> Token         (D-07)
-//   under 60 s of life left      -> RefreshDue    (the refresh seam)
+//   under 60 s of life left      -> refresh first (below)
 //   file unusable                -> FileProblem   (disables only that plugin)
+//
+// The refresh is lazy: it happens here, just before a poll, and never on a
+// timer (D-07). It runs under an in-process gate and the per-alias file lock,
+// re-reads the file after taking the lock, and saves the new login before its
+// access token is returned (D-08):
+//
+//   refresh ok                   -> Token         (new login on disk first)
+//   save failed                  -> RefreshFailed (no token is handed out)
+//   invalid_grant                -> NeedsLogin    (file kept, flag set; D-09)
+//   transient / rejected         -> Token(old) while it is still valid,
+//                                   else RefreshFailed; nothing is marked
+//   no refresh token, expired    -> NeedsLogin
 //
 // Expiry is judged by an injectable wall-clock function. Tokio's paused time
 // does not move the wall clock, so a test that pauses time can neither make a
@@ -20,11 +32,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use super::client::{DEFAULT_EXPIRES_IN_SECS, RefreshFailure, TokenClient, TokenSet};
 use super::error::AuthError;
-use super::store::{AccessToken, TokenStore};
+use super::store::{AccessToken, AuthLock, RefreshToken, StoredTokens, TokenStore};
 use crate::plugins::config::OAuthConfig;
+use crate::plugins::host::engine::clean_guest_text;
+
+/// Longest error text kept in an outcome, in characters.
+const ERROR_TEXT_CLIP: usize = 240;
 
 /// A token with fewer seconds than this left is due for a refresh (D-07).
 pub const REFRESH_MARGIN_SECS: i64 = 60;
@@ -59,6 +76,11 @@ pub struct TokenProvider {
     oauth: OAuthConfig,
     store: TokenStore,
     clock: Clock,
+    /// One refresh in flight per plugin inside this process (D-08); the
+    /// per-alias file lock covers other processes.
+    gate: tokio::sync::Mutex<()>,
+    /// Built on first use; a build failure is kept as cleaned text.
+    client: OnceLock<Result<TokenClient, String>>,
 }
 
 impl std::fmt::Debug for TokenProvider {
@@ -79,6 +101,8 @@ impl TokenProvider {
             oauth,
             store: TokenStore::new(state_dir, plugin),
             clock: system_clock(),
+            gate: tokio::sync::Mutex::new(()),
+            client: OnceLock::new(),
         }
     }
 
@@ -90,11 +114,8 @@ impl TokenProvider {
         self
     }
 
-    /// Re-reads the token file and decides what the next poll receives.
-    #[allow(
-        clippy::unused_async,
-        reason = "the refresh path of plan 06-06 awaits the token endpoint here"
-    )]
+    /// Re-reads the token file and decides what the next poll receives,
+    /// refreshing the token first when it is due.
     pub async fn access_token(&self) -> TokenOutcome {
         let tokens = match self.store.read() {
             Ok(Some(tokens)) => tokens,
@@ -104,13 +125,135 @@ impl TokenProvider {
         if tokens.needs_login {
             return TokenOutcome::NeedsLogin;
         }
-        let left = tokens.expires_at.saturating_sub((self.clock)());
-        if left >= REFRESH_MARGIN_SECS {
-            TokenOutcome::Token(tokens.access_token)
-        } else {
-            TokenOutcome::RefreshFailed("refresh is not implemented yet".to_string())
+        let now = (self.clock)();
+        if tokens.expires_at.saturating_sub(now) >= REFRESH_MARGIN_SECS {
+            return TokenOutcome::Token(tokens.access_token);
+        }
+        self.renew(tokens, now).await
+    }
+
+    /// The token is under the margin. With no refresh token to use and some
+    /// life left it is used as it is; otherwise the refresh (or the marking)
+    /// runs under the in-process gate and the per-alias lock.
+    async fn renew(&self, stored: StoredTokens, now: i64) -> TokenOutcome {
+        if stored.refresh_token.is_none() && stored.expires_at > now {
+            return TokenOutcome::Token(stored.access_token);
+        }
+        // One refresh in flight per plugin, then one writer across processes.
+        let _gate = self.gate.lock().await;
+        let lock = match self.store.lock().await {
+            Ok(lock) => lock,
+            Err(error) => return TokenOutcome::RefreshFailed(cleaned(&error)),
+        };
+
+        // A refresh or login that landed while this call waited is used as it
+        // is: decide again from what is on disk now.
+        let current = match self.store.read() {
+            Ok(Some(tokens)) => tokens,
+            Ok(None) => return TokenOutcome::NotLoggedIn,
+            Err(error) => return TokenOutcome::FileProblem(error),
+        };
+        if current.needs_login {
+            return TokenOutcome::NeedsLogin;
+        }
+        let now = (self.clock)();
+        if current.expires_at.saturating_sub(now) >= REFRESH_MARGIN_SECS {
+            return TokenOutcome::Token(current.access_token);
+        }
+        let Some(refresh_token) = current.refresh_token.clone() else {
+            if current.expires_at > now {
+                return TokenOutcome::Token(current.access_token);
+            }
+            self.mark_needs_login(&lock);
+            return TokenOutcome::NeedsLogin;
+        };
+
+        let refreshed = match self.client() {
+            Ok(client) => client.refresh(&refresh_token).await,
+            Err(text) => Err(RefreshFailure::Transient(format!(
+                "http client unavailable: {text}"
+            ))),
+        };
+        match refreshed {
+            Ok(set) => self.persist(&current, set),
+            Err(RefreshFailure::Permanent(_)) => {
+                self.mark_needs_login(&lock);
+                tracing::warn!(
+                    plugin = %self.plugin,
+                    "the provider refused the stored login; run: fili auth login {}",
+                    self.plugin
+                );
+                TokenOutcome::NeedsLogin
+            }
+            Err(RefreshFailure::Transient(text) | RefreshFailure::Rejected(text)) => {
+                // D-09: nothing is marked and nothing is deleted.
+                if current.expires_at > (self.clock)() {
+                    tracing::warn!(
+                        plugin = %self.plugin,
+                        "token refresh failed, using the current token: {text}"
+                    );
+                    TokenOutcome::Token(current.access_token)
+                } else {
+                    TokenOutcome::RefreshFailed(text)
+                }
+            }
         }
     }
+
+    /// Builds the new login from a refresh answer and saves it before its
+    /// access token is handed to anyone (D-08). A save that fails hands out no
+    /// token: using a rotated token that was never persisted could lose the
+    /// only valid refresh token.
+    fn persist(&self, current: &StoredTokens, set: TokenSet) -> TokenOutcome {
+        let obtained_at = (self.clock)();
+        let lifetime = i64::try_from(set.expires_in.unwrap_or(DEFAULT_EXPIRES_IN_SECS))
+            .unwrap_or(i64::MAX);
+        let tokens = StoredTokens {
+            access_token: AccessToken::new(set.access_token),
+            // An answer without one keeps the stored refresh token.
+            refresh_token: set
+                .refresh_token
+                .map(RefreshToken::new)
+                .or_else(|| current.refresh_token.clone()),
+            expires_at: obtained_at.saturating_add(lifetime),
+            token_type: set.token_type.or_else(|| current.token_type.clone()),
+            scope: set.scope.or_else(|| current.scope.clone()),
+            needs_login: false,
+            obtained_at,
+        };
+        match self.store.write(&tokens) {
+            Ok(()) => TokenOutcome::Token(tokens.access_token),
+            Err(error) => TokenOutcome::RefreshFailed(format!(
+                "the refreshed login could not be saved: {}",
+                cleaned(&error)
+            )),
+        }
+    }
+
+    /// Flags the stored login as needing a new login. The file is kept (D-09).
+    /// A failure to flag is logged once; the poll still runs without a token.
+    fn mark_needs_login(&self, lock: &AuthLock) {
+        if let Err(error) = self.store.mark_needs_login(lock) {
+            tracing::warn!(
+                plugin = %self.plugin,
+                "could not mark the login as needing renewal: {}",
+                cleaned(&error)
+            );
+        }
+    }
+
+    /// The token endpoint client, built on first use.
+    fn client(&self) -> Result<&TokenClient, &str> {
+        self.client
+            .get_or_init(|| TokenClient::new(&self.oauth).map_err(|error| cleaned(&error)))
+            .as_ref()
+            .map_err(String::as_str)
+    }
+}
+
+/// An error's text with control characters removed and its length capped.
+fn cleaned(error: &AuthError) -> String {
+    clean_guest_text(&error.to_string(), ERROR_TEXT_CLIP)
 }
 
 #[cfg(test)]
