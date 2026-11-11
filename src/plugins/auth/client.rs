@@ -25,6 +25,7 @@ use std::time::Duration;
 use super::callback::AuthCode;
 use super::error::AuthError;
 use super::pkce::Verifier;
+use super::store::RefreshToken;
 use crate::plugins::config::OAuthConfig;
 use crate::plugins::host::engine::clean_guest_text;
 
@@ -170,6 +171,15 @@ impl TokenClient {
         parse_token_set(&body).map_err(|reason| AuthError::TokenResponse {
             reason: reason.to_string(),
         })
+    }
+
+    /// Refreshes an access token with `refresh_token`.
+    ///
+    /// # Errors
+    /// A [`RefreshFailure`] classifying why no token was obtained.
+    pub async fn refresh(&self, refresh_token: &RefreshToken) -> Result<TokenSet, RefreshFailure> {
+        let _ = refresh_token;
+        Err(RefreshFailure::Transient("not implemented".to_string()))
     }
 
     /// Revokes `token` at the provider's revocation endpoint. `Ok(false)` when
@@ -724,5 +734,270 @@ mod tests {
         assert!(text.contains("500"), "{text}");
         assert!(!text.contains("RT-1"), "{text}");
         assert!(!text.contains('\u{1b}'), "{text:?}");
+    }
+
+    // ── Refresh ───────────────────────────────────────────────────────────────
+
+    fn refresh_token() -> RefreshToken {
+        RefreshToken::new("RT-1".to_string())
+    }
+
+    /// Runs one refresh against a server answering `reply`.
+    async fn refresh_against(
+        reply: Reply,
+        secret: Option<&str>,
+    ) -> (Result<TokenSet, RefreshFailure>, Vec<SeenRequest>) {
+        let server = serve(reply).await;
+        let config = oauth_config_for(&server.url("/token"), secret);
+        let client = TokenClient::new(&config).expect("client");
+        (client.refresh(&refresh_token()).await, server.seen())
+    }
+
+    /// The failure of a refresh that must fail.
+    async fn failure_of(reply: Reply) -> RefreshFailure {
+        refresh_against(reply, None)
+            .await
+            .0
+            .expect_err("the refresh must fail")
+    }
+
+    fn oauth_error(status: u16, code: &str) -> Reply {
+        Reply::json(status, &format!(r#"{{"error":"{code}"}}"#))
+    }
+
+    #[tokio::test]
+    async fn refresh_posts_the_refresh_token_grant() {
+        let (result, seen) = refresh_against(
+            Reply::json(200, &token_body("AT-2", None, Some(3600))),
+            None,
+        )
+        .await;
+        result.expect("refresh");
+        assert_eq!(seen[0].method, "POST");
+        let pairs = form_pairs(&seen[0].body);
+        assert!(has_pair(&pairs, "grant_type", "refresh_token"), "{pairs:?}");
+        assert!(has_pair(&pairs, "refresh_token", "RT-1"), "{pairs:?}");
+        assert!(has_pair(&pairs, "client_id", "client-1"), "{pairs:?}");
+        assert_eq!(seen[0].header("authorization"), None);
+
+        let (result, seen) = refresh_against(
+            Reply::json(200, &token_body("AT-2", None, Some(3600))),
+            Some("CS-SENTINEL"),
+        )
+        .await;
+        result.expect("refresh with a secret");
+        assert_eq!(
+            seen[0].header("authorization"),
+            Some(basic("client-1", "CS-SENTINEL").as_str())
+        );
+        let body = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(!body.contains("CS-SENTINEL"), "{body}");
+        assert!(
+            form_pairs(&seen[0].body)
+                .iter()
+                .all(|(key, _)| key != "client_secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_answer_without_a_refresh_token_returns_none_for_it() {
+        let (result, _) = refresh_against(
+            Reply::json(200, &token_body("AT-2", None, Some(1800))),
+            None,
+        )
+        .await;
+        let tokens = result.expect("refresh");
+        assert_eq!(tokens.access_token, "AT-2");
+        assert_eq!(tokens.refresh_token, None);
+        assert_eq!(tokens.expires_in, Some(1800));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_answer_with_a_rotated_token_returns_it() {
+        let (result, _) = refresh_against(
+            Reply::json(200, &token_body("AT-2", Some("RT-2"), Some(3600))),
+            None,
+        )
+        .await;
+        assert_eq!(
+            result.expect("refresh").refresh_token.as_deref(),
+            Some("RT-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_is_permanent() {
+        for status in [400, 401] {
+            let failure = failure_of(oauth_error(status, "invalid_grant")).await;
+            assert!(
+                matches!(&failure, RefreshFailure::Permanent(text) if text.contains("invalid_grant")),
+                "{status}: {failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_transient() {
+        for reply in [
+            Reply::status(500),
+            Reply::status(503),
+            oauth_error(500, "server_down"),
+            oauth_error(503, "invalid_grant"),
+        ] {
+            let failure = failure_of(reply).await;
+            assert!(
+                matches!(failure, RefreshFailure::Transient(_)),
+                "{failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_408_and_429_are_transient() {
+        for status in [408, 429] {
+            let failure = failure_of(Reply::status(status)).await;
+            assert!(
+                matches!(failure, RefreshFailure::Transient(_)),
+                "{status}: {failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn temporarily_unavailable_and_server_error_are_transient() {
+        for code in ["temporarily_unavailable", "server_error"] {
+            let failure = failure_of(oauth_error(400, code)).await;
+            assert!(
+                matches!(&failure, RefreshFailure::Transient(text) if text.contains(code)),
+                "{code}: {failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_error_is_transient() {
+        let config = oauth_config_for(&closed_port_url().await, None);
+        let client = TokenClient::new(&config).expect("client");
+        let failure = client
+            .refresh(&refresh_token())
+            .await
+            .expect_err("unreachable");
+        assert!(
+            matches!(failure, RefreshFailure::Transient(_)),
+            "{failure:?}"
+        );
+        assert!(!failure.text().contains("/token"), "{}", failure.text());
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_5xx_body_is_transient() {
+        let failure = failure_of(Reply::json(502, &format!("<html>{BODY_SENTINEL}</html>"))).await;
+        assert!(
+            matches!(&failure, RefreshFailure::Transient(text) if text == "HTTP 502"),
+            "{failure:?}"
+        );
+        assert!(!failure.text().contains(BODY_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn a_success_without_an_access_token_is_transient() {
+        let failure = failure_of(Reply::json(200, "{}")).await;
+        assert!(
+            matches!(failure, RefreshFailure::Transient(_)),
+            "{failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_client_is_rejected_not_permanent() {
+        let failure = failure_of(oauth_error(401, "invalid_client")).await;
+        assert!(
+            matches!(&failure, RefreshFailure::Rejected(text) if text.contains("invalid_client")),
+            "{failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_4xx_oauth_errors_are_rejected() {
+        for code in [
+            "unsupported_grant_type",
+            "invalid_scope",
+            "invalid_request",
+            "unauthorized_client",
+        ] {
+            let failure = failure_of(oauth_error(400, code)).await;
+            assert!(
+                matches!(&failure, RefreshFailure::Rejected(text) if text.contains(code)),
+                "{code}: {failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_4xx_body_is_rejected() {
+        let failure = failure_of(Reply::json(400, BODY_SENTINEL)).await;
+        assert!(
+            matches!(&failure, RefreshFailure::Rejected(text) if text == "HTTP 400"),
+            "{failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_answer_is_rejected() {
+        let target = serve(Reply::json(200, &token_body("AT-2", None, None))).await;
+        let first = serve(Reply::redirect(307, &target.url("/token"))).await;
+        let config = oauth_config_for(&first.url("/token"), Some("CS-SENTINEL"));
+        let client = TokenClient::new(&config).expect("client");
+        let failure = client
+            .refresh(&refresh_token())
+            .await
+            .expect_err("a redirect is a rejection");
+        assert!(
+            matches!(&failure, RefreshFailure::Rejected(text) if text == "HTTP 307"),
+            "{failure:?}"
+        );
+        assert!(
+            target.seen().is_empty(),
+            "the redirect target was contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_text_never_contains_the_tokens_or_the_body() {
+        let mut failures = vec![];
+        for reply in [
+            Reply::json(
+                400,
+                r#"{"error":"invalid_grant","error_description":"gone\u001b[31m"}"#,
+            ),
+            Reply::json(
+                401,
+                r#"{"error":"invalid_client","error_description":"nope\u001b[0m"}"#,
+            ),
+            Reply::json(502, &format!("<html>{BODY_SENTINEL}</html>")),
+            Reply::json(400, BODY_SENTINEL),
+            Reply::ok(BODY_SENTINEL),
+            Reply::json(200, "{}"),
+            Reply::status(503),
+            Reply::redirect(307, "http://127.0.0.1:9/RT-2"),
+        ] {
+            let (result, _) = refresh_against(reply, Some("CS-SENTINEL")).await;
+            failures.push(result.expect_err("a failing answer"));
+        }
+        let config = oauth_config_for(&closed_port_url().await, Some("CS-SENTINEL"));
+        let client = TokenClient::new(&config).expect("client");
+        failures.push(
+            client
+                .refresh(&refresh_token())
+                .await
+                .expect_err("unreachable"),
+        );
+        for failure in &failures {
+            let text = format!("{} {failure:?}", failure.text());
+            for secret in ["RT-1", "RT-2", "CS-SENTINEL", BODY_SENTINEL] {
+                assert!(!text.contains(secret), "`{secret}` leaked into: {text}");
+            }
+            assert!(!failure.text().contains('\u{1b}'), "{:?}", failure.text());
+        }
     }
 }
