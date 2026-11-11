@@ -1,0 +1,87 @@
+{
+  "kind": "Listing",
+  "data": {
+    "after": "t3_1kx9ac3",
+    "dist": 3,
+    "modhash": null,
+    "geo_filter": "",
+    "before": null,
+    "children": [
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "rust",
+          "selftext": "I have been porting a small parser to async and the borrow checker keeps rejecting a self-referential buffer. What is the usual way out?",
+          "author_fullname": "t2_synthetic1",
+          "saved": false,
+          "title": "How do you structure self-referential buffers in async code?",
+          "name": "t3_1kx9aa1",
+          "id": "1kx9aa1",
+          "author": "ferris_fan",
+          "score": 42,
+          "num_comments": 17,
+          "created_utc": 1700000300.0,
+          "created": 1700000300.0,
+          "permalink": "/r/rust/comments/1kx9aa1/how_do_you_structure_selfreferential_buffers_in/",
+          "url": "https://www.reddit.com/r/rust/comments/1kx9aa1/how_do_you_structure_selfreferential_buffers_in/",
+          "is_self": true,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/rust"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "rust",
+          "selftext": "",
+          "author_fullname": "t2_synthetic2",
+          "saved": false,
+          "title": "Release notes: a 2026 edition roadmap & tooling update",
+          "name": "t3_1kx9ab2",
+          "id": "1kx9ab2",
+          "author": "crate_keeper",
+          "score": 311,
+          "num_comments": 58,
+          "created_utc": 1700000200.0,
+          "created": 1700000200.0,
+          "permalink": "/r/rust/comments/1kx9ab2/release_notes_a_2026_edition_roadmap_tooling/",
+          "url": "https://blog.example.org/2026-edition-roadmap?a=1&b=2",
+          "is_self": false,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/rust"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "rust",
+          "selftext": "Weekly thread: what are you working on? Tell us about your projects, big or small.",
+          "author_fullname": "t2_synthetic3",
+          "saved": false,
+          "title": "What's everyone working on this week?",
+          "name": "t3_1kx9ac3",
+          "id": "1kx9ac3",
+          "author": "mod_bot",
+          "score": 9,
+          "num_comments": 4,
+          "created_utc": 1700000100.0,
+          "created": 1700000100.0,
+          "permalink": "/r/rust/comments/1kx9ac3/whats_everyone_working_on_this_week/",
+          "url": "https://www.reddit.com/r/rust/comments/1kx9ac3/whats_everyone_working_on_this_week/",
+          "is_self": true,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/rust"
+        }
+      }
+    ]
+  }
+}

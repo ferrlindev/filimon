@@ -1,0 +1,28 @@
+[package]
+name = "reddit-source"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "filimon Reddit source plugin: polls subreddit listings through the official OAuth API and returns items."
+authors = ["filimon"]
+
+[lib]
+# `rlib` lets `tests/` link the plain-Rust core; `cdylib` is what cargo-component turns into the component.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+percent-encoding = "2"
+
+[package.metadata.component]
+package = "filimon:reddit-source"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "source"
+
+# Own workspace, so the root filimon workspace does not capture this crate.
+[workspace]
