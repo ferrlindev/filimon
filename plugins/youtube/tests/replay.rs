@@ -576,6 +576,104 @@ fn only_the_official_api_host_and_playlist_items_are_ever_requested() {
     }
 }
 
+// ── Plan 07-08 Task 2: credential modes and the low-cost request sweep ──────
+
+/// A strict recording mock: it answers every request with an empty page and
+/// fails on the first request that breaks a request rule (host, endpoint,
+/// credential header count, accept header, credential in the url).
+struct StrictHttp {
+    requests: RefCell<Vec<HttpRequest>>,
+    secrets: Vec<String>,
+}
+
+impl StrictHttp {
+    fn new(secrets: &[&str]) -> Self {
+        StrictHttp {
+            requests: RefCell::new(Vec::new()),
+            secrets: secrets.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.requests.borrow().len()
+    }
+}
+
+impl Http for StrictHttp {
+    fn get(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let url = &request.url;
+        assert!(
+            url.starts_with("https://www.googleapis.com/youtube/v3/playlistItems?"),
+            "unexpected endpoint {url}"
+        );
+        let path = url.split('?').next().unwrap();
+        assert!(
+            path.split('/')
+                .all(|segment| segment != "search" && segment != "videos"),
+            "expensive endpoint {url}"
+        );
+        for secret in &self.secrets {
+            assert!(!url.contains(secret.as_str()), "credential in the url");
+        }
+        let header = |name: &str| youtube_source::http::header(&request.headers, name);
+        assert_eq!(header("accept"), Some("application/json"));
+        let credentials = request
+            .headers
+            .iter()
+            .filter(|(name, _)| {
+                name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("x-goog-api-key")
+            })
+            .count();
+        assert_eq!(credentials, 1, "exactly one credential header per request");
+        self.requests.borrow_mut().push(request.clone());
+        Ok(page(Vec::new()))
+    }
+}
+
+#[test]
+fn an_access_token_is_preferred_over_the_api_key_and_sent_as_bearer() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page"))]);
+    poll(&http, &one_channel(), Some(KEY), None, Some("TOKEN-1")).expect("poll");
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    let header = |name: &str| youtube_source::http::header(&requests[0].headers, name);
+    assert_eq!(header("authorization"), Some("Bearer TOKEN-1"));
+    assert_eq!(header("x-goog-api-key"), None);
+    assert!(!requests[0].url.contains("TOKEN-1") && !requests[0].url.contains(KEY));
+}
+
+#[test]
+fn without_a_token_the_api_key_header_is_used() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page"))]);
+    poll(&http, &one_channel(), Some(KEY), None, None).expect("poll");
+    let requests = http.requests();
+    let header = |name: &str| youtube_source::http::header(&requests[0].headers, name);
+    assert_eq!(header("x-goog-api-key"), Some(KEY));
+    assert_eq!(header("authorization"), None);
+}
+
+fn many_channels(count: usize) -> Settings {
+    let list: Vec<String> = (0..count).map(|i| format!("\"UC{i:0>22}\"")).collect();
+    settings(&format!("channels = [{}]\n", list.join(", ")))
+}
+
+#[test]
+fn only_playlistitems_requests_are_ever_made_and_each_poll_costs_one_unit_per_playlist() {
+    for count in [1, 3, youtube_source::cursor::MAX_FEEDS] {
+        let settings = many_channels(count);
+        for (key, token) in [(Some(KEY), None), (Some(KEY), Some("TOKEN-1")), (None, Some("TOKEN-1"))]
+        {
+            let http = StrictHttp::new(&[KEY, "TOKEN-1"]);
+            // First poll, then a later poll with the cursor the first returned.
+            let first = poll(&http, &settings, key, None, token).expect("first poll");
+            assert_eq!(http.count(), count, "first poll of {count} channels");
+            poll(&http, &settings, key, first.next_cursor.as_deref(), token).expect("later poll");
+            assert_eq!(http.count(), 2 * count, "two polls of {count} channels");
+        }
+    }
+}
+
 // ── Plan 07-08 Task 1: response classification (D-15, YTUB-03) ───────────────
 
 const QUOTA_TEXT: &str = "YouTube quota exceeded (quotaExceeded): daily Data API quota exhausted; resets at midnight Pacific";
