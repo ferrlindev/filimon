@@ -164,7 +164,7 @@ pub enum AuthCommand {
         json: bool,
     },
 
-    /// Delete a plugin's stored login and revoke it at the provider when the plugin declares a revocation_url.
+    /// Delete a plugin's stored login and revoke it at the provider when the plugin declares a `revocation_url`.
     Logout {
         /// The registered source to log out of
         #[arg(value_name = "NAME")]

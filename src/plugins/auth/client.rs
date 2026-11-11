@@ -87,7 +87,9 @@ pub enum RefreshFailure {
 
 impl RefreshFailure {
     /// The cleaned description: an OAuth code, `HTTP <status>` or a transport
-    /// description, never a body.
+    /// description, never a body. Only tests read it: the provider matches on
+    /// the variants and carries the text itself.
+    #[cfg(test)]
     #[must_use]
     pub fn text(&self) -> &str {
         match self {

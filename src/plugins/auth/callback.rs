@@ -113,7 +113,9 @@ impl CallbackListener {
         })
     }
 
-    /// The port actually bound.
+    /// The port actually bound. Only tests read it: the login flow uses
+    /// `redirect_uri`.
+    #[cfg(test)]
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port

@@ -263,13 +263,6 @@ pub struct PluginConfig {
 /// `https://` URL with a host and no user-info (D-13). `client_secret` is the
 /// only secret; it is never part of `PluginConfig::secrets` (D-12).
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the login flow and the token client read these fields in later plans of this phase"
-    )
-)]
 pub struct OAuthConfig {
     pub authorize_url: url::Url,
     pub token_url: url::Url,
