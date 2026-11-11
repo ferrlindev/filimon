@@ -4,7 +4,9 @@
 // `poll_once` is the poll half of one scheduler cycle: instantiate, `init`,
 // `poll`, map. It takes no sink and no cursor store, so it cannot send or
 // persist anything. The size rule for the next cursor and the single place a
-// secret is exposed are the scheduler's own helpers, not copies.
+// secret is exposed are the scheduler's own helpers, not copies. The token
+// provider is consulted through the scheduler's `auth_for_poll`, so a stored
+// login reaches the guest here exactly as it does in the loop.
 //
 // `commit_once` is the `--produce` half: it sends the batch with the
 // scheduler's own `send_records` and only then writes the cursor (D-07), so a
@@ -19,9 +21,11 @@ use super::engine::clean_guest_text;
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
 use super::scheduler::{
-    CycleOutcome, Phase, PluginSpec, expose_secrets, oversize_cursor_outcome, send_records,
+    CycleOutcome, Phase, PluginSpec, auth_for_poll, expose_secrets, oversize_cursor_outcome,
+    send_records, warn_login_hint,
 };
 use super::sink::{ItemSink, SinkRecord};
+use crate::plugins::auth::store::AccessToken;
 
 /// Longest error text kept from a failed cursor write, in characters.
 const COMMIT_TEXT_CLIP: usize = 512;
@@ -42,7 +46,8 @@ pub struct PolledOnce {
 ///
 /// # Errors
 /// The cycle's `CycleOutcome` when the instance cannot be built, `init` or
-/// `poll` fails, or the next cursor is over the byte cap.
+/// `poll` fails, the token provider reports a problem, or the next cursor is
+/// over the byte cap.
 pub async fn poll_once<F: InstanceFactory>(
     spec: &PluginSpec,
     factory: &F,
@@ -67,7 +72,15 @@ pub async fn poll_once<F: InstanceFactory>(
         CallOutcome::InstanceFatal(text) => return Err(CycleOutcome::InstanceFatal(text)),
     }
 
-    let response = match instance.poll(cursor).await {
+    let auth = auth_for_poll(spec).await?;
+    if let Some(hint) = auth.hint {
+        warn_login_hint(&spec.name, hint);
+    }
+
+    let response = match instance
+        .poll(cursor, auth.token.as_ref().map(AccessToken::expose))
+        .await
+    {
         CallOutcome::Ok(response) => response,
         CallOutcome::Guest(error) => {
             return Err(CycleOutcome::Guest {
@@ -291,6 +304,52 @@ mod tests {
         };
         let shared = oversize_cursor_outcome(&response).expect("over the cap");
         assert_eq!(describe(&shared), describe(&outcome));
+    }
+
+    // ── The stored login (D-15) ───────────────────────────────────────────────
+
+    use crate::plugins::auth::testing::{provider_for, unix_now, write_tokens};
+
+    #[tokio::test]
+    async fn once_hands_the_stored_access_token_to_poll() {
+        let dir = TempDir::new().expect("tempdir");
+        write_tokens(dir.path(), "fake", "AT-once", unix_now() + 3600);
+        let mut spec = once_spec();
+        spec.auth = Some(provider_for(dir.path(), "fake"));
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_ok(vec![], None)]);
+
+        poll_once(&spec, &factory, None).await.expect("one cycle");
+
+        assert_eq!(factory.poll_tokens(), vec![Some("AT-once".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn once_reports_a_token_file_problem_naming_plugin_and_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let auth_dir = dir.path().join("auth");
+        std::fs::create_dir_all(&auth_dir).expect("auth dir");
+        let path = auth_dir.join("fake.json");
+        std::fs::write(&path, "NOT-JSON-SENTINEL").expect("write the corrupt file");
+        let mut spec = once_spec();
+        spec.auth = Some(provider_for(dir.path(), "fake"));
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_ok(vec![], None)]);
+
+        let outcome = poll_once(&spec, &factory, None)
+            .await
+            .expect_err("a corrupt token file fails the cycle");
+
+        let CycleOutcome::TokenFile(text) = &outcome else {
+            panic!("expected a token file outcome, got {outcome:?}");
+        };
+        assert!(text.contains("`fake`"), "{text}");
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(!text.contains("NOT-JSON-SENTINEL"), "{text}");
+        assert!(factory.poll_tokens().is_empty(), "the guest was never polled");
+        assert_eq!(
+            std::fs::read(&path).expect("bytes"),
+            b"NOT-JSON-SENTINEL",
+            "the file is left as found"
+        );
     }
 
     // ── commit_once (D-07) ────────────────────────────────────────────────────

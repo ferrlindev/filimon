@@ -647,6 +647,7 @@ lower_case=v
             },
             settings_toml: String::new(),
             secrets: ResolvedSecrets::from([("token".to_string(), Secret("pa55word".to_string()))]),
+            oauth: None,
         };
 
         let debug = format!("{plugin:?}");

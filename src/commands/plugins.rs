@@ -792,7 +792,7 @@ pub async fn run_once(
     let spec = loaded
         .sources
         .get(name)
-        .and_then(PluginSpec::from_loaded)
+        .and_then(|source| PluginSpec::from_loaded(source, &state_dir))
         .ok_or_else(|| miette::miette!("plugin `{}` could not be prepared", planned.name))?;
 
     // The starting cursor, before any component is loaded, so a corrupt cursor
@@ -2344,7 +2344,11 @@ mod tests {
             CallOutcome::Ok(())
         }
 
-        async fn poll(&mut self, _cursor: Option<&[u8]>) -> CallOutcome<PollResponse> {
+        async fn poll(
+            &mut self,
+            _cursor: Option<&[u8]>,
+            _access_token: Option<&str>,
+        ) -> CallOutcome<PollResponse> {
             (self.poll)()
         }
     }
@@ -2360,8 +2364,9 @@ mod tests {
         let env = |key: &str| (key == "STUB_TOKEN").then(|| SECRET_VALUE.to_string());
         let loaded = crate::plugins::config::load_registry_with_env(&registry, &env)
             .expect("registry loads with the secret");
-        let spec = PluginSpec::from_loaded(&loaded.sources["stub"]).expect("an enabled source");
         let state = dir.path().join("state");
+        let spec = PluginSpec::from_loaded(&loaded.sources["stub"], &state)
+            .expect("an enabled source");
         let store = CursorStore::open(&state).expect("cursor store");
         let sink = VecSink::default();
 

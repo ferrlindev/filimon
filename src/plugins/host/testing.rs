@@ -483,10 +483,26 @@ pub(crate) enum FakeEvent {
     },
 }
 
+/// One input a fake instance received, in call order. This is everything the
+/// host hands a guest, so a test can prove which values did and did not reach
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FakeInput {
+    Init {
+        settings: String,
+        secrets: Vec<(String, String)>,
+    },
+    Poll {
+        cursor: Option<Vec<u8>>,
+        access_token: Option<String>,
+    },
+}
+
 /// Builds `FakeInstance`s that share one script and one event log.
 pub(crate) struct FakeFactory {
     script: Arc<Mutex<VecDeque<FakeStep>>>,
     events: Arc<Mutex<Vec<FakeEvent>>>,
+    inputs: Arc<Mutex<Vec<FakeInput>>>,
 }
 
 impl FakeFactory {
@@ -494,7 +510,24 @@ impl FakeFactory {
         Self {
             script: Arc::new(Mutex::new(steps.into())),
             events: Arc::new(Mutex::new(Vec::new())),
+            inputs: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every `init` and `poll` input received, in call order.
+    pub(crate) fn inputs(&self) -> Vec<FakeInput> {
+        self.inputs.lock().expect("inputs").clone()
+    }
+
+    /// The access token each poll received.
+    pub(crate) fn poll_tokens(&self) -> Vec<Option<String>> {
+        self.inputs()
+            .into_iter()
+            .filter_map(|input| match input {
+                FakeInput::Poll { access_token, .. } => Some(access_token),
+                FakeInput::Init { .. } => None,
+            })
+            .collect()
     }
 
     pub(crate) fn events(&self) -> Vec<FakeEvent> {
@@ -546,6 +579,7 @@ impl InstanceFactory for FakeFactory {
         Ok(FakeInstance {
             script: Arc::clone(&self.script),
             events: Arc::clone(&self.events),
+            inputs: Arc::clone(&self.inputs),
         })
     }
 }
@@ -554,11 +588,16 @@ impl InstanceFactory for FakeFactory {
 pub(crate) struct FakeInstance {
     script: Arc<Mutex<VecDeque<FakeStep>>>,
     events: Arc<Mutex<Vec<FakeEvent>>>,
+    inputs: Arc<Mutex<Vec<FakeInput>>>,
 }
 
 impl PluginInstance for FakeInstance {
-    async fn init(&mut self, _settings: &str, _secrets: &[(String, String)]) -> CallOutcome<()> {
+    async fn init(&mut self, settings: &str, secrets: &[(String, String)]) -> CallOutcome<()> {
         self.events.lock().expect("events").push(FakeEvent::Init);
+        self.inputs.lock().expect("inputs").push(FakeInput::Init {
+            settings: settings.to_string(),
+            secrets: secrets.to_vec(),
+        });
         let step = self.script.lock().expect("script").pop_front();
         match step {
             None | Some(FakeStep::InitOk) => CallOutcome::Ok(()),
@@ -568,8 +607,16 @@ impl PluginInstance for FakeInstance {
         }
     }
 
-    async fn poll(&mut self, cursor: Option<&[u8]>) -> CallOutcome<PollResponse> {
+    async fn poll(
+        &mut self,
+        cursor: Option<&[u8]>,
+        access_token: Option<&str>,
+    ) -> CallOutcome<PollResponse> {
         let started = Instant::now();
+        self.inputs.lock().expect("inputs").push(FakeInput::Poll {
+            cursor: cursor.map(<[u8]>::to_vec),
+            access_token: access_token.map(str::to_string),
+        });
         let step = self.script.lock().expect("script").pop_front();
         let outcome = match step {
             None => CallOutcome::Ok(PollResponse {
@@ -656,6 +703,7 @@ pub(crate) fn spec(
         },
         settings_toml: String::new(),
         secrets: ResolvedSecrets::new(),
+        auth: None,
     }
 }
 

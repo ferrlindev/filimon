@@ -7,6 +7,7 @@
 // they can ever cross into a guest's `init`.
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod host;

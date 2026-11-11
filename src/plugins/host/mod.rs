@@ -132,7 +132,11 @@ impl Host {
         let mut loaded_sources = Vec::new();
         let mut load_failures = report.failures;
         for (name, pre) in report.sources {
-            let Some(spec) = registry.sources.get(&name).and_then(PluginSpec::from_loaded) else {
+            let Some(spec) = registry
+                .sources
+                .get(&name)
+                .and_then(|source| PluginSpec::from_loaded(source, &options.state_dir))
+            else {
                 continue;
             };
             let mut factory = WasmtimeFactory::new(host_engine.engine().clone(), pre);
