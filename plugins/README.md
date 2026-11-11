@@ -7,11 +7,16 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
 
 - `stub-source/`: a minimal plugin for the `source` world. `init` parses its
   `[settings]` TOML, logs a greeting and the secret alias names (never the
-  values), and calls the imported `fetch` when `fetch_url` is set. `poll`
+  values), and calls the imported `fetch` when `fetch_url` is set (an optional
+  `fetch_headers` table is sent with that request, for host tests). `poll`
   returns one hardcoded item and advances a one-byte cursor.
 - `stub-fetcher/`: a minimal plugin for the `fetcher` world. `fetch` logs the
-  request URL and returns a canned `200` JSON response. It never calls
-  `outbound-http`.
+  request URL and returns a canned `200` JSON response, unless the request
+  carries an `x-stub-mode` header: `spin` never returns and `forward:<url>`
+  calls `outbound-http.send` for that url and returns its result. Those modes
+  exist for host tests only (a fetcher that outlives its deadline, a fetcher
+  that tries to reach a host the source may not); never register it for a real
+  source or reference the modes from `examples/plugins/`.
 - `http-fetcher/`: the default fetcher, a plugin for the `fetcher` world.
   `fetch` forwards the request to the host's `outbound-http.send` and returns
   the answer unchanged. It adds no header, follows no redirect and logs no url,

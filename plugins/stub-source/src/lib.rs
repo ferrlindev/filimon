@@ -4,7 +4,9 @@
 // Minimal but exercising source plugin, built from ../../wit alone:
 //
 //   init  Parse the raw [settings] TOML, log the greeting and secret aliases,
-//         and call the imported `fetch` when `fetch_url` is set.
+//         and call the imported `fetch` when `fetch_url` is set. The optional
+//         `fetch_headers` table (name to value) is sent with that request, so a
+//         host test can steer a test fetcher through a header.
 //   poll  Return one hardcoded item and advance a one-byte cursor.
 //
 // Doubles as a Phase 3 host test fixture. Built for wasm32-unknown-unknown,
@@ -19,6 +21,7 @@ use bindings::filimon::plugin::fetch::fetch;
 use bindings::filimon::plugin::log::{Level, log};
 use bindings::filimon::plugin::types::{Item, Method, PollError, PollResponse, Request};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 // ── Settings ─────────────────────────────────────────────────────────────────
 
@@ -30,6 +33,8 @@ struct Settings {
     greeting: String,
     /// When set, `init` calls the imported `fetch` with a GET to this URL.
     fetch_url: Option<String>,
+    /// Headers sent with the `fetch_url` request, in key order.
+    fetch_headers: Option<BTreeMap<String, String>>,
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -59,7 +64,11 @@ impl Guest for Component {
             let request = Request {
                 method: Method::Get,
                 url,
-                headers: vec![],
+                headers: settings
+                    .fetch_headers
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
                 body: None,
             };
             match fetch(&request) {
