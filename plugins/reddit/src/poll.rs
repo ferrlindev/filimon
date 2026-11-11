@@ -5,7 +5,7 @@
 
 use crate::api::{self, Item};
 use crate::cursor::{self, Cursor, Mark};
-use crate::http::{Http, HttpError};
+use crate::http::{Http, HttpError, header};
 use crate::settings::Settings;
 use std::collections::HashSet;
 
@@ -44,6 +44,59 @@ fn map_http_error(error: HttpError) -> PollError {
         HttpError::InvalidRequest(_) => {
             PollError::Fatal("Reddit request was rejected as invalid".to_string())
         }
+    }
+}
+
+/// A response header parsed as a float (Reddit can send `59.0`). An absent,
+/// non-numeric or non-finite value is `None`.
+fn parse_header_f64(headers: &[(String, String)], name: &str) -> Option<f64> {
+    header(headers, name)?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+/// Whole seconds for a reset header: rounded up, negatives clamp to 0, huge
+/// values saturate at `u32::MAX`.
+fn reset_seconds(value: f64) -> u32 {
+    if value <= 0.0 {
+        0
+    } else if value >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        value.ceil() as u32
+    }
+}
+
+/// Classify a response before any parsing (D-13, D-04). `None` means a 2xx
+/// answer that is not rate limited, so parsing may continue. The texts hold
+/// fixed phrases, the feed key and numbers only: never a body, a header value
+/// or a url.
+fn classify_response(
+    status: u16,
+    headers: &[(String, String)],
+    feed_key: &str,
+) -> Option<PollError> {
+    // D-13: reactive and stateless. The host backoff does the waiting.
+    let remaining_exhausted = parse_header_f64(headers, "x-ratelimit-remaining")
+        .is_some_and(|remaining| remaining < 1.0);
+    if status == 429 || remaining_exhausted {
+        let reset = parse_header_f64(headers, "x-ratelimit-reset").map(reset_seconds);
+        return Some(PollError::RateLimited(reset));
+    }
+    match status {
+        200..=299 => None,
+        401 => Some(PollError::AuthRequired),
+        404 => Some(PollError::Config(format!(
+            "Reddit reports no such listing for {feed_key} (HTTP 404); check the subreddits setting"
+        ))),
+        403 => Some(PollError::Transient(format!(
+            "Reddit refused access to {feed_key} (HTTP 403); the subreddit may be private or banned, or the login lacks the history scope"
+        ))),
+        other => Some(PollError::Transient(format!(
+            "Reddit HTTP {other} for {feed_key}"
+        ))),
     }
 }
 
@@ -99,11 +152,8 @@ pub fn poll(
             settings.user_agent(),
         );
         let response = http.get(&request).map_err(map_http_error)?;
-        if response.status != 200 {
-            return Err(PollError::Transient(format!(
-                "Reddit HTTP {}",
-                response.status
-            )));
+        if let Some(error) = classify_response(response.status, &response.headers, &feed.key) {
+            return Err(error);
         }
         // The feed's listing decides the sticky rule (D-12). Settings only
         // produce `new` and `hot`, so the fallback is never taken.
@@ -171,4 +221,38 @@ pub fn poll(
         next_cursor: Some(next_cursor),
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn reset_of(value: &str) -> Option<u32> {
+        parse_header_f64(&headers(&[("x-ratelimit-reset", value)]), "x-ratelimit-reset")
+            .map(reset_seconds)
+    }
+
+    #[test]
+    fn rate_limit_headers_parse_as_floats() {
+        assert_eq!(reset_of("59.0"), Some(59));
+        assert_eq!(reset_of("37"), Some(37));
+        assert_eq!(reset_of("37.2"), Some(38));
+        assert_eq!(reset_of("-5"), Some(0));
+        assert_eq!(reset_of("abc"), None);
+        assert_eq!(reset_of("1e12"), Some(u32::MAX));
+        assert_eq!(reset_of("NaN"), None);
+        assert_eq!(reset_of("inf"), None);
+        assert_eq!(parse_header_f64(&headers(&[]), "x-ratelimit-reset"), None);
+        assert_eq!(
+            parse_header_f64(&headers(&[("x-ratelimit-remaining", "0.99")]), "x-ratelimit-remaining"),
+            Some(0.99)
+        );
+    }
 }
