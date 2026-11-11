@@ -200,6 +200,207 @@ impl LogCapture {
     }
 }
 
+// ── Loopback HTTP Server ──────────────────────────────────────────────────────
+
+/// One request a `TestHttpServer` received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeenRequest {
+    pub(crate) method: String,
+    /// The request target as sent: path plus query.
+    pub(crate) target: String,
+    /// Header names are lowercased.
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+}
+
+/// What a `TestHttpServer` answers one request with.
+#[derive(Debug, Clone)]
+pub(crate) struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    omit_length: bool,
+}
+
+impl Reply {
+    /// A 200 answer with `body`.
+    pub(crate) fn ok(body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status: 200,
+            headers: vec![],
+            body: body.into(),
+            omit_length: false,
+        }
+    }
+
+    /// An answer with this status and header, for example an `x-test` header.
+    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Leaves out `Content-Length`; the close of the socket ends the body.
+    pub(crate) fn without_length(mut self) -> Self {
+        self.omit_length = true;
+        self
+    }
+}
+
+type Handler = Arc<dyn Fn(&SeenRequest) -> Reply + Send + Sync>;
+
+/// A loopback HTTP/1.1 server for egress tests. It answers every request
+/// with `Connection: close`; dropping it aborts its tasks.
+pub(crate) struct TestHttpServer {
+    port: u16,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+    accept_loop: tokio::task::JoinHandle<()>,
+}
+
+impl TestHttpServer {
+    /// Binds `127.0.0.1:0` and answers each request with `handler`.
+    pub(crate) async fn start(
+        handler: impl Fn(&SeenRequest) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local address").port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler: Handler = Arc::new(handler);
+        let recorded = Arc::clone(&seen);
+        let accept_loop = tokio::spawn(async move {
+            // Connection tasks live in the set, so aborting this task ends them.
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let handler = Arc::clone(&handler);
+                let recorded = Arc::clone(&recorded);
+                connections.spawn(serve_connection(stream, handler, recorded));
+            }
+        });
+        Self {
+            port,
+            seen,
+            accept_loop,
+        }
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// `http://127.0.0.1:<port><path>`.
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port())
+    }
+
+    /// `http://localhost:<port><path>`: a different name for the same server.
+    pub(crate) fn localhost_url(&self, path: &str) -> String {
+        format!("http://localhost:{}{path}", self.port())
+    }
+
+    /// Every request received so far, in arrival order.
+    pub(crate) fn seen(&self) -> Vec<SeenRequest> {
+        self.seen.lock().expect("seen requests").clone()
+    }
+}
+
+impl Drop for TestHttpServer {
+    fn drop(&mut self) {
+        self.accept_loop.abort();
+    }
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        _ => "Status",
+    }
+}
+
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    handler: Handler,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+        return;
+    }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+
+    let mut headers = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+            return;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+    let length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; length];
+    if reader.read_exact(&mut body).await.is_err() {
+        return;
+    }
+
+    let request = SeenRequest {
+        method,
+        target,
+        headers,
+        body,
+    };
+    seen.lock().expect("seen requests").push(request.clone());
+    let reply = handler(&request);
+
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        reply.status,
+        reason_phrase(reply.status)
+    );
+    let mut lines: Vec<String> = reply
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    if !reply.omit_length {
+        lines.push(format!("content-length: {}\r\n", reply.body.len()));
+    }
+    lines.push("connection: close\r\n\r\n".to_string());
+    head.push_str(&lines.concat());
+
+    // The client may hang up early (a body over the cap, a timeout); that is
+    // not a test failure.
+    let mut stream = reader.into_inner();
+    if stream.write_all(head.as_bytes()).await.is_ok() {
+        let _ = stream.write_all(&reply.body).await;
+    }
+    let _ = stream.shutdown().await;
+}
+
 // ── Scripted Fakes For Scheduler Tests ────────────────────────────────────────
 
 /// One scripted answer. Every `init` and `poll` call of every instance a

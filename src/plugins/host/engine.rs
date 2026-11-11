@@ -56,7 +56,7 @@ pub use source_world::{Source, SourcePre};
 
 use source_world::filimon::plugin::{fetch, log, types};
 
-use super::fetch::FetchRoute;
+use super::fetch::{Egress, EgressGrant, FetchRoute};
 use crate::output::sanitize_for_terminal;
 
 /// How often the epoch ticker advances the engine epoch.
@@ -123,6 +123,8 @@ pub struct HostState {
     plugin: Arc<str>,
     limits: StoreLimits,
     route: Option<Arc<FetchRoute>>,
+    /// For a fetcher: what its `outbound-http.send` may reach.
+    grant: Option<EgressGrant>,
 }
 
 impl HostState {
@@ -132,7 +134,18 @@ impl HostState {
             plugin: Arc::from(plugin),
             limits: store_limits(),
             route: None,
+            grant: None,
         }
+    }
+
+    /// State for a fetcher instance. `label` is the fetcher alias used for its
+    /// log lines; `grant` is the calling consumer's policy, deadline and the
+    /// shared client behind `outbound-http.send`.
+    #[must_use]
+    pub fn for_fetcher(label: &str, grant: EgressGrant) -> Self {
+        let mut state = Self::new(label);
+        state.grant = Some(grant);
+        state
     }
 
     /// Sets the route that answers this instance's `fetch` calls. With none,
@@ -197,12 +210,17 @@ impl fetch::Host for HostState {
 }
 
 impl fetcher_world::filimon::plugin::outbound_http::Host for HostState {
-    /// Interim answer until the Phase 5 fetcher layer exists: no real HTTP.
+    /// Real HTTP through the host's shared client, under the calling
+    /// consumer's policy and deadline. Without a grant (a state that is not a
+    /// fetcher's) nothing is reachable.
     async fn send(
         &mut self,
-        _request: types::Request,
+        request: types::Request,
     ) -> wasmtime::Result<Result<types::Response, types::FetchError>> {
-        Ok(Err(types::FetchError::NotConfigured))
+        let Some(grant) = self.grant.clone() else {
+            return Ok(Err(types::FetchError::NotConfigured));
+        };
+        Ok(grant.send(request).await)
     }
 }
 
@@ -249,6 +267,7 @@ pub struct HostEngine {
     engine: Engine,
     source_linker: Linker<HostState>,
     fetcher_linker: Linker<HostState>,
+    egress: Arc<Egress>,
     _ticker: EpochTicker,
 }
 
@@ -276,6 +295,7 @@ impl HostEngine {
             engine,
             source_linker,
             fetcher_linker,
+            egress: Arc::new(Egress::new()),
             _ticker: ticker,
         })
     }
@@ -293,6 +313,12 @@ impl HostEngine {
     #[must_use]
     pub fn fetcher_linker(&self) -> &Linker<HostState> {
         &self.fetcher_linker
+    }
+
+    /// The HTTP client shared by every fetcher call.
+    #[must_use]
+    pub fn egress(&self) -> Arc<Egress> {
+        Arc::clone(&self.egress)
     }
 }
 

@@ -17,8 +17,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::error::Error as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::engine::source_world::filimon::plugin::types;
@@ -27,6 +28,12 @@ use crate::plugins::config::HostConfig;
 
 /// Longest text kept from a fetcher failure, in characters.
 const FAILURE_TEXT_CLIP: usize = 512;
+
+/// Largest response body the host hands to a plugin, in bytes (8 MiB).
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Longest text kept from a transport failure, in characters.
+const TRANSPORT_TEXT_CLIP: usize = 256;
 
 // ── Policy ────────────────────────────────────────────────────────────────────
 
@@ -172,6 +179,217 @@ impl FetchPolicy {
     }
 }
 
+// ── Egress ────────────────────────────────────────────────────────────────────
+
+/// The host's one HTTP client: certificate validation is the client's default
+/// (on) and its own redirect following is off. It is built on first use and
+/// shared by every fetcher call, so `HostEngine::new` stays cheap.
+///
+/// Certificate roots are the ones bundled with the client's rustls
+/// configuration; the operating system's trust store is not read (WD-11).
+#[derive(Default)]
+pub struct Egress {
+    client: OnceLock<Result<reqwest::Client, String>>,
+    #[cfg(test)]
+    extra_roots: Vec<reqwest::Certificate>,
+}
+
+impl Egress {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An egress that also trusts the certificate in `pem`.
+    ///
+    /// # Panics
+    /// When `pem` is not a certificate.
+    #[cfg(test)]
+    #[allow(dead_code, reason = "used by the tls_ tests in plan 05-05")]
+    pub(crate) fn with_extra_root(pem: &[u8]) -> Self {
+        let root = reqwest::Certificate::from_pem(pem).expect("test root certificate");
+        Self {
+            client: OnceLock::new(),
+            extra_roots: vec![root],
+        }
+    }
+
+    fn client(&self) -> Result<&reqwest::Client, types::FetchError> {
+        let built = self.client.get_or_init(|| {
+            #[allow(unused_mut, reason = "extra roots exist only under cfg(test)")]
+            let mut builder =
+                reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+            #[cfg(test)]
+            for root in &self.extra_roots {
+                builder = builder.add_root_certificate(root.clone());
+            }
+            builder.build().map_err(describe_transport_error)
+        });
+        built.as_ref().map_err(|reason| {
+            types::FetchError::Transport(format!("http client unavailable: {reason}"))
+        })
+    }
+
+    /// Sends `request` and returns the response, under one `deadline`.
+    ///
+    /// # Errors
+    /// The policy's error, `InvalidRequest` for a method or header that cannot
+    /// be sent, `Timeout` when the deadline passes, and `Transport` for a
+    /// connection, certificate or body failure (never carrying the url).
+    pub async fn execute(
+        &self,
+        policy: &FetchPolicy,
+        request: types::Request,
+        deadline: tokio::time::Instant,
+    ) -> Result<types::Response, types::FetchError> {
+        if let Ok(result) = tokio::time::timeout_at(deadline, self.run(policy, request)).await {
+            result
+        } else {
+            tracing::warn!(consumer = %policy.consumer(), "outbound request timed out");
+            Err(types::FetchError::Timeout)
+        }
+    }
+
+    async fn run(
+        &self,
+        policy: &FetchPolicy,
+        request: types::Request,
+    ) -> Result<types::Response, types::FetchError> {
+        let url = policy.check(&request)?;
+        let method = to_method(&request.method)?;
+        let headers = to_header_map(&request.headers)?;
+        let client = self.client()?;
+
+        let mut builder = client.request(method.clone(), url.clone()).headers(headers);
+        if let Some(body) = request.body {
+            builder = builder.body(body);
+        }
+        let mut response = builder.send().await.map_err(map_error)?;
+        let status = response.status().as_u16();
+
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+
+        let too_big = || {
+            types::FetchError::Transport(format!(
+                "response body exceeds {MAX_RESPONSE_BYTES} bytes"
+            ))
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(too_big());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(map_error)? {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(too_big());
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        tracing::debug!(
+            consumer = %policy.consumer(),
+            method = %method,
+            host = %url.host_str().unwrap_or_default(),
+            status,
+            body_len = body.len(),
+            "outbound request"
+        );
+        Ok(types::Response {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+fn to_method(method: &types::Method) -> Result<reqwest::Method, types::FetchError> {
+    Ok(match method {
+        types::Method::Get => reqwest::Method::GET,
+        types::Method::Head => reqwest::Method::HEAD,
+        types::Method::Post => reqwest::Method::POST,
+        types::Method::Put => reqwest::Method::PUT,
+        types::Method::Patch => reqwest::Method::PATCH,
+        types::Method::Delete => reqwest::Method::DELETE,
+        types::Method::Options => reqwest::Method::OPTIONS,
+        types::Method::Other(text) => reqwest::Method::from_bytes(text.as_bytes())
+            .map_err(|_| types::FetchError::InvalidRequest("method is not valid".to_string()))?,
+    })
+}
+
+fn to_header_map(
+    headers: &[(String, String)],
+) -> Result<reqwest::header::HeaderMap, types::FetchError> {
+    let invalid = || types::FetchError::InvalidRequest("header is not valid".to_string());
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        let name =
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?;
+        let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| invalid())?;
+        map.append(name, value);
+    }
+    Ok(map)
+}
+
+/// A client error as a fetch error: a timeout stays a timeout, anything else
+/// is a transport failure whose text never carries the url.
+fn map_error(error: reqwest::Error) -> types::FetchError {
+    if error.is_timeout() {
+        types::FetchError::Timeout
+    } else {
+        types::FetchError::Transport(describe_transport_error(error))
+    }
+}
+
+/// The error's own text joined with its `source()` chain, with the url
+/// removed (reqwest's `Display` includes it otherwise) and cleaned.
+fn describe_transport_error(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    clean_guest_text(&text, TRANSPORT_TEXT_CLIP)
+}
+
+/// What a fetcher store holds to reach the network: the calling consumer's own
+/// policy and deadline, and the shared client. This is the only way a fetcher
+/// reaches the network, so a fetcher can never go where its consumer may not.
+#[derive(Clone)]
+pub struct EgressGrant {
+    pub policy: Arc<FetchPolicy>,
+    pub egress: Arc<Egress>,
+    pub deadline: tokio::time::Instant,
+}
+
+impl EgressGrant {
+    /// Sends one request under the grant's policy and deadline.
+    ///
+    /// # Errors
+    /// See `Egress::execute`.
+    pub async fn send(
+        &self,
+        request: types::Request,
+    ) -> Result<types::Response, types::FetchError> {
+        self.egress
+            .execute(&self.policy, request, self.deadline)
+            .await
+    }
+}
+
 // ── Route ─────────────────────────────────────────────────────────────────────
 
 /// Answers one consumer's `fetch` calls with its assigned fetcher component.
@@ -180,6 +398,7 @@ pub struct FetchRoute {
     pre: Arc<FetcherPre<HostState>>,
     engine: wasmtime::Engine,
     policy: Arc<FetchPolicy>,
+    egress: Arc<Egress>,
     calls: AtomicU64,
 }
 
@@ -190,12 +409,14 @@ impl FetchRoute {
         pre: Arc<FetcherPre<HostState>>,
         engine: wasmtime::Engine,
         policy: Arc<FetchPolicy>,
+        egress: Arc<Egress>,
     ) -> Self {
         Self {
             fetcher: Arc::from(fetcher),
             pre,
             engine,
             policy,
+            egress,
             calls: AtomicU64::new(0),
         }
     }
@@ -227,7 +448,7 @@ impl FetchRoute {
             host = %url.host_str().unwrap_or_default(),
             "fetch routed"
         );
-        if let Ok(result) = tokio::time::timeout_at(deadline, self.call_fetcher(&request)).await {
+        if let Ok(result) = tokio::time::timeout_at(deadline, self.call_fetcher(&request, deadline)).await {
             result
         } else {
             tracing::warn!(
@@ -245,9 +466,16 @@ impl FetchRoute {
     async fn call_fetcher(
         &self,
         request: &types::Request,
+        deadline: tokio::time::Instant,
     ) -> Result<types::Response, types::FetchError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let mut store = new_guest_store(&self.engine, HostState::new(&self.fetcher));
+        let grant = EgressGrant {
+            policy: Arc::clone(&self.policy),
+            egress: Arc::clone(&self.egress),
+            deadline,
+        };
+        let state = HostState::for_fetcher(&self.fetcher, grant);
+        let mut store = new_guest_store(&self.engine, state);
         let fetcher = match self.pre.instantiate_async(&mut store).await {
             Ok(fetcher) => fetcher,
             Err(error) => return Err(self.failure(&error)),
@@ -286,7 +514,7 @@ mod tests {
     use crate::plugins::host::instance::WasmtimeFactory;
     use crate::plugins::host::loader::{load_fetcher, load_source};
     use crate::plugins::host::once::poll_once;
-    use crate::plugins::host::testing::{self, LogCapture, fixture_wasm};
+    use crate::plugins::host::testing::{self, LogCapture, Reply, TestHttpServer, fixture_wasm};
 
     fn fetcher_route(engine: &HostEngine, allow: &[&str]) -> Arc<FetchRoute> {
         let path = fixture_wasm("stub-fetcher", "stub_fetcher.wasm");
@@ -301,6 +529,7 @@ mod tests {
             Arc::new(pre),
             engine.engine().clone(),
             Arc::new(policy),
+            engine.egress(),
         ))
     }
 
@@ -353,6 +582,135 @@ mod tests {
         let text = logs.text();
         assert!(text.contains("init fetch failed: FetchError::NotConfigured"), "{text}");
         assert_eq!(text.matches("stub fetch:").count(), 1, "{text}");
+    }
+
+    // ── Egress Tests (loopback server, no wasm) ───────────────────────────────
+
+    fn policy_for(hosts: &[&str], timeout: Duration) -> FetchPolicy {
+        FetchPolicy::new("test", Allowlist::new(hosts), timeout)
+    }
+
+    fn get(url: &str) -> types::Request {
+        request(url)
+    }
+
+    fn in_five_seconds() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(5)
+    }
+
+    #[tokio::test]
+    async fn egress_get_returns_status_headers_and_body() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/hello" => Reply::ok("hello").with_header("x-test", "1"),
+            _ => Reply::ok("other"),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let response = Egress::new()
+            .execute(&policy, get(&server.url("/hello")), in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        assert_eq!(response.status, 200);
+        let header = response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "x-test")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(header, Some("1"));
+        assert_eq!(response.body, b"hello");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!((seen[0].method.as_str(), seen[0].target.as_str()), ("GET", "/hello"));
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_a_response_body_over_the_cap() {
+        let big = vec![b'x'; 9 * 1024 * 1024];
+        let declared = {
+            let big = big.clone();
+            TestHttpServer::start(move |_| Reply::ok(big.clone())).await
+        };
+        let undeclared = TestHttpServer::start(move |_| Reply::ok(big.clone()).without_length()).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(20));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let egress = Egress::new();
+
+        for server in [&declared, &undeclared] {
+            let result = egress.execute(&policy, get(&server.url("/big")), deadline).await;
+            let Err(types::FetchError::Transport(text)) = result else {
+                panic!("expected a transport error, got {result:?}");
+            };
+            assert!(text.contains("8388608"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_transport_errors_never_contain_the_url() {
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("address").port()
+        };
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let url = format!("http://127.0.0.1:{closed}/secret/path?token=SECRET123");
+
+        let result = Egress::new()
+            .execute(&policy, get(&url), in_five_seconds())
+            .await;
+
+        let Err(types::FetchError::Transport(text)) = result else {
+            panic!("expected a transport error, got {result:?}");
+        };
+        assert!(!text.is_empty());
+        assert!(!text.contains("SECRET123"), "{text}");
+        assert!(!text.contains("/secret/path"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn egress_denies_a_host_outside_the_allowlist_on_the_send_path() {
+        let server = TestHttpServer::start(|_| Reply::ok("x")).await;
+        let grant = EgressGrant {
+            policy: Arc::new(policy_for(&["127.0.0.1"], Duration::from_secs(5))),
+            egress: Arc::new(Egress::new()),
+            deadline: in_five_seconds(),
+        };
+
+        // `localhost` reaches the same server, but is not on the allowlist.
+        let result = grant.send(get(&server.localhost_url("/x"))).await;
+
+        assert!(matches!(result, Err(types::FetchError::Denied(_))), "{result:?}");
+        assert!(server.seen().is_empty(), "a denied send made a connection");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_tracer_default_fetcher_reaches_a_local_server() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/hello" => Reply::ok("hello"),
+            _ => Reply::ok("other"),
+        })
+        .await;
+        let engine = HostEngine::new().expect("engine");
+        let path = fixture_wasm("http-fetcher", "http_fetcher.wasm");
+        let pre = load_fetcher("http", &path, &engine).expect("fetcher loads");
+        let route = Arc::new(FetchRoute::new(
+            "http",
+            Arc::new(pre),
+            engine.engine().clone(),
+            Arc::new(policy_for(&["127.0.0.1"], Duration::from_secs(30))),
+            engine.egress(),
+        ));
+        let settings = format!("greeting = \"hi\"\nfetch_url = \"{}\"\n", server.url("/hello"));
+        let (logs, _guard) = LogCapture::start();
+
+        poll_stub_source(&engine, Some(route), &settings).await;
+
+        let text = logs.text();
+        assert!(text.contains("init fetch status 200"), "{text}");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!((seen[0].method.as_str(), seen[0].target.as_str()), ("GET", "/hello"));
     }
 
     #[tokio::test]
