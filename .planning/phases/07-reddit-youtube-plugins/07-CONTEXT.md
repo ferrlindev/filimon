@@ -43,7 +43,14 @@ Two reference `.wasm` source components (Reddit, YouTube), built separately from
 - **D-17:** Parsing, cursor and error-mapping logic is plain Rust behind a small **`Http`-style trait**. Native `cargo test` replays fixtures through a mock of that trait; the wasm `fetch` import is a thin adapter. No network, no keys.
 - **D-18:** Fixtures are **real API responses captured once, hand-sanitised** (tokens and PII stripped, trimmed) and committed under each crate's `tests/fixtures/`, with a short note on how they were recorded. Required cases: normal page, empty page, self post vs link post, deleted/removed post, 429 with rate-limit headers, `quotaExceeded` 403, 401/auth failure, malformed JSON.
 
+### Research-phase rulings (user, 2026-11-11, after 07-RESEARCH.md tensions T1/T2/T3b/fixtures)
+- **D-19 (amends D-12):** D-12's `created_utc` mark stays for subreddit listings and the home feed. The Reddit `saved` feed instead stores a **seen-fullname set** (top ~25 fullnames of the previous page) in its cursor value and emits entries until the first already-seen fullname. `saved` requires a `username` setting (a `config` error naming the field when absent) and the `history` scope. The D-11 per-feed-map shape is kept; the value type is per feed. — **Reversibility:** costly — stored cursor bytes.
+- **D-20 (amends D-09/D-11):** YouTube requests `part=snippet,contentDetails` (same 1 unit). `published` and the cursor mark use `contentDetails.videoPublishedAt` when present, else `snippet.publishedAt`. `raw` stays the `snippet`.
+- **D-21 (amends D-18):** Fixture capture is a human-action checkpoint using the curl recipes in 07-RESEARCH.md. If real capture is blocked (Reddit credentials may be unobtainable), schema-faithful hand-authored fixtures labelled `synthetic` in each `fixtures/README.md` are accepted. Offline Phase 7 work must not depend on credentials.
+- **D-22 (amends D-14):** `init` receives no alias, so the User-Agent is `filimon:<app_id>:<version> (by /u/<contact>)` with `app_id` defaulting to the fixed value `reddit`, overridable by an optional `[settings] app_id`. `user_agent_contact` stays required.
+
 ### Claude's Discretion
+- Adopted from research (additive, not user-ruled): optional host-side `[host.oauth] user_agent` key applied to token/revoke requests (T4), added in the D-03 host task; Reddit `url` = `https://www.reddit.com` + `permalink` for every post with the external link kept in `raw` (T6); the `client_credentials` token is cached in memory only, no token file (Open Question 4); a `subscriptions_limit` setting (default 50) with the quota formula documented; ROADMAP SC2/SC3 verified against the `reddit-user`/`youtube-user` instance names (T5).
 - JSON/serde crate choices in the plugins, exact module split, and fixture file naming.
 - Page-size parameters beyond the first-poll values, and exact `raw` serialisation.
 - Mapping of 401/403 auth failures to `auth-required` vs `transient`, and of 5xx to `transient`.
