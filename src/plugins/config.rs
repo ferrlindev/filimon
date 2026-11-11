@@ -418,23 +418,26 @@ fn load_registry_inner(
         }
     }
 
-    // Pass 2: `.env` is read only when some enabled source declares secrets,
-    // so a `.env` shared with other tools cannot break plugin-free registries.
+    // Pass 2: `.env` is read only when some enabled source declares secrets
+    // (`[host.secrets]` aliases or an OAuth `client_secret_env`), so a `.env`
+    // shared with other tools cannot break plugin-free registries.
     // `None` means the file is unusable: its DotenvInvalid problems are
     // recorded here in line order, and pass 3 reports no MissingSecret.
     let dotenv_path = base_dir.join(".env");
-    let dotenv: Option<HashMap<String, String>> =
-        if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
-            match secrets::read_dotenv(&dotenv_path) {
-                Ok(map) => Some(map),
-                Err(mut problems) => {
-                    registry_problems.append(&mut problems);
-                    None
-                }
+    let dotenv: Option<HashMap<String, String>> = if parsed
+        .values()
+        .any(|plugin| !plugin.aliases.is_empty() || plugin.client_secret_env.is_some())
+    {
+        match secrets::read_dotenv(&dotenv_path) {
+            Ok(map) => Some(map),
+            Err(mut problems) => {
+                registry_problems.append(&mut problems);
+                None
             }
-        } else {
-            Some(HashMap::new())
-        };
+        }
+    } else {
+        Some(HashMap::new())
+    };
 
     // Pass 3: resolve secrets per enabled source and assemble the output.
     let mut sources = BTreeMap::new();
@@ -649,7 +652,34 @@ fn finish_plugin(
         dotenv,
         dotenv_path,
         env,
-    )?;
+    );
+    // D-12: the client secret goes only into `OAuthConfig::client_secret`,
+    // never into `ResolvedSecrets`, which is what the plugin's `init` receives.
+    let client_secret = match &parsed.client_secret_env {
+        Some(env_var) => secrets::resolve_oauth_secret(
+            name,
+            &parsed.path,
+            &parsed.text,
+            env_var,
+            dotenv,
+            dotenv_path,
+            env,
+        )
+        .map_err(|problem| vec![problem]),
+        None => Ok(None),
+    };
+    let (secrets, client_secret) = match (secrets, client_secret) {
+        (Ok(secrets), Ok(client_secret)) => (secrets, client_secret),
+        (secrets, client_secret) => {
+            let mut problems = secrets.err().unwrap_or_default();
+            problems.extend(client_secret.err().unwrap_or_default());
+            return Err(problems);
+        }
+    };
+    let oauth = parsed.oauth.map(|mut oauth| {
+        oauth.client_secret = client_secret;
+        oauth
+    });
     // Names only, never values: makes alias mappings auditable.
     let env_vars: Vec<&str> = parsed
         .aliases
@@ -661,7 +691,7 @@ fn finish_plugin(
         host: parsed.host,
         settings_toml: parsed.settings_toml,
         secrets,
-        oauth: parsed.oauth,
+        oauth,
     })
 }
 
@@ -2211,6 +2241,293 @@ fetcher = "nope"
         );
     }
 
+    // ── [host.oauth] client secret (D-12) ─────────────────────────────────────
+
+    /// The value every secret test plants; no output may ever contain it.
+    const SENTINEL: &str = "s3cret-sentinel";
+
+    /// `alpha` with `client_secret_env = "STUB_CLIENT_SECRET"` and, when
+    /// `with_token_alias` is set, `[host.secrets] token = "STUB_TOKEN"`.
+    fn alpha_with_client_secret(dir: &TempDir, with_token_alias: bool, dotenv: Option<&str>) {
+        let secrets = if with_token_alias {
+            "\n[host.secrets]\ntoken = \"STUB_TOKEN\"\n"
+        } else {
+            ""
+        };
+        alpha_with_plugin(
+            dir,
+            &format!(
+                "{}{secrets}",
+                oauth_file("[\"read\"]", "client_secret_env = \"STUB_CLIENT_SECRET\"\n")
+            ),
+        );
+        if let Some(text) = dotenv {
+            write(dir, ".env", text);
+        }
+    }
+
+    fn load_with(
+        dir: &TempDir,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<LoadedRegistry, ConfigErrors> {
+        load_registry_with_env(&dir.path().join("filimon.toml"), env)
+    }
+
+    fn plugin_of(registry: &LoadedRegistry) -> &PluginConfig {
+        registry.sources["alpha"].plugin.as_ref().expect("loaded")
+    }
+
+    #[test]
+    fn a_secret_only_plugin_reads_dotenv() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            false,
+            Some(&format!("STUB_CLIENT_SECRET={SENTINEL}\n")),
+        );
+
+        let registry = load(&dir).expect("the client secret comes from .env");
+
+        let plugin = plugin_of(&registry);
+        let secret = plugin
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.client_secret.as_ref())
+            .expect("a client secret");
+        assert_eq!(secret.expose(), SENTINEL);
+        assert!(plugin.secrets.is_empty(), "no [host.secrets] alias exists");
+    }
+
+    #[test]
+    fn client_secret_never_appears_in_resolved_secrets() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            true,
+            Some(&format!(
+                "STUB_TOKEN=tok-1\nSTUB_CLIENT_SECRET={SENTINEL}\n"
+            )),
+        );
+
+        let registry = load(&dir).expect("both secrets resolve");
+
+        let plugin = plugin_of(&registry);
+        let keys: Vec<&str> = plugin.secrets.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["token"]);
+        assert!(plugin.secrets.values().all(|s| s.expose() != SENTINEL));
+        assert_eq!(plugin.secrets["token"].expose(), "tok-1");
+        assert!(!plugin.settings_toml.contains(SENTINEL));
+        let oauth = plugin.oauth.as_ref().expect("oauth");
+        assert_eq!(
+            oauth.client_secret.as_ref().map(Secret::expose),
+            Some(SENTINEL)
+        );
+    }
+
+    #[test]
+    fn missing_client_secret_names_plugin_and_field() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(&dir, false, Some("UNRELATED=1\n"));
+
+        let errors = load(&dir).expect_err("a missing client secret is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::MissingOAuthSecret {
+            plugin, env_var, ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected MissingOAuthSecret, got {:?}", errors.problems[0]);
+        };
+        assert_eq!(plugin, "alpha");
+        assert_eq!(env_var, "STUB_CLIENT_SECRET");
+        let text = errors.problems[0].to_string();
+        for needle in [
+            "alpha",
+            "host.oauth.client_secret_env",
+            "STUB_CLIENT_SECRET",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        let report = render(&errors);
+        assert!(
+            report.contains("fili::config::missing_oauth_secret"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn empty_client_secret_names_the_origin() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(&dir, false, Some("STUB_CLIENT_SECRET=\n"));
+
+        let errors = load(&dir).expect_err("an empty .env value is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::EmptyOAuthSecret {
+            plugin,
+            env_var,
+            origin,
+            ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected EmptyOAuthSecret, got {:?}", errors.problems[0]);
+        };
+        assert_eq!(plugin, "alpha");
+        assert_eq!(env_var, "STUB_CLIENT_SECRET");
+        assert_eq!(origin, &dir.path().join(".env").display().to_string());
+        let text = errors.problems[0].to_string();
+        assert!(text.contains("host.oauth.client_secret_env"), "{text}");
+        let report = render(&errors);
+        assert!(
+            report.contains("fili::config::empty_oauth_secret"),
+            "{report}"
+        );
+
+        // An empty process value names the process environment.
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(String::new);
+        let errors = load_with(&dir, &env).expect_err("an empty process value is an error");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::EmptyOAuthSecret { origin, .. } if origin == "the process environment"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn process_env_wins_over_dotenv_even_when_empty() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            false,
+            Some(&format!("STUB_CLIENT_SECRET={SENTINEL}\n")),
+        );
+
+        let empty = |key: &str| (key == "STUB_CLIENT_SECRET").then(String::new);
+        let errors = load_with(&dir, &empty).expect_err("an empty process value wins");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::EmptyOAuthSecret { origin, .. } if origin == "the process environment"
+            ),
+            "{errors:?}"
+        );
+
+        let from_process =
+            |key: &str| (key == "STUB_CLIENT_SECRET").then(|| "from-env".to_string());
+        let registry = load_with(&dir, &from_process).expect("a non-empty process value wins");
+        let secret = plugin_of(&registry)
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.client_secret.as_ref())
+            .expect("a client secret");
+        assert_eq!(secret.expose(), "from-env");
+    }
+
+    #[test]
+    fn an_unusable_dotenv_does_not_add_a_missing_client_secret_problem() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(&dir, false, Some("STUB_CLIENT_SECRET=has a space\n"));
+
+        let errors = load(&dir).expect_err("an invalid .env is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DotenvInvalid { line: Some(1), .. }
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_load_plugin_keeps_oauth_secret_problems_for_that_plugin() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.a]\ncomponent = \"a.wasm\"\nconfig = \"a.toml\"\n\n\
+             [sources.b]\ncomponent = \"b.wasm\"\nconfig = \"b.toml\"\n",
+        );
+        for (name, var) in [("a", "A_CLIENT_SECRET"), ("b", "B_CLIENT_SECRET")] {
+            write(
+                &dir,
+                &format!("{name}.toml"),
+                &oauth_file("[\"read\"]", &format!("client_secret_env = \"{var}\"\n")),
+            );
+        }
+
+        let errors = load_plugin_with_env(&dir.path().join("filimon.toml"), "a", &no_env)
+            .expect_err("a lacks its client secret");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::MissingOAuthSecret { plugin, env_var, .. }
+                    if plugin == "a" && env_var == "A_CLIENT_SECRET"
+            ),
+            "{errors:?}"
+        );
+        assert_eq!(errors.problems[0].plugin(), Some("a"));
+
+        // The unscoped load reports both plugins.
+        let all = load(&dir).expect_err("both lack their client secret");
+        assert_eq!(all.problems.len(), 2, "{all:?}");
+    }
+
+    #[test]
+    fn oauth_secret_value_never_in_debug_or_errors() {
+        // Success: the secret is held, but no Debug text carries it.
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            true,
+            Some(&format!(
+                "STUB_TOKEN=tok-1\nSTUB_CLIENT_SECRET={SENTINEL}\n"
+            )),
+        );
+        let registry = load(&dir).expect("loads");
+        let debug = format!("{registry:?}");
+        assert!(!debug.contains(SENTINEL), "{debug}");
+        assert!(debug.contains("Secret(***)"), "{debug}");
+
+        // Failures that sit beside a present secret: a missing alias, an
+        // empty alias, and an invalid .env.
+        let cases = [
+            format!("STUB_CLIENT_SECRET={SENTINEL}\n"),
+            format!("STUB_TOKEN=\nSTUB_CLIENT_SECRET={SENTINEL}\n"),
+            format!("STUB_CLIENT_SECRET={SENTINEL}\nBROKEN=has a space\n"),
+        ];
+        for dotenv in cases {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_client_secret(&dir, true, Some(&dotenv));
+
+            let errors = load(&dir).expect_err("a problem sits beside the client secret");
+
+            let report = render(&errors);
+            for text in [
+                report,
+                format!("{errors:?}"),
+                errors.to_string(),
+                format!("{:?}", miette::Report::new(errors)),
+            ] {
+                assert!(!text.contains(SENTINEL), "leaked: {text}");
+            }
+        }
+
+        // The problems of the secret itself carry names only.
+        for dotenv in ["", "STUB_CLIENT_SECRET=\n"] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_client_secret(&dir, false, Some(dotenv));
+            let env = |key: &str| (key == "OTHER").then(|| SENTINEL.to_string());
+            let errors = load_with(&dir, &env).expect_err("a client secret problem");
+            assert!(!render(&errors).contains(SENTINEL));
+        }
+    }
+
     #[test]
     fn malformed_plugin_toml() {
         let dir = TempDir::new().expect("tempdir");
@@ -2675,6 +2992,32 @@ config = "x.toml"
         ];
         for problem in &registry_level {
             assert_eq!(problem.plugin(), None, "{problem:?}");
+        }
+    }
+
+    #[test]
+    fn config_error_plugin_names_the_oauth_secret_variants() {
+        let src = || NamedSource::new("x.toml", String::new());
+        let span = || SourceSpan::from(0..0);
+        let problems = [
+            ConfigError::MissingOAuthSecret {
+                plugin: "p".into(),
+                env_var: "E".into(),
+                dotenv: "d".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::EmptyOAuthSecret {
+                plugin: "p".into(),
+                env_var: "E".into(),
+                origin: "o".into(),
+                fix: "f".into(),
+                src: src(),
+                span: span(),
+            },
+        ];
+        for problem in &problems {
+            assert_eq!(problem.plugin(), Some("p"), "{problem:?}");
         }
     }
 

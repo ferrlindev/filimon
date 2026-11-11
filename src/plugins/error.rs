@@ -115,6 +115,43 @@ pub enum ConfigError {
         span: SourceSpan,
     },
 
+    /// `[host.oauth] client_secret_env` names an env var that is set nowhere.
+    /// The text carries the env var NAME only, never a value (D-12).
+    #[error(
+        "plugin `{plugin}`: `host.oauth.client_secret_env` needs env var `{env_var}`, which is not set in the process environment or {dotenv}"
+    )]
+    #[diagnostic(
+        code(fili::config::missing_oauth_secret),
+        help("add `{env_var}=...` to {dotenv}")
+    )]
+    MissingOAuthSecret {
+        plugin: String,
+        env_var: String,
+        dotenv: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared here")]
+        span: SourceSpan,
+    },
+
+    /// `[host.oauth] client_secret_env` names an env var whose effective value
+    /// is empty. `origin` and `fix` are as in `EmptySecret`.
+    #[error(
+        "plugin `{plugin}`: `host.oauth.client_secret_env`: env var `{env_var}` is set but empty in {origin}"
+    )]
+    #[diagnostic(code(fili::config::empty_oauth_secret))]
+    EmptyOAuthSecret {
+        plugin: String,
+        env_var: String,
+        origin: String,
+        #[help]
+        fix: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared here")]
+        span: SourceSpan,
+    },
+
     /// An enabled source's `fetcher` names no `[fetchers.<name>]` table.
     #[error(
         "`sources.{plugin}.fetcher` references fetcher `{fetcher}`, which is not defined under [fetchers]"
@@ -211,6 +248,8 @@ impl ConfigError {
             | Self::InvalidValue { plugin, .. }
             | Self::MissingSecret { plugin, .. }
             | Self::EmptySecret { plugin, .. }
+            | Self::MissingOAuthSecret { plugin, .. }
+            | Self::EmptyOAuthSecret { plugin, .. }
             | Self::UnknownFetcher { plugin, .. }
             | Self::DisabledFetcher { plugin, .. }
             | Self::InvalidName { plugin, .. }
