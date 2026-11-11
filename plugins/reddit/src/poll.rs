@@ -5,7 +5,7 @@
 
 use crate::api::{self, Item};
 use crate::cursor::{self, Cursor, Mark};
-use crate::http::{Http, HttpError};
+use crate::http::{Http, HttpError, header};
 use crate::settings::Settings;
 use std::collections::HashSet;
 
@@ -47,15 +47,57 @@ fn map_http_error(error: HttpError) -> PollError {
     }
 }
 
-/// A response header parsed as a float (Reddit can send `59.0`).
-fn parse_header_f64(_headers: &[(String, String)], _name: &str) -> Option<f64> {
-    None
+/// A response header parsed as a float (Reddit can send `59.0`). An absent,
+/// non-numeric or non-finite value is `None`.
+fn parse_header_f64(headers: &[(String, String)], name: &str) -> Option<f64> {
+    header(headers, name)?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 /// Whole seconds for a reset header: rounded up, negatives clamp to 0, huge
 /// values saturate at `u32::MAX`.
-fn reset_seconds(_value: f64) -> u32 {
-    0
+fn reset_seconds(value: f64) -> u32 {
+    if value <= 0.0 {
+        0
+    } else if value >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        value.ceil() as u32
+    }
+}
+
+/// Classify a response before any parsing (D-13, D-04). `None` means a 2xx
+/// answer that is not rate limited, so parsing may continue. The texts hold
+/// fixed phrases, the feed key and numbers only: never a body, a header value
+/// or a url.
+fn classify_response(
+    status: u16,
+    headers: &[(String, String)],
+    feed_key: &str,
+) -> Option<PollError> {
+    // D-13: reactive and stateless. The host backoff does the waiting.
+    let remaining_exhausted = parse_header_f64(headers, "x-ratelimit-remaining")
+        .is_some_and(|remaining| remaining < 1.0);
+    if status == 429 || remaining_exhausted {
+        let reset = parse_header_f64(headers, "x-ratelimit-reset").map(reset_seconds);
+        return Some(PollError::RateLimited(reset));
+    }
+    match status {
+        200..=299 => None,
+        401 => Some(PollError::AuthRequired),
+        404 => Some(PollError::Config(format!(
+            "Reddit reports no such listing for {feed_key} (HTTP 404); check the subreddits setting"
+        ))),
+        403 => Some(PollError::Transient(format!(
+            "Reddit refused access to {feed_key} (HTTP 403); the subreddit may be private or banned, or the login lacks the history scope"
+        ))),
+        other => Some(PollError::Transient(format!(
+            "Reddit HTTP {other} for {feed_key}"
+        ))),
+    }
 }
 
 /// Run one poll.
@@ -110,11 +152,8 @@ pub fn poll(
             settings.user_agent(),
         );
         let response = http.get(&request).map_err(map_http_error)?;
-        if response.status != 200 {
-            return Err(PollError::Transient(format!(
-                "Reddit HTTP {}",
-                response.status
-            )));
+        if let Some(error) = classify_response(response.status, &response.headers, &feed.key) {
+            return Err(error);
         }
         // The feed's listing decides the sticky rule (D-12). Settings only
         // produce `new` and `hot`, so the fallback is never taken.
