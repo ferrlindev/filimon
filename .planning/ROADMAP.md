@@ -149,7 +149,7 @@ Plans:
   2. The host rejects, with a clear error, any request to a domain outside the source's allowlist and any request that exceeds its timeout. This holds for both the default fetcher and a custom fetcher.
   3. The bundled default HTTP fetcher component makes real HTTPS requests with TLS certificate validation on: a request to a host with an invalid certificate fails. The crawler's disabled certificate validation is not carried over.
   4. With the crawler configured to use a fetcher component, `fili produce <url>` fetches pages through that component and articles still reach the consumer.
-**Plans:** 3/8 plans executed
+**Plans:** 6/8 plans executed
 
 Plans:
 **Wave 1**
@@ -160,9 +160,9 @@ Plans:
 - [x] 05-03-PLAN.md — Host `outbound-http.send`: shared certificate-validating client, redirects re-checked on every hop, response cap, one deadline per call, loopback `TestHttpServer` (FETCH-02, FETCH-03)
 
 **Wave 3** *(blocked on 05-03)*
-- [ ] 05-04-PLAN.md — Request rules: forbidden and malformed headers, size limits, header and body fidelity, 429 pass-through, log hygiene (FETCH-02)
-- [ ] 05-05-PLAN.md — TLS proof: self-signed rejected, explicitly trusted accepted, wrong name rejected, also through the real default fetcher; always-on source guard; public-internet group (FETCH-03)
-- [ ] 05-06-PLAN.md — Swapping the assigned fetcher by registry alone, allowlist and timeout hold for a default and a custom fetcher, per-call deadlines, `fili plugins run-once` routing (FETCH-01, FETCH-02)
+- [x] 05-04-PLAN.md — Request rules: forbidden and malformed headers, size limits, header and body fidelity, 429 pass-through, log hygiene (FETCH-02)
+- [x] 05-05-PLAN.md — TLS proof: self-signed rejected, explicitly trusted accepted, wrong name rejected, also through the real default fetcher; always-on source guard; public-internet group (FETCH-03)
+- [x] 05-06-PLAN.md — Swapping the assigned fetcher by registry alone, allowlist and timeout hold for a default and a custom fetcher, per-call deadlines, `fili plugins run-once` routing (FETCH-01, FETCH-02)
 
 **Wave 4** *(blocked on 05-01, 05-03 and 05-04)*
 - [ ] 05-07-PLAN.md — `[crawler]` registry table and `fili produce` through a fetcher component under the seed-host allowlist, with no silent fallback to the built-in client (FETCH-04)
@@ -216,7 +216,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
-| 5. Fetcher Layer | 3/8 | In Progress | - |
+| 5. Fetcher Layer | 6/8 | In Progress | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
