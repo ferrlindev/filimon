@@ -76,6 +76,49 @@ pub fn listing_request(
     }
 }
 
+/// Which listing a feed reads. The sticky rule differs (D-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    New,
+    Hot,
+}
+
+impl Listing {
+    /// The listing named by a feed (`"new"` or `"hot"`).
+    pub fn from_name(name: &str) -> Option<Listing> {
+        match name {
+            "new" => Some(Listing::New),
+            "hot" => Some(Listing::Hot),
+            _ => None,
+        }
+    }
+}
+
+/// Largest `raw` JSON text an item carries. Over it, `raw` is dropped and the
+/// item is kept: well under the host's 1,000,000-byte record cap (T-07-16).
+pub const RAW_MAX_BYTES: usize = 256 * 1024;
+
+/// Largest accepted `created_utc`, in seconds (year 2286). Larger values are
+/// not real post times, and the cursor size budget assumes a 10-digit mark.
+pub const MAX_CREATED_UTC: f64 = 9_999_999_999.0;
+
+/// The body is not a listing: not JSON, or no `data.children` array. The
+/// text of an error built from it never echoes the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    Unreadable,
+}
+
+/// The usable posts of one page and how many children were skipped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPage {
+    pub posts: Vec<Post>,
+    /// Children that were not a usable `t3` post: another kind, or missing a
+    /// name, title, permalink or a usable `created_utc`. A stickied post that
+    /// the `new` listing leaves out on purpose (D-12) is not counted here.
+    pub skipped: usize,
+}
+
 fn text_of(data: &Value, key: &str) -> String {
     data.get(key)
         .and_then(Value::as_str)
@@ -83,51 +126,62 @@ fn text_of(data: &Value, key: &str) -> String {
         .to_string()
 }
 
-/// Parse a listing body. Keeps children whose `kind` is `t3`. The error text
-/// never echoes the body.
-pub fn parse_listing(body: &[u8]) -> Result<Vec<Post>, String> {
-    let root: Value =
-        serde_json::from_slice(body).map_err(|_| "malformed listing: not JSON".to_string())?;
+/// One child as a post, or `None` when it is not a usable `t3` post. No
+/// indexing, no `unwrap`: the child is attacker-influenced JSON (T-07-15).
+fn parse_post(child: &Value) -> Option<Post> {
+    if child.get("kind").and_then(Value::as_str) != Some("t3") {
+        return None;
+    }
+    let data = child.get("data").filter(|data| data.is_object())?;
+    let name = text_of(data, "name");
+    let title = text_of(data, "title");
+    let permalink = text_of(data, "permalink");
+    let created_utc = data.get("created_utc").and_then(Value::as_f64)?;
+    let usable_time = created_utc.is_finite() && (0.0..=MAX_CREATED_UTC).contains(&created_utc);
+    if name.is_empty() || title.is_empty() || !permalink.starts_with('/') || !usable_time {
+        return None;
+    }
+    Some(Post {
+        name,
+        title,
+        selftext: text_of(data, "selftext"),
+        permalink,
+        created_utc,
+        is_self: data
+            .get("is_self")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        stickied: data
+            .get("stickied")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        url: text_of(data, "url"),
+        author: text_of(data, "author"),
+        raw: data.clone(),
+    })
+}
+
+/// Parse a listing body. The top level must be an object whose `data.children`
+/// is an array, otherwise [`ParseError::Unreadable`]: an error page that
+/// happens to be JSON is never mistaken for an empty page. A stickied post is
+/// left out of a `new` listing and kept on `hot` (D-12).
+pub fn parse_listing(body: &[u8], listing: Listing) -> Result<ParsedPage, ParseError> {
+    let root: Value = serde_json::from_slice(body).map_err(|_| ParseError::Unreadable)?;
     let children = root
         .get("data")
         .and_then(|data| data.get("children"))
         .and_then(Value::as_array)
-        .ok_or_else(|| "malformed listing: no data.children".to_string())?;
+        .ok_or(ParseError::Unreadable)?;
     let mut posts = Vec::new();
+    let mut skipped = 0;
     for child in children {
-        if child.get("kind").and_then(Value::as_str) != Some("t3") {
-            continue;
+        match parse_post(child) {
+            None => skipped += 1,
+            Some(post) if post.stickied && listing == Listing::New => {}
+            Some(post) => posts.push(post),
         }
-        let Some(data) = child.get("data") else {
-            continue;
-        };
-        let name = text_of(data, "name");
-        if name.is_empty() {
-            continue;
-        }
-        posts.push(Post {
-            name,
-            title: text_of(data, "title"),
-            selftext: text_of(data, "selftext"),
-            permalink: text_of(data, "permalink"),
-            created_utc: data
-                .get("created_utc")
-                .and_then(Value::as_f64)
-                .unwrap_or(f64::NAN),
-            is_self: data
-                .get("is_self")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            stickied: data
-                .get("stickied")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            url: text_of(data, "url"),
-            author: text_of(data, "author"),
-            raw: data.clone(),
-        });
     }
-    Ok(posts)
+    Ok(ParsedPage { posts, skipped })
 }
 
 /// Whole seconds of a representable `created_utc`, or `None` for a value that
@@ -138,6 +192,7 @@ pub fn created_seconds(post: &Post) -> Option<i64> {
 
 /// Map a post to an item (D-08). `None` when `created_utc` is not
 /// representable, so that post is skipped rather than emitted with a bad time.
+/// `raw` is `None` when the post object is larger than [`RAW_MAX_BYTES`].
 pub fn post_to_item(post: &Post) -> Option<Item> {
     created_seconds(post)?;
     let published = (post.created_utc * 1000.0).round() as u64;
@@ -154,7 +209,9 @@ pub fn post_to_item(post: &Post) -> Option<Item> {
         author: (!post.author.is_empty()).then(|| post.author.clone()),
         published: Some(published),
         platform: "reddit".to_string(),
-        raw: serde_json::to_string(&post.raw).ok(),
+        raw: serde_json::to_string(&post.raw)
+            .ok()
+            .filter(|raw| raw.len() <= RAW_MAX_BYTES),
     })
 }
 
@@ -178,18 +235,42 @@ mod tests {
     }
 
     #[test]
-    fn created_utc_seconds_become_epoch_milliseconds_rounded_to_the_nearest() {
+    fn published_is_created_utc_in_epoch_milliseconds_rounded() {
+        let published = |created_utc: f64| post_to_item(&post(created_utc)).unwrap().published;
+        assert_eq!(published(1_700_000_000.0), Some(1_700_000_000_000));
+        assert_eq!(published(1_700_000_000.123), Some(1_700_000_000_123));
+        assert_eq!(published(1_700_000_000.0004), Some(1_700_000_000_000));
+        assert_eq!(published(1_700_000_000.9996), Some(1_700_000_001_000));
+        assert_eq!(published(1_700_000_000.1236), Some(1_700_000_000_124));
+    }
+
+    #[test]
+    fn created_utc_that_is_negative_or_not_a_number_is_skipped_without_a_panic() {
+        // Each bad child sits beside a good one, which must still map.
+        for bad in [
+            "-1",
+            r#""1700000000""#,
+            "null",
+            "[]",
+            "1e300",
+            "10000000000",
+        ] {
+            let body = format!(
+                r#"{{"data":{{"children":[
+                {{"kind":"t3","data":{{"name":"t3_bad","title":"t","permalink":"/r/a/x/","created_utc":{bad}}}}},
+                {{"kind":"t3","data":{{"name":"t3_ok","title":"t","permalink":"/r/a/y/","created_utc":1.0}}}}]}}}}"#
+            );
+            let page = parse_listing(body.as_bytes(), Listing::New).unwrap();
+            assert_eq!(page.skipped, 1, "created_utc {bad}");
+            assert_eq!(page.posts.len(), 1, "created_utc {bad}");
+            assert_eq!(page.posts[0].name, "t3_ok");
+        }
+        // 1e400 is not even a representable JSON number for the parser: the
+        // whole body is unreadable, which is an error and never a panic.
+        let overflow = br#"{"data":{"children":[{"kind":"t3","data":{"name":"t3_a","title":"t","created_utc":1e400}}]}}"#;
         assert_eq!(
-            post_to_item(&post(1_700_000_000.0)).unwrap().published,
-            Some(1_700_000_000_000)
-        );
-        assert_eq!(
-            post_to_item(&post(1_700_000_000.1234)).unwrap().published,
-            Some(1_700_000_000_123)
-        );
-        assert_eq!(
-            post_to_item(&post(1_700_000_000.1236)).unwrap().published,
-            Some(1_700_000_000_124)
+            parse_listing(overflow, Listing::New),
+            Err(ParseError::Unreadable)
         );
     }
 
@@ -209,19 +290,32 @@ mod tests {
 
     #[test]
     fn a_malformed_body_is_an_error_that_does_not_echo_it() {
-        let err = parse_listing(b"<html>secret-token</html>").unwrap_err();
-        assert!(!err.contains("secret-token"));
-        assert!(parse_listing(br#"{"kind":"Listing"}"#).is_err());
+        let err = parse_listing(b"<html>secret-token</html>", Listing::New).unwrap_err();
+        assert_eq!(err, ParseError::Unreadable);
+        assert!(!format!("{err:?}").contains("secret-token"));
+        assert!(parse_listing(br#"{"kind":"Listing"}"#, Listing::New).is_err());
     }
 
     #[test]
-    fn only_t3_children_are_kept() {
+    fn only_usable_t3_children_are_kept_and_the_rest_are_counted() {
         let body = br#"{"data":{"children":[
-            {"kind":"t3","data":{"name":"t3_a","created_utc":1.0}},
+            {"kind":"t3","data":{"name":"t3_a","title":"t","permalink":"/r/a/x/","created_utc":1.0}},
             {"kind":"t1","data":{"name":"t1_b","created_utc":2.0}},
             {"kind":"t5","data":{"name":"t5_c"}}]}}"#;
-        let posts = parse_listing(body).unwrap();
-        assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].name, "t3_a");
+        let page = parse_listing(body, Listing::New).unwrap();
+        assert_eq!(page.posts.len(), 1);
+        assert_eq!(page.posts[0].name, "t3_a");
+        assert_eq!(page.skipped, 2);
+    }
+
+    #[test]
+    fn a_stickied_post_is_left_out_of_new_and_kept_on_hot() {
+        let body = br#"{"data":{"children":[
+            {"kind":"t3","data":{"name":"t3_a","title":"t","permalink":"/r/a/x/","created_utc":1.0,"stickied":true}}]}}"#;
+        let on_new = parse_listing(body, Listing::New).unwrap();
+        assert!(on_new.posts.is_empty());
+        assert_eq!(on_new.skipped, 0, "a sticky left out by rule is not a skip");
+        let on_hot = parse_listing(body, Listing::Hot).unwrap();
+        assert_eq!(on_hot.posts.len(), 1);
     }
 }

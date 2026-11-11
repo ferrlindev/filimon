@@ -69,6 +69,8 @@ pub fn poll(
     let mut next = Cursor::default();
     let mut items: Vec<Item> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Warning counters: only numbers ever reach a warning, never post content.
+    let mut skipped = 0usize;
 
     for feed in settings.feeds() {
         let mark = old.0.get(&feed.key);
@@ -93,7 +95,14 @@ pub fn poll(
                 response.status
             )));
         }
-        let posts = api::parse_listing(&response.body).map_err(PollError::Transient)?;
+        // The feed's listing decides the sticky rule (D-12). Settings only
+        // produce `new` and `hot`, so the fallback is never taken.
+        let listing = api::Listing::from_name(feed.listing).unwrap_or(api::Listing::New);
+        let page = api::parse_listing(&response.body, listing).map_err(|_| {
+            PollError::Transient("Reddit answer is not a readable listing".to_string())
+        })?;
+        skipped += page.skipped;
+        let posts = page.posts;
 
         // Strictly newer than the mark by whole seconds (D-12): `>=` would
         // re-emit a same-second sibling on every poll.
@@ -127,6 +136,20 @@ pub fn poll(
                 }
             }
         }
+    }
+
+    if skipped > 0 {
+        warnings.push(format!(
+            "{skipped} listing children were not usable posts and were skipped"
+        ));
+    }
+    // `raw` is `None` only when the post object was over the size cap.
+    let raw_dropped = items.iter().filter(|item| item.raw.is_none()).count();
+    if raw_dropped > 0 {
+        warnings.push(format!(
+            "{raw_dropped} items had a raw object over {} bytes; raw was dropped",
+            api::RAW_MAX_BYTES
+        ));
     }
 
     let next_cursor = cursor::encode(&next).map_err(PollError::Fatal)?;
