@@ -6,6 +6,7 @@
 // re-reads it before every poll and hands the guest only the current access
 // token, as `poll`'s `access-token` argument.
 //
+// - `client`: the token endpoint client (code exchange, refresh, revoke).
 // - `store`: the token file and the redacting token types.
 // - `provider`: the pre-poll decision (token, not logged in, needs login,
 //   refresh due, or a file problem).
@@ -23,6 +24,7 @@
 )]
 
 pub mod callback;
+pub mod client;
 pub mod error;
 pub mod pkce;
 pub mod provider;

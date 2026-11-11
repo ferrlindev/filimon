@@ -8,6 +8,7 @@ use std::sync::Arc;
 use super::provider::TokenProvider;
 use super::store::{AccessToken, StoredTokens, TokenStore};
 use crate::plugins::config::OAuthConfig;
+use crate::plugins::secrets::Secret;
 
 /// An OAuth config over example https endpoints.
 pub(crate) fn oauth_config() -> OAuthConfig {
@@ -21,6 +22,35 @@ pub(crate) fn oauth_config() -> OAuthConfig {
         redirect_port: 0,
         authorize_params: vec![],
     }
+}
+
+/// `oauth_config()` with `token_url` set to `token_url` (a loopback test
+/// server) and, when given, a client secret.
+pub(crate) fn oauth_config_for(token_url: &str, secret: Option<&str>) -> OAuthConfig {
+    OAuthConfig {
+        token_url: url::Url::parse(token_url).expect("token url"),
+        client_secret: secret.map(Secret::for_test),
+        ..oauth_config()
+    }
+}
+
+/// A token endpoint answer as JSON text.
+pub(crate) fn token_body(access: &str, refresh: Option<&str>, expires_in: Option<u64>) -> String {
+    let mut body = serde_json::json!({ "access_token": access });
+    if let Some(refresh) = refresh {
+        body["refresh_token"] = serde_json::json!(refresh);
+    }
+    if let Some(expires_in) = expires_in {
+        body["expires_in"] = serde_json::json!(expires_in);
+    }
+    body.to_string()
+}
+
+/// The key and value pairs of a form-encoded request body.
+pub(crate) fn form_pairs(body: &[u8]) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(body)
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
 }
 
 /// The real wall clock, as Unix seconds.
