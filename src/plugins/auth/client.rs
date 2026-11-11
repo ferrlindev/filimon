@@ -178,8 +178,22 @@ impl TokenClient {
     /// # Errors
     /// A [`RefreshFailure`] classifying why no token was obtained.
     pub async fn refresh(&self, refresh_token: &RefreshToken) -> Result<TokenSet, RefreshFailure> {
-        let _ = refresh_token;
-        Err(RefreshFailure::Transient("not implemented".to_string()))
+        let form = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.expose()),
+        ];
+        let (status, body) = match self.post_form(&self.oauth.token_url, form).await {
+            Ok(answer) => answer,
+            Err(SendFailure::Transport(text)) => return Err(RefreshFailure::Transient(text)),
+            Err(SendFailure::TooLarge) => return Err(RefreshFailure::Transient(too_large_text())),
+        };
+        if status.is_success() {
+            // A broken answer is not a reason to throw the login away (D-09).
+            return parse_token_set(&body).map_err(|_| {
+                RefreshFailure::Transient("answer has no usable access token".to_string())
+            });
+        }
+        Err(classify_refresh_error(status, &body))
     }
 
     /// Revokes `token` at the provider's revocation endpoint. `Ok(false)` when
@@ -268,6 +282,38 @@ enum SendFailure {
     Transport(String),
     /// The answer is larger than [`MAX_RESPONSE_BYTES`].
     TooLarge,
+}
+
+/// Classifies a non-success refresh answer (D-09). Only the cleaned OAuth
+/// error text or `HTTP <status>` is ever carried.
+fn classify_refresh_error(status: reqwest::StatusCode, body: &[u8]) -> RefreshFailure {
+    let http = || format!("HTTP {}", status.as_u16());
+    // Redirects are never followed; a redirect answer is a rejection.
+    if status.is_redirection() {
+        return RefreshFailure::Rejected(http());
+    }
+    let code = oauth_error_code(body);
+    let described = parse_oauth_error(body);
+    let transient_status = status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+    let transient_code = matches!(
+        code.as_deref(),
+        Some("temporarily_unavailable" | "server_error")
+    );
+    if transient_status || transient_code {
+        return RefreshFailure::Transient(described.unwrap_or_else(http));
+    }
+    if matches!(status.as_u16(), 400 | 401) && code.as_deref() == Some("invalid_grant") {
+        return RefreshFailure::Permanent(described.unwrap_or_else(http));
+    }
+    RefreshFailure::Rejected(described.unwrap_or_else(http))
+}
+
+/// The raw OAuth `error` code of a JSON error body, for classification only.
+fn oauth_error_code(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    Some(value.get("error")?.as_str()?.to_string())
 }
 
 fn too_large_text() -> String {
