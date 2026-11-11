@@ -91,14 +91,17 @@ pub fn s256_challenge(verifier: &str) -> String {
 /// Any query already on the endpoint is kept. The standard parameters come
 /// first, in a fixed order, then the plugin's `authorize_params` in the order
 /// stored (config loading guarantees none collides with a standard key).
+///
+/// `None` when the config has no authorize URL, which is the case for the
+/// `client_credentials` grant.
 #[must_use]
 pub fn build_authorize_url(
     oauth: &OAuthConfig,
     redirect_uri: &str,
     state: &str,
     challenge: &str,
-) -> url::Url {
-    let mut url = oauth.authorize_url.clone();
+) -> Option<url::Url> {
+    let mut url = oauth.authorize_url.clone()?;
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("response_type", "code");
@@ -114,7 +117,7 @@ pub fn build_authorize_url(
             query.append_pair(key, value);
         }
     }
-    url
+    Some(url)
 }
 
 #[cfg(test)]
@@ -176,7 +179,7 @@ mod tests {
     fn authorize_url_carries_every_standard_parameter() {
         let mut oauth = oauth_config();
         oauth.scopes = vec!["read".to_string(), "identity".to_string()];
-        let url = build_authorize_url(&oauth, REDIRECT, "S", "C");
+        let url = build_authorize_url(&oauth, REDIRECT, "S", "C").expect("an authorize url");
         let got = pairs(&url);
         for expected in [
             ("response_type", "code"),
@@ -201,7 +204,7 @@ mod tests {
     fn authorize_url_appends_authorize_params_after_the_standard_ones() {
         let mut oauth = oauth_config();
         oauth.authorize_params = vec![("duration".to_string(), "permanent".to_string())];
-        let url = build_authorize_url(&oauth, REDIRECT, "S", "C");
+        let url = build_authorize_url(&oauth, REDIRECT, "S", "C").expect("an authorize url");
         let got = pairs(&url);
         assert_eq!(
             got.last(),
@@ -218,8 +221,8 @@ mod tests {
     fn authorize_url_keeps_an_existing_query_of_the_endpoint() {
         let mut oauth = oauth_config();
         oauth.authorize_url =
-            url::Url::parse("https://auth.example/authorize?tenant=t1").expect("url");
-        let url = build_authorize_url(&oauth, REDIRECT, "S", "C");
+            Some(url::Url::parse("https://auth.example/authorize?tenant=t1").expect("url"));
+        let url = build_authorize_url(&oauth, REDIRECT, "S", "C").expect("an authorize url");
         let got = pairs(&url);
         assert_eq!(got.first(), Some(&("tenant".to_string(), "t1".to_string())));
         assert!(got.contains(&("state".to_string(), "S".to_string())));
@@ -229,7 +232,7 @@ mod tests {
     fn authorize_url_omits_scope_when_there_are_no_scopes() {
         let mut oauth = oauth_config();
         oauth.scopes = vec![];
-        let url = build_authorize_url(&oauth, REDIRECT, "S", "C");
+        let url = build_authorize_url(&oauth, REDIRECT, "S", "C").expect("an authorize url");
         assert!(pairs(&url).iter().all(|(k, _)| k != "scope"));
     }
 }

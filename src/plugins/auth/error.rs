@@ -97,6 +97,15 @@ pub enum AuthError {
     #[diagnostic(code(fili::auth::token_response))]
     TokenResponse { reason: String },
 
+    /// A login was asked for a plugin that uses the `client_credentials`
+    /// grant: it has no user, so there is nothing to log in to (D-03).
+    #[error("the plugin uses the client_credentials grant, so there is nothing to log in to")]
+    #[diagnostic(
+        code(fili::auth::no_login),
+        help("run `fili auth status` to see which plugins have a login")
+    )]
+    GrantHasNoLogin,
+
     /// Revoking the login at the provider failed. The caller decides whether
     /// to warn (D-03).
     #[error("revoking the login at the provider failed: {reason}")]

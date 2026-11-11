@@ -259,12 +259,25 @@ pub struct PluginConfig {
     pub oauth: Option<OAuthConfig>,
 }
 
+/// Which OAuth grant a plugin's `[host.oauth]` table uses (D-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthGrant {
+    /// The interactive PKCE authorization-code flow. The default.
+    AuthorizationCode,
+    /// The app-only `client_credentials` grant: no user, no login.
+    ClientCredentials,
+}
+
 /// A plugin's host-managed OAuth configuration (D-11). Every endpoint is an
 /// `https://` URL with a host and no user-info (D-13). `client_secret` is the
 /// only secret; it is never part of `PluginConfig::secrets` (D-12).
+///
+/// `authorize_url` is `Some` exactly for the authorization-code grant, and
+/// `redirect_port` is only used by it.
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
-    pub authorize_url: url::Url,
+    pub grant: OAuthGrant,
+    pub authorize_url: Option<url::Url>,
     pub token_url: url::Url,
     pub scopes: Vec<String>,
     pub client_id: String,
@@ -1074,7 +1087,8 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
         return None;
     }
     Some(OAuthConfig {
-        authorize_url,
+        grant: OAuthGrant::AuthorizationCode,
+        authorize_url: Some(authorize_url),
         token_url,
         scopes: section
             .scopes
@@ -1972,8 +1986,8 @@ fetcher = "nope"
         let plugin = registry.sources["alpha"].plugin.as_ref().expect("loaded");
         let oauth = plugin.oauth.as_ref().expect("the oauth table");
         assert_eq!(
-            oauth.authorize_url.as_str(),
-            "https://auth.example/authorize"
+            oauth.authorize_url.as_ref().map(url::Url::as_str),
+            Some("https://auth.example/authorize")
         );
         assert_eq!(oauth.token_url.as_str(), "https://auth.example/token");
         assert_eq!(oauth.scopes, ["read"]);
@@ -2058,7 +2072,10 @@ fetcher = "nope"
             .as_ref()
             .and_then(|p| p.oauth.as_ref())
             .expect("oauth");
-        assert_eq!(oauth.authorize_url.scheme(), "https");
+        assert_eq!(
+            oauth.authorize_url.as_ref().map(url::Url::scheme),
+            Some("https")
+        );
     }
 
     // ── [host.oauth] remaining keys (D-04, D-11, D-13, D-14) ──────────────────
@@ -2313,6 +2330,176 @@ fetcher = "nope"
                 "host.oauth.token_url",
                 "host.oauth.redirect_port"
             ]
+        );
+    }
+
+    // ── [host.oauth] grant (D-03) ─────────────────────────────────────────────
+
+    /// A plugin file whose `[host.oauth]` uses the `client_credentials` grant
+    /// with a https `token_url` and `client_id`, followed by `extra` lines
+    /// (which must stay inside the table, so they come last).
+    fn client_credentials_file(extra: &str) -> String {
+        format!(
+            "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
+             grant = \"client_credentials\"\n\
+             token_url = \"https://auth.example/token\"\n\
+             client_id = \"client-1\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn grant_defaults_to_authorization_code_and_requires_authorize_url() {
+        for extra in ["", "grant = \"authorization_code\"\n"] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(&dir, &oauth_file("[\"read\"]", extra));
+
+            let oauth = loaded_oauth(&dir);
+
+            assert_eq!(oauth.grant, OAuthGrant::AuthorizationCode, "{extra:?}");
+            assert_eq!(
+                oauth.authorize_url.as_ref().map(url::Url::as_str),
+                Some("https://auth.example/authorize"),
+                "{extra:?}"
+            );
+            assert_eq!(oauth.redirect_port, DEFAULT_REDIRECT_PORT, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_grant_is_rejected_naming_the_field_without_echoing_the_value() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", "grant = \"password\"\n"));
+
+        let problems = invalid_problems(&dir);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].0, "host.oauth.grant");
+        assert!(
+            problems[0].1.contains("authorization_code"),
+            "{}",
+            problems[0].1
+        );
+        assert!(
+            problems[0].1.contains("client_credentials"),
+            "{}",
+            problems[0].1
+        );
+        assert!(!problems[0].1.contains("password"), "{}", problems[0].1);
+    }
+
+    #[test]
+    fn client_credentials_loads_with_a_secret_and_no_authorize_url() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file("client_secret_env = \"STUB_CLIENT_SECRET\"\n"),
+        );
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(|| SENTINEL.to_string());
+
+        let registry = load_with(&dir, &env).expect("a client_credentials table loads");
+
+        let oauth = plugin_of(&registry).oauth.as_ref().expect("the oauth table");
+        assert_eq!(oauth.grant, OAuthGrant::ClientCredentials);
+        assert!(oauth.authorize_url.is_none());
+        assert_eq!(oauth.token_url.as_str(), "https://auth.example/token");
+        assert_eq!(oauth.client_id, "client-1");
+        assert_eq!(
+            oauth.client_secret.as_ref().map(Secret::expose),
+            Some(SENTINEL)
+        );
+    }
+
+    #[test]
+    fn client_credentials_without_client_secret_env_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &client_credentials_file(""));
+
+        let problems = invalid_problems(&dir);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].0, "host.oauth.client_secret_env");
+        assert!(
+            problems[0].1.contains("client_credentials"),
+            "{}",
+            problems[0].1
+        );
+    }
+
+    #[test]
+    fn client_credentials_rejects_keys_that_belong_to_the_code_flow() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file(
+                "client_secret_env = \"STUB_CLIENT_SECRET\"\n\
+                 authorize_url = \"https://auth.example/authorize\"\n\
+                 redirect_port = 8123\n\
+                 revocation_url = \"https://auth.example/revoke\"\n\
+                 scopes = [\"read\"]\n\
+                 authorize_params = { prompt = \"consent\" }\n",
+            ),
+        );
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(|| SENTINEL.to_string());
+
+        let errors = load_with(&dir, &env).expect_err("code-flow keys are an error");
+
+        let problems: Vec<(String, String)> = errors
+            .problems
+            .iter()
+            .map(|problem| match problem {
+                ConfigError::InvalidValue {
+                    plugin,
+                    field,
+                    message,
+                    span,
+                    ..
+                } => {
+                    assert_eq!(plugin, "alpha");
+                    assert!(span.is_some(), "{field} is labelled");
+                    (field.clone(), message.clone())
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            })
+            .collect();
+        let fields: Vec<&str> = problems.iter().map(|(field, _)| field.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                "host.oauth.authorize_url",
+                "host.oauth.redirect_port",
+                "host.oauth.authorize_params",
+                "host.oauth.revocation_url",
+                "host.oauth.scopes",
+            ]
+        );
+        for (field, message) in &problems {
+            assert!(
+                message.contains("not used by the client_credentials grant"),
+                "{field}: {message}"
+            );
+            for value in ["auth.example", "8123", "consent", "read", "revoke"] {
+                assert!(!message.contains(value), "{field} echoes {value}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn authorization_code_without_authorize_url_is_an_invalid_value_naming_the_field() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
+             token_url = \"https://auth.example/token\"\nclient_id = \"client-1\"\n",
+        );
+
+        let problems = invalid_problems(&dir);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].0, "host.oauth.authorize_url");
+        assert!(
+            problems[0].1.contains("authorization_code"),
+            "{}",
+            problems[0].1
         );
     }
 
