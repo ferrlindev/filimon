@@ -2184,6 +2184,13 @@ mod sched_auth {
         let bad_path = state_dir.join("auth").join("bad.json");
         std::fs::create_dir_all(state_dir.join("auth")).expect("auth dir");
         std::fs::write(&bad_path, "NOT-JSON-SENTINEL").expect("write the corrupt file");
+        // 0600, so the refusal is the content and not the permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 600");
+        }
         let before = std::fs::read(&bad_path).expect("bytes");
         write_tokens(&state_dir, "good", "AT-good", unix_now() + 3600);
         let bad_factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
@@ -2214,6 +2221,57 @@ mod sched_auth {
         assert_eq!(std::fs::read(&bad_path).expect("bytes"), before);
         let status = std::fs::read_to_string(status_path(&state_dir, "bad")).expect("status");
         assert!(status.contains("token file problem"), "{status}");
+
+        assert_eq!(good.disabled, None);
+        let good_tokens: Vec<Option<String>> = vec![Some("AT-good".to_string()); 3];
+        assert_eq!(good_factory.poll_tokens(), good_tokens);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_loose_permission_token_file_disables_only_that_plugin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        write_tokens(&state_dir, "loose", "AT-loose", unix_now() + 3600);
+        let loose_path = state_dir.join("auth").join("loose.json");
+        std::fs::set_permissions(&loose_path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        let before = std::fs::read(&loose_path).expect("bytes");
+        write_tokens(&state_dir, "good", "AT-good", unix_now() + 3600);
+        let loose_factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let good_factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+
+        let (loose, good) = tokio::join!(
+            run_for(
+                oauth_spec("loose", &state_dir),
+                Arc::clone(&loose_factory),
+                Arc::new(VecSink::default()),
+                Arc::clone(&cursors),
+                secs(150),
+            ),
+            run_for(
+                oauth_spec("good", &state_dir),
+                Arc::clone(&good_factory),
+                Arc::new(VecSink::default()),
+                Arc::clone(&cursors),
+                secs(150),
+            ),
+        );
+
+        let reason = loose.disabled.expect("the loose plugin is disabled");
+        assert!(reason.contains("`loose`"), "{reason}");
+        assert!(reason.contains(&loose_path.display().to_string()), "{reason}");
+        assert!(reason.contains("permissions"), "{reason}");
+        assert!(!reason.contains("AT-loose"), "{reason}");
+        assert!(loose_factory.poll_tokens().is_empty(), "never polled");
+        let mode = std::fs::metadata(&loose_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644, "never chmod'd");
+        assert_eq!(std::fs::read(&loose_path).expect("bytes"), before);
 
         assert_eq!(good.disabled, None);
         let good_tokens: Vec<Option<String>> = vec![Some("AT-good".to_string()); 3];
