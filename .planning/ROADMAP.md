@@ -179,7 +179,7 @@ Plans:
   2. The host refreshes an access token automatically before it expires, so the user does not have to log in again during normal polling.
   3. A logged-in plugin gets a current access token through the WIT token import and never sees the refresh token. A test component that records everything it receives can confirm this.
   4. `fili auth status` lists stored logins and their expiry state per plugin. `fili auth logout <plugin>` deletes that plugin's tokens, and later polls run without authentication.
-**Plans:** 4/9 plans executed
+**Plans:** 5/9 plans executed
 
 Plans:
 **Wave 1**
@@ -191,7 +191,7 @@ Plans:
 - [x] 06-04-PLAN.md — PKCE verifier, S256 challenge, state and authorize URL, plus the one-shot loopback callback listener (AUTH-01)
 
 **Wave 3** *(blocked on 06-03 and 06-04)*
-- [ ] 06-05-PLAN.md — Token endpoint client: code exchange, refresh with permanent/transient/rejected classification, revocation (AUTH-01, AUTH-02, AUTH-04)
+- [x] 06-05-PLAN.md — Token endpoint client: code exchange, refresh with permanent/transient/rejected classification, revocation (AUTH-01, AUTH-02, AUTH-04)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 - [ ] 06-06-PLAN.md — Provider refresh under the lock (lazy, 60 s margin, rotation, `needs_login`) wired into the scheduler and `fili plugins run-once` (AUTH-02, AUTH-03)
@@ -239,6 +239,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
-| 6. Host-Managed OAuth | 4/9 | In Progress | - |
+| 6. Host-Managed OAuth | 5/9 | In Progress | - |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
