@@ -101,7 +101,7 @@ async fn main() -> miette::Result<()> {
 
     match cli.command {
         Command::Produce { ref urls, depth } => {
-            run_produce(urls, depth).await?;
+            run_produce(urls, depth, &cli.registry).await?;
         }
         Command::Consume {
             from_beginning,

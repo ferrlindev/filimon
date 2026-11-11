@@ -670,7 +670,6 @@ impl FetchRoute {
 /// The hosts of the seed urls, as the url parser writes them, without
 /// duplicates and in order of first appearance. Only `http` and `https` urls
 /// with a host count; anything else is skipped.
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 #[must_use]
 pub fn seed_hosts(urls: &[String]) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
@@ -694,7 +693,6 @@ pub fn seed_hosts(urls: &[String]) -> Vec<String> {
 
 /// The request for one crawled page: a plain GET carrying the crawler's
 /// User-Agent.
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 #[must_use]
 pub(crate) fn page_request(url: &str) -> types::Request {
     types::Request {
@@ -720,7 +718,6 @@ pub(crate) fn page_request(url: &str) -> types::Request {
 /// # Errors
 /// `HTTP  <status>` for any status that is not 2xx (the built-in client's own
 /// wording).
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 pub(crate) fn page_from_response(
     url: &str,
     response: &types::Response,
@@ -737,7 +734,6 @@ pub(crate) fn page_from_response(
 
 /// A fetch failure as one line of text. It never carries the url; the text a
 /// fetcher supplied is cleaned for the terminal first.
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 #[must_use]
 pub(crate) fn fetch_error_text(error: &types::FetchError) -> String {
     let clean = |text: &str| clean_guest_text(text, FAILURE_TEXT_CLIP);
@@ -757,7 +753,6 @@ pub(crate) fn fetch_error_text(error: &types::FetchError) -> String {
 /// The news crawler's page fetcher: one fetcher component behind a route
 /// labelled `crawler`, under the same `FetchPolicy` a source gets. It owns the
 /// engine the route's fetcher was compiled for.
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 pub struct CrawlFetcher {
     route: FetchRoute,
     description: String,
@@ -765,7 +760,6 @@ pub struct CrawlFetcher {
     _engine: HostEngine,
 }
 
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 impl CrawlFetcher {
     /// Loads the crawler's fetcher component. The crawler may reach the hosts
     /// of `seeds` and `crawler.extra_hosts`, and no others.

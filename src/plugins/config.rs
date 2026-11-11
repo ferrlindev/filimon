@@ -70,7 +70,6 @@ struct CrawlerEntry {
 /// The two tables `load_crawler` reads. Unlike `Registry` it ignores every
 /// other key, so a broken source entry cannot stop `fili produce`.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 struct CrawlerView {
     crawler: Option<CrawlerEntry>,
     #[serde(default)]
@@ -175,7 +174,6 @@ pub struct LoadedRegistry {
 }
 
 /// The news crawler's fetch configuration, validated and typed.
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 #[derive(Debug, Clone)]
 pub struct LoadedCrawler {
     /// The fetcher's registry name.
@@ -459,7 +457,6 @@ fn read_toml<T: serde::de::DeserializeOwned>(
 /// `RegistryUnreadable` or `RegistryMalformed` when the file cannot be read
 /// or parsed, and the unknown or disabled fetcher problem when `[crawler]`
 /// names a fetcher that cannot be used.
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 pub fn load_crawler(path: &Path) -> Result<Option<LoadedCrawler>, ConfigErrors> {
     let (view, name, text): (CrawlerView, _, _) = read_toml(path)?;
     let Some(entry) = view.crawler else {

@@ -91,14 +91,12 @@ pub fn fetch_page(target: &CrawlTarget) -> Result<RawPage, String> {
 
 /// How `fili produce` fetches a page: with the built-in HTTP client, or through
 /// the fetcher component the registry's `[crawler]` table names.
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 pub enum PageFetcher {
     BuiltIn,
     /// Boxed so the enum stays small.
     Component(Box<CrawlFetcher>),
 }
 
-#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
 impl PageFetcher {
     /// Fetches the page at `target`.
     ///
