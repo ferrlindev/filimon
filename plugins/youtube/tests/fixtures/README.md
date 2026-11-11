@@ -27,6 +27,7 @@ research assumptions about the live API (A9 to A13) stay unconfirmed.
 | `playlist_newer.json` | `playlist_page.json` plus two newer videos (`vidNew00004`, `vidNew00005`) placed first, as the API lists newest first; used for the later-poll case |
 | `playlist_empty.json` | A playlist with no entries: `items` is an empty array |
 | `playlist_placeholders.json` | One ordinary upload plus entries titled `Private video` and `Deleted video` and one entry with no `videoId`; the placeholders are newer than the ordinary entry |
+| `subscriptions_page.json` | `subscriptions.list` (`mine=true`) response with three subscribed channels (`UCSubscribedChannel00001` to `00003`) and a `nextPageToken`; the synthetic subscription list used by the plan 07-09 tests |
 
 ## Provenance of each file
 
@@ -42,6 +43,7 @@ capture.
 | `quota_exceeded_403` (+ `.meta.json`) | synthetic | Google error envelope, status 403, `errors[0].reason` `quotaExceeded`, domain `youtube.quota` |
 | `unauthorized_401` (+ `.meta.json`) | synthetic | Google error envelope, status 401, reason `authError` |
 | `malformed` | synthetic | a playlist page cut off mid-string; carries the sentinel word `SENTINELTRUNCATED`, which no error text may echo |
+| `subscriptions_page` | synthetic | hand-written `youtube#subscriptionListResponse` (plan 07-09): three entries with valid 24-character `snippet.resourceId.channelId` values, a `nextPageToken` and `pageInfo`; the ids and titles double as the privacy sentinels that no warning or error text may echo |
 
 Other statuses and reasons (429, 400 `keyInvalid`, 403 `accessNotConfigured`,
 5xx and so on) are built inline in `tests/replay.rs`.

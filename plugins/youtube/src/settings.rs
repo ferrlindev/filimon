@@ -14,6 +14,25 @@ pub const MAX_LATER_LIMIT: u32 = 50;
 /// Mirror of the host cap `MAX_ITEMS_PER_POLL` in `src/plugins/host/map.rs`:
 /// the host keeps the first 1000 items of a poll and silently drops the rest.
 pub const MAX_ITEMS_PER_POLL: usize = 1000;
+/// Default `subscriptions_limit`: subscribed channels one poll follows (D-06).
+pub const DEFAULT_SUBSCRIPTIONS_LIMIT: u32 = 50;
+/// YouTube's page maximum for `subscriptions.list`.
+pub const SUBSCRIPTIONS_PAGE_SIZE: u32 = 50;
+/// Hard cap on `subscriptions.list` requests in one poll, so a hostile endless
+/// `nextPageToken` cannot loop the plugin (T-07-38).
+pub const MAX_SUBSCRIPTION_PAGES: u32 = 10;
+
+/// Quota units one poll costs. Every Data API call used here is one unit:
+/// `ceil(subscription_channels / 50)` `subscriptions.list` pages plus one
+/// `playlistItems.list` per polled playlist (research O4).
+///
+/// Subscription mode always makes at least one `subscriptions.list` call, even
+/// for an account with no subscriptions, which this formula counts as zero.
+pub fn quota_units_per_poll(subscription_channels: u32, playlists: u32) -> u32 {
+    subscription_channels
+        .div_ceil(SUBSCRIPTIONS_PAGE_SIZE)
+        .saturating_add(playlists)
+}
 
 /// The raw `[settings]` table. Unknown keys are rejected. Values stay untyped
 /// so a wrong type is reported by this module, which never echoes the value
@@ -22,11 +41,13 @@ pub const MAX_ITEMS_PER_POLL: usize = 1000;
 #[serde(deny_unknown_fields)]
 struct Raw {
     channels: Option<Value>,
+    subscriptions: Option<Value>,
+    subscriptions_limit: Option<Value>,
 }
 
 /// A channel ID is `UC` followed by 22 characters from letters, digits, `_`
 /// and `-` (24 characters in total).
-fn valid_channel_id(id: &str) -> bool {
+pub(crate) fn valid_channel_id(id: &str) -> bool {
     id.len() == 24
         && id.starts_with("UC")
         && id
@@ -43,13 +64,24 @@ pub fn uploads_playlist(channel_id: &str) -> String {
     }
 }
 
-fn parse_channels(value: Option<Value>) -> Result<Vec<String>, String> {
-    const RULE: &str = "settings.channels: required, a non-empty list of channel IDs (24 characters starting with UC)";
-    let Some(Value::Array(entries)) = value else {
-        return Err(RULE.to_string());
+/// `channels` is a list of channel IDs. With `subscriptions = true` it may be
+/// absent or empty; otherwise it must be a non-empty list.
+fn parse_channels(value: Option<Value>, subscriptions: bool) -> Result<Vec<String>, String> {
+    const WRONG_TYPE: &str =
+        "settings.channels: expected a list of channel IDs (24 characters starting with UC)";
+    const REQUIRED: &str = "settings.channels: a non-empty list of channel IDs (24 characters starting with UC) is required unless settings.subscriptions is true; set channels or subscriptions = true";
+    let entries = match value {
+        None if subscriptions => return Ok(Vec::new()),
+        None => return Err(REQUIRED.to_string()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => return Err(WRONG_TYPE.to_string()),
     };
     if entries.is_empty() {
-        return Err(RULE.to_string());
+        return if subscriptions {
+            Ok(Vec::new())
+        } else {
+            Err(REQUIRED.to_string())
+        };
     }
     let mut ids: Vec<String> = Vec::new();
     for (index, entry) in entries.into_iter().enumerate() {
@@ -80,10 +112,34 @@ pub struct Playlist {
     pub playlist_id: String,
 }
 
+/// `subscriptions`: absent or `false` is off, `true` is on.
+fn parse_subscriptions(value: Option<Value>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(Value::Boolean(on)) => Ok(on),
+        Some(_) => Err("settings.subscriptions: expected true or false".to_string()),
+    }
+}
+
+/// `subscriptions_limit`: only with `subscriptions = true`, 1 through
+/// `MAX_FEEDS`, default 50.
+fn parse_subscriptions_limit(value: Option<Value>) -> Result<u32, String> {
+    let rule = format!("settings.subscriptions_limit: expected a whole number from 1 to {MAX_FEEDS}");
+    let Some(value) = value else {
+        return Ok(DEFAULT_SUBSCRIPTIONS_LIMIT);
+    };
+    match value {
+        Value::Integer(limit) if (1..=MAX_FEEDS as i64).contains(&limit) => Ok(limit as u32),
+        _ => Err(rule),
+    }
+}
+
 /// Validated settings.
 #[derive(Debug, Clone)]
 pub struct Settings {
     channels: Vec<String>,
+    /// The subscribed-channel limit, when `subscriptions = true`.
+    subscriptions: Option<u32>,
 }
 
 impl Settings {
@@ -96,14 +152,36 @@ impl Settings {
                 let message = error.message();
                 // serde's unknown-field text quotes the key: keep it out.
                 return Err(if message.contains("unknown field") {
-                    "settings: unknown key; the only supported key is `channels`".to_string()
+                    "settings: unknown key; the supported keys are `channels`, `subscriptions` and `subscriptions_limit`"
+                        .to_string()
                 } else {
                     format!("settings: {message}")
                 });
             }
         };
+        let subscriptions_on = parse_subscriptions(raw.subscriptions)?;
+        if raw.subscriptions_limit.is_some() && !subscriptions_on {
+            return Err(
+                "settings.subscriptions_limit: only allowed together with subscriptions = true"
+                    .to_string(),
+            );
+        }
+        let channels = parse_channels(raw.channels, subscriptions_on)?;
+        let subscriptions = if subscriptions_on {
+            let limit = parse_subscriptions_limit(raw.subscriptions_limit)?;
+            // Worst case before deduplication: every subscribed channel is new.
+            if channels.len() + limit as usize > MAX_FEEDS {
+                return Err(format!(
+                    "settings.subscriptions_limit: channels plus subscriptions_limit must not exceed {MAX_FEEDS}"
+                ));
+            }
+            Some(limit)
+        } else {
+            None
+        };
         Ok(Settings {
-            channels: parse_channels(raw.channels)?,
+            channels,
+            subscriptions,
         })
     }
 
@@ -116,6 +194,18 @@ impl Settings {
                 playlist_id: uploads_playlist(channel_id),
             })
             .collect()
+    }
+
+    /// The subscribed-channel limit when `subscriptions = true`, else `None`.
+    pub fn subscriptions(&self) -> Option<u32> {
+        self.subscriptions
+    }
+
+    /// Most playlists one poll can follow: the explicit channels plus the
+    /// subscription limit. It sizes the later-poll page so the worst case
+    /// stays under the host's item cap.
+    pub fn max_playlists(&self) -> usize {
+        self.channels.len() + self.subscriptions.map_or(0, |limit| limit as usize)
     }
 
     /// Page size of a poll that has a mark: the largest page, shrunk so one
@@ -215,6 +305,89 @@ mod tests {
             assert!(per * feeds <= MAX_ITEMS_PER_POLL, "{feeds} feeds");
             assert!(FIRST_POLL_LIMIT as usize * feeds <= MAX_ITEMS_PER_POLL);
         }
+    }
+
+    // ── Plan 07-09: subscriptions ────────────────────────────────────────────
+
+    #[test]
+    fn subscriptions_true_makes_channels_optional_but_one_source_is_required() {
+        assert!(Settings::parse("subscriptions = true\n").is_ok());
+        assert!(Settings::parse("subscriptions = true\nchannels = []\n").is_ok());
+        assert!(parse(&format!("[\"{CHANNEL}\"]")).is_ok());
+        for text in [
+            "",
+            "subscriptions = false\n",
+            "subscriptions = false\nchannels = []\n",
+        ] {
+            let error = Settings::parse(text).unwrap_err();
+            assert!(
+                error.contains("channels") && error.contains("subscriptions"),
+                "{error}"
+            );
+        }
+        // A wrong type is still named and never echoed.
+        let error = Settings::parse("subscriptions = \"hunter2\"\n").unwrap_err();
+        assert!(error.contains("subscriptions") && !error.contains("hunter2"), "{error}");
+    }
+
+    #[test]
+    fn subscriptions_limit_defaults_to_50_and_is_range_checked() {
+        let default = Settings::parse("subscriptions = true\n").unwrap();
+        assert_eq!(default.subscriptions(), Some(DEFAULT_SUBSCRIPTIONS_LIMIT));
+        assert_eq!(DEFAULT_SUBSCRIPTIONS_LIMIT, 50);
+        for limit in [1, MAX_FEEDS] {
+            let settings =
+                Settings::parse(&format!("subscriptions = true\nsubscriptions_limit = {limit}\n"))
+                    .unwrap();
+            assert_eq!(settings.subscriptions(), Some(limit as u32));
+        }
+        let too_big = (MAX_FEEDS + 1).to_string();
+        for bad in ["0", too_big.as_str(), "-1", "1.5", "\"hunter2\"", "true"] {
+            let error =
+                Settings::parse(&format!("subscriptions = true\nsubscriptions_limit = {bad}\n"))
+                    .unwrap_err();
+            assert!(error.contains("subscriptions_limit"), "{error}");
+            if bad.len() > 1 {
+                assert!(!error.contains(bad.trim_matches('"')), "{error}");
+            }
+        }
+        // `subscriptions = false` and no flag at all leave the feature off.
+        assert_eq!(parse(&format!("[\"{CHANNEL}\"]")).unwrap().subscriptions(), None);
+    }
+
+    #[test]
+    fn subscriptions_limit_without_subscriptions_is_rejected() {
+        for text in [
+            format!("channels = [\"{CHANNEL}\"]\nsubscriptions_limit = 10\n"),
+            format!("channels = [\"{CHANNEL}\"]\nsubscriptions = false\nsubscriptions_limit = 10\n"),
+        ] {
+            let error = Settings::parse(&text).unwrap_err();
+            assert!(error.contains("subscriptions_limit"), "{error}");
+        }
+    }
+
+    #[test]
+    fn channels_plus_subscriptions_limit_over_the_cursor_capacity_is_rejected_naming_subscriptions_limit()
+     {
+        let explicit = MAX_FEEDS - 10;
+        let text = |limit: usize| {
+            format!(
+                "channels = {}\nsubscriptions = true\nsubscriptions_limit = {limit}\n",
+                ids(explicit)
+            )
+        };
+        assert!(Settings::parse(&text(10)).is_ok(), "a sum equal to the cap fits");
+        let error = Settings::parse(&text(11)).unwrap_err();
+        assert!(error.contains("subscriptions_limit"), "{error}");
+    }
+
+    #[test]
+    fn quota_units_per_poll_formula() {
+        assert_eq!(quota_units_per_poll(0, 20), 20);
+        assert_eq!(quota_units_per_poll(50, 50), 51);
+        assert_eq!(quota_units_per_poll(51, 51), 53);
+        assert_eq!(quota_units_per_poll(100, 100), 102);
+        assert_eq!(quota_units_per_poll(0, 0), 0);
     }
 
     #[test]
