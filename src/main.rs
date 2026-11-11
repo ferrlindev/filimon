@@ -33,7 +33,7 @@ mod streaming;
 
 use clap::Parser;
 use cli::{Cli, Command};
-use commands::{run_consume, run_plugin_host, run_plugins, run_produce, run_watch};
+use commands::{run_auth, run_consume, run_plugin_host, run_plugins, run_produce, run_watch};
 use models::SourceItem;
 use scorer::NerEngine;
 use std::path::{Path, PathBuf};
@@ -81,11 +81,14 @@ fn init_logging() {
 
 // ── Entry Point ───────────────────────────────────────────────────────────────
 
-/// Whether the decorative banner is printed. The `plugins` subcommands and
-/// `run` print only their own output, so stdout stays exactly what the command
-/// wrote.
+/// Whether the decorative banner is printed. The `plugins` and `auth`
+/// subcommands and `run` print only their own output, so stdout stays exactly
+/// what the command wrote.
 fn shows_banner(command: &Command) -> bool {
-    !matches!(command, Command::Plugins { .. } | Command::Run)
+    !matches!(
+        command,
+        Command::Plugins { .. } | Command::Run | Command::Auth { .. }
+    )
 }
 
 #[tokio::main]
@@ -128,6 +131,9 @@ async fn main() -> miette::Result<()> {
             run_plugins(command, &cli.registry, cli.state_dir.as_deref()).await?;
         }
         Command::Run => run_plugin_host(&cli.registry, cli.state_dir.as_deref()).await?,
+        Command::Auth { ref command } => {
+            run_auth(command, &cli.registry, cli.state_dir.as_deref()).await?;
+        }
     }
 
     Ok(())
@@ -468,6 +474,12 @@ mod tests {
     fn banner_is_skipped_for_run() {
         let run = Cli::try_parse_from(["fili", "run"]).expect("parses");
         assert!(!shows_banner(&run.command));
+    }
+
+    #[test]
+    fn banner_is_skipped_for_auth_commands() {
+        let auth = Cli::try_parse_from(["fili", "auth", "login", "x"]).expect("parses");
+        assert!(!shows_banner(&auth.command));
     }
 
     #[test]

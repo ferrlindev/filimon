@@ -135,6 +135,27 @@ pub enum Command {
 
     /// Poll every enabled source plugin on its interval and produce items to Fluvio until stopped.
     Run,
+
+    /// Log in to a plugin's platform, show stored logins, or log out.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+}
+
+/// The `fili auth` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Log in to a source plugin's platform through OAuth 2.0 PKCE; --no-browser only prints the URL.
+    Login {
+        /// The registered source to log in to
+        #[arg(value_name = "NAME")]
+        plugin: String,
+
+        /// Print the URL but do not try to open a browser (for SSH sessions)
+        #[arg(long)]
+        no_browser: bool,
+    },
 }
 
 /// The `fili plugins` subcommands.
@@ -247,6 +268,39 @@ mod tests {
         let error = Cli::try_parse_from(["fili", "--state-dir", "   ", "plugins", "list"])
             .expect_err("a blank --state-dir is a usage error");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn auth_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["fili", "auth"]).is_err());
+    }
+
+    #[test]
+    fn auth_login_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "login", "reddit"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Login { ref plugin, no_browser: false }
+            } if plugin == "reddit"
+        ));
+    }
+
+    #[test]
+    fn auth_login_no_browser_flag_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "login", "reddit", "--no-browser"])
+            .expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Login { ref plugin, no_browser: true }
+            } if plugin == "reddit"
+        ));
+    }
+
+    #[test]
+    fn auth_login_requires_a_plugin_name() {
+        assert!(Cli::try_parse_from(["fili", "auth", "login"]).is_err());
     }
 
     #[test]
