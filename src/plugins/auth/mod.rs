@@ -10,7 +10,8 @@
 // - `store`: the token file and the redacting token types.
 // - `provider`: the pre-poll decision (token, not logged in, needs login,
 //   refresh due, or a file problem).
-// - `error`: the diagnostics of both.
+// - `login`: the interactive PKCE login flow behind a small hooks trait.
+// - `error`: the diagnostics of all of them.
 //
 // Nothing in this module takes the state directory lock: `fili run` holds it
 // for its whole life, and the auth commands must work beside it.
@@ -26,6 +27,7 @@
 pub mod callback;
 pub mod client;
 pub mod error;
+pub mod login;
 pub mod pkce;
 pub mod provider;
 pub mod store;

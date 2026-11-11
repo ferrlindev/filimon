@@ -47,6 +47,7 @@ base64 = "0.22"
 tokio-util = "0.7"
 sha2 = "0.10"
 getrandom = "0.3"
+open = "5"
 
 [dev-dependencies]
 # test-util enables paused time (`#[tokio::test(start_paused = true)]`).

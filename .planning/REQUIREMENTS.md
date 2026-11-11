@@ -36,7 +36,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### OAuth
 
-- [ ] **AUTH-01**: User can run `fili auth login <plugin>` to complete an OAuth 2.0 PKCE flow via local callback, using endpoints and scopes declared in the plugin's TOML
+- [x] **AUTH-01**: User can run `fili auth login <plugin>` to complete an OAuth 2.0 PKCE flow via local callback, using endpoints and scopes declared in the plugin's TOML
 - [ ] **AUTH-02**: Host stores tokens locally and refreshes access tokens automatically before expiry
 - [ ] **AUTH-03**: Plugins receive only a current access token via the WIT contract — never refresh tokens
 - [ ] **AUTH-04**: User can run `fili auth status` and `fili auth logout <plugin>` to inspect and revoke stored logins
@@ -141,7 +141,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CONF-01 | Phase 1 | Complete |
 | CONF-02 | Phase 1 | Complete |
 | CONF-03 | Phase 1 | Complete |
-| AUTH-01 | Phase 6 | Pending |
+| AUTH-01 | Phase 6 | Complete |
 | AUTH-02 | Phase 6 | Pending |
 | AUTH-03 | Phase 6 | Pending |
 | AUTH-04 | Phase 6 | Pending |
