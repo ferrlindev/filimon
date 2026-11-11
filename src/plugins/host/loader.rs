@@ -20,7 +20,8 @@ use wasmtime::component::Component;
 
 use super::engine::{FetcherPre, HostEngine, HostState, SourcePre, clean_guest_text};
 use super::error::HostError;
-use crate::plugins::config::LoadedRegistry;
+use super::fetch::{FetchPolicy, FetchRoute};
+use crate::plugins::config::{HostConfig, LoadedRegistry};
 
 /// The only import package a plugin may use.
 const PLUGIN_PACKAGE_PREFIX: &str = "filimon:plugin/";
@@ -173,6 +174,54 @@ pub(crate) fn load_fetcher(
         .and_then(FetcherPre::new)
         .map_err(|e| wrong_world(plugin, PluginKind::Fetcher, path, &e))?;
     Ok(pre)
+}
+
+/// The fetch route for one source, built from the registry's assignment: the
+/// same route and policy `Host::load` builds, for a caller that loads a single
+/// source (`fili plugins run-once`).
+///
+/// `Ok(None)` when the source names no fetcher (every `fetch` then answers
+/// `not-configured`). The fetcher is loaded here, before the caller loads the
+/// source's own component, so a broken dependency is reported first.
+///
+/// # Errors
+/// `HostError::FetcherUnavailable`, naming the source and the fetcher, when
+/// the fetcher is not registered, is disabled, or its component fails to load.
+pub(crate) fn load_route_for_source(
+    registry: &LoadedRegistry,
+    source: &str,
+    host: &HostConfig,
+    host_engine: &HostEngine,
+) -> Result<Option<Arc<FetchRoute>>, HostError> {
+    let Some(alias) = registry
+        .sources
+        .get(source)
+        .and_then(|loaded| loaded.fetcher.as_deref())
+    else {
+        return Ok(None);
+    };
+    let unavailable = |reason: &str| HostError::FetcherUnavailable {
+        plugin: source.to_string(),
+        fetcher: alias.to_string(),
+        reason: clean_guest_text(reason, REASON_CLIP),
+    };
+
+    let entry = registry
+        .fetchers
+        .get(alias)
+        .ok_or_else(|| unavailable("it is not registered in filimon.toml"))?;
+    if !entry.enabled {
+        return Err(unavailable("it is disabled in filimon.toml"));
+    }
+    let pre = load_fetcher(alias, entry.component.as_path(), host_engine)
+        .map_err(|error| unavailable(&error.to_string()))?;
+    Ok(Some(Arc::new(FetchRoute::new(
+        alias,
+        Arc::new(pre),
+        host_engine.engine().clone(),
+        Arc::new(FetchPolicy::for_source(source, host)),
+        host_engine.egress(),
+    ))))
 }
 
 /// Checks that the component at `path` compiles, imports nothing outside
