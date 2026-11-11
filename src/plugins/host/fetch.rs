@@ -39,20 +39,38 @@ pub struct Allowlist {
 
 impl Allowlist {
     /// Builds an allowlist from the configured host names.
+    ///
+    /// Each entry is trimmed, loses one trailing dot and is normalized with
+    /// `url::Host::parse`, so case and internationalized names compare in
+    /// their ASCII form. A blank entry is ignored. An entry that is not a bare
+    /// host (a scheme, port, path, space or `*` wildcard) can never match and
+    /// is kept in `rejected()`.
     pub fn new<I>(entries: I) -> Self
     where
         I: IntoIterator,
         I::Item: AsRef<str>,
     {
-        let hosts = entries
-            .into_iter()
-            .map(|entry| entry.as_ref().trim().to_ascii_lowercase())
-            .filter(|entry| !entry.is_empty())
-            .collect();
-        Self {
-            hosts,
-            rejected: Vec::new(),
+        let mut hosts = BTreeSet::new();
+        let mut rejected = Vec::new();
+        for entry in entries {
+            let entry = entry.as_ref().trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let bare = entry.strip_suffix('.').unwrap_or(entry);
+            let parsed = if bare.is_empty() || bare.contains('*') {
+                None
+            } else {
+                url::Host::parse(bare).ok()
+            };
+            match parsed {
+                Some(host) => {
+                    hosts.insert(normalize(&host.to_string()));
+                }
+                None => rejected.push(entry.to_string()),
+            }
         }
+        Self { hosts, rejected }
     }
 
     /// The non-blank configured entries that are not bare host names and so
@@ -65,8 +83,14 @@ impl Allowlist {
     /// Whether `host` is allowed.
     #[must_use]
     pub fn permits(&self, host: &url::Host<&str>) -> bool {
-        self.hosts.contains(&host.to_string())
+        self.hosts.contains(&normalize(&host.to_string()))
     }
+}
+
+/// A host's comparison form: one trailing dot removed. The URL parser has
+/// already lowercased domains and put IP literals in canonical form.
+fn normalize(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_string()
 }
 
 /// What the host enforces on one consumer's fetches.
@@ -80,6 +104,14 @@ pub struct FetchPolicy {
 impl FetchPolicy {
     #[must_use]
     pub fn new(consumer: &str, allowlist: Allowlist, timeout: Duration) -> Self {
+        for entry in allowlist.rejected() {
+            // Operator config text, but still cleaned before it is logged.
+            tracing::warn!(
+                plugin = %clean_guest_text(consumer, 128),
+                entry = %clean_guest_text(entry, 128),
+                "allowlist entry is not a bare host name and will never match"
+            );
+        }
         Self {
             consumer: consumer.to_string(),
             allowlist,
@@ -109,8 +141,20 @@ impl FetchPolicy {
     /// `InvalidRequest` for a url that cannot be used and `Denied` for a host
     /// outside the allowlist.
     pub fn check(&self, request: &types::Request) -> Result<url::Url, types::FetchError> {
-        let url = url::Url::parse(&request.url)
+        let text = request.url.trim();
+        if text.is_empty() {
+            return Err(types::FetchError::InvalidRequest(
+                "url is empty".to_string(),
+            ));
+        }
+        // The url is never echoed back: it is guest data and may carry secrets.
+        let url = url::Url::parse(text)
             .map_err(|_| types::FetchError::InvalidRequest("url cannot be parsed".to_string()))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(types::FetchError::InvalidRequest(
+                "only http and https urls are allowed".to_string(),
+            ));
+        }
         let Some(host) = url.host() else {
             return Err(types::FetchError::InvalidRequest(
                 "url has no host".to_string(),
@@ -505,12 +549,12 @@ mod tests {
         use crate::plugins::config::BackoffConfig;
 
         let host = HostConfig {
-            poll_interval: Duration::from_secs(60),
+            poll_interval: Duration::from_mins(1),
             timeout: Duration::from_secs(7),
             allowlist: vec!["www.reddit.com".to_string()],
             backoff: BackoffConfig {
                 initial: Duration::from_secs(1),
-                max: Duration::from_secs(60),
+                max: Duration::from_mins(1),
                 multiplier: 2.0,
             },
         };

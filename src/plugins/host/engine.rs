@@ -306,7 +306,7 @@ mod tests {
     fn clean_guest_text_strips_control_chars_and_clips() {
         let cleaned = clean_guest_text("a\u{1b}[31mred\nline\ttab\r", 4096);
         assert_eq!(cleaned, "a[31mred line tab ");
-        assert!(!cleaned.chars().any(|c| c.is_control()));
+        assert!(!cleaned.chars().any(char::is_control));
 
         let long = "x".repeat(5000);
         let clipped = clean_guest_text(&long, 4096);
