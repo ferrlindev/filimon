@@ -19,6 +19,7 @@ use super::fetch::{Allowlist, FetchPolicy, FetchRoute};
 use super::instance::WasmtimeFactory;
 use super::loader::{load_fetcher, load_source};
 use super::once::poll_once;
+use super::scheduler::PluginSpec;
 use super::sink::{ItemSink, SinkError, SinkRecord, VecSink};
 use super::testing::{
     self, LogCapture, Reply, SeenRequest, TestHttpServer, TestSource, fixture_wasm,
@@ -862,4 +863,162 @@ async fn wasm_a_slow_call_does_not_time_out_a_fast_concurrent_call() {
     assert!(fast_done < slow_done, "fast {fast_done:?}, slow {slow_done:?}");
     assert!(fast_done < Duration::from_millis(800), "fast took {fast_done:?}");
     assert!(slow_done < Duration::from_millis(2500), "slow took {slow_done:?}");
+}
+
+// ── Host-Managed OAuth Against The Real Component ─────────────────────────────
+//
+// The `stub-source` fixture, run with `record_inputs = true`, returns
+// everything it received in the item's `raw`. These tests read that back to
+// show what a plugin holds: the access token and its own secrets, and nothing
+// the host keeps for itself (D-10, D-12). They need `stub-source` rebuilt after
+// the `record_inputs` setting was added (plugins/README.md, "Build").
+
+const WASM_ACCESS_TOKEN: &str = "AT-WASM-1";
+const WASM_REFRESH_TOKEN: &str = "RT-SENTINEL-W";
+const WASM_API_KEY: &str = "API-VALUE-W";
+const WASM_CLIENT_SECRET: &str = "CS-SENTINEL-W";
+
+/// Writes a registry for the real `stub-source` as source `stub`, with one
+/// plugin secret, a `[host.oauth]` table with a client secret, and
+/// `record_inputs = true`; the two secret values go in a `.env` beside it.
+/// With `token_file`, also stores a login that is a day from expiry, so no
+/// refresh (and no network) is involved. Returns the registry path and the
+/// state directory.
+fn auth_registry(dir: &Path, token_file: bool) -> (PathBuf, PathBuf) {
+    use crate::plugins::auth::store::{AccessToken, RefreshToken, StoredTokens, TokenStore};
+    use crate::plugins::auth::testing::unix_now;
+
+    let component = fixture_wasm("stub-source", "stub_source.wasm");
+    std::fs::write(
+        dir.join("filimon.toml"),
+        format!(
+            "[sources.stub]\ncomponent = {:?}\nconfig = \"stub.toml\"\n",
+            component.display().to_string()
+        ),
+    )
+    .expect("write registry");
+    std::fs::write(
+        dir.join("stub.toml"),
+        "[host]\npoll_interval_secs = 60\nallowlist = []\n\n\
+         [host.secrets]\napi_key = \"STUB_API_KEY\"\n\n\
+         [host.oauth]\n\
+         authorize_url = \"https://auth.example/authorize\"\n\
+         token_url = \"https://auth.example/token\"\n\
+         scopes = [\"read\"]\nclient_id = \"client-w\"\n\
+         client_secret_env = \"STUB_CLIENT_SECRET\"\n\n\
+         [settings]\ngreeting = \"hi\"\nrecord_inputs = true\n",
+    )
+    .expect("write plugin toml");
+    std::fs::write(
+        dir.join(".env"),
+        format!("STUB_API_KEY={WASM_API_KEY}\nSTUB_CLIENT_SECRET={WASM_CLIENT_SECRET}\n"),
+    )
+    .expect("write the env file");
+
+    let state_dir = dir.join(".fili-state");
+    if token_file {
+        TokenStore::new(&state_dir, "stub")
+            .write(&StoredTokens {
+                access_token: AccessToken::new(WASM_ACCESS_TOKEN.to_string()),
+                refresh_token: Some(RefreshToken::new(WASM_REFRESH_TOKEN.to_string())),
+                expires_at: unix_now() + 86_400,
+                token_type: None,
+                scope: None,
+                needs_login: false,
+                obtained_at: unix_now(),
+            })
+            .expect("write the login");
+    }
+    (dir.join("filimon.toml"), state_dir)
+}
+
+/// The text the guest returned in the `raw` of its one item.
+fn recorded_text(records: &[SinkRecord]) -> String {
+    assert_eq!(records.len(), 1, "one item was returned");
+    records[0]
+        .item
+        .raw
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the item raw is not a string: {:?}", records[0].item.raw))
+        .to_string()
+}
+
+/// What a plugin may never hold, whatever the path that built its inputs.
+fn assert_no_host_credentials(recorded: &str) {
+    for secret in [WASM_REFRESH_TOKEN, WASM_CLIENT_SECRET] {
+        assert!(
+            !recorded.contains(secret),
+            "{secret} reached the guest:\n{recorded}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_auth_the_guest_sees_the_access_token_and_never_the_refresh_token_or_the_client_secret()
+ {
+    let tmp = TempDir::new().expect("tempdir");
+    let (registry_path, state_dir) = auth_registry(tmp.path(), true);
+    let registry = load_test_registry(&registry_path);
+
+    let host = Host::load(&registry, HostOptions { state_dir }).expect("host loads");
+    let sink = Arc::new(VecSink::default());
+    let report = run_host(host, Arc::clone(&sink), Duration::from_secs(1)).await;
+
+    let plugin = &report.plugins["stub"];
+    assert_eq!(plugin.polls, 1);
+    assert_eq!(plugin.disabled, None);
+    let recorded = recorded_text(&sink.records());
+    assert!(recorded.contains(WASM_ACCESS_TOKEN), "{recorded}");
+    assert!(recorded.contains(WASM_API_KEY), "{recorded}");
+    assert!(recorded.contains("api_key"), "{recorded}");
+    assert_no_host_credentials(&recorded);
+}
+
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_auth_run_once_path_hands_the_guest_the_token_too() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (registry_path, state_dir) = auth_registry(tmp.path(), true);
+    let registry = load_test_registry(&registry_path);
+    let engine = HostEngine::new().expect("engine");
+    let pre = load_source(
+        "stub",
+        &fixture_wasm("stub-source", "stub_source.wasm"),
+        &engine,
+    )
+    .expect("source loads");
+    let factory = WasmtimeFactory::new(engine.engine().clone(), pre);
+    let spec = PluginSpec::from_loaded(&registry.sources["stub"], &state_dir)
+        .expect("an enabled source");
+
+    let polled = poll_once(&spec, &factory, None)
+        .await
+        .expect("the source polls");
+
+    let recorded = recorded_text(&polled.records);
+    assert!(recorded.contains(WASM_ACCESS_TOKEN), "{recorded}");
+    assert!(recorded.contains(WASM_API_KEY), "{recorded}");
+    assert_no_host_credentials(&recorded);
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_auth_a_plugin_without_a_login_gets_no_token() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (registry_path, state_dir) = auth_registry(tmp.path(), false);
+    let registry = load_test_registry(&registry_path);
+
+    let host = Host::load(&registry, HostOptions { state_dir }).expect("host loads");
+    let sink = Arc::new(VecSink::default());
+    let report = run_host(host, Arc::clone(&sink), Duration::from_secs(1)).await;
+
+    let plugin = &report.plugins["stub"];
+    assert_eq!(plugin.polls, 1);
+    assert_eq!(plugin.disabled, None);
+    let recorded = recorded_text(&sink.records());
+    assert!(recorded.contains("access_token=None"), "{recorded}");
+    assert!(!recorded.contains(WASM_ACCESS_TOKEN), "{recorded}");
+    assert_no_host_credentials(&recorded);
 }
