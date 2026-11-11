@@ -1,0 +1,113 @@
+{
+  "kind": "Listing",
+  "data": {
+    "after": null,
+    "dist": 6,
+    "modhash": null,
+    "geo_filter": "",
+    "before": null,
+    "children": [
+      {
+        "kind": "t3",
+        "data": {
+          "subreddit": "rust",
+          "selftext": "[removed]",
+          "author_fullname": "t2_synthetic4",
+          "saved": false,
+          "title": "Question removed by the moderators",
+          "name": "t3_1kx9ca1",
+          "id": "1kx9ca1",
+          "author": "some_user",
+          "score": 0,
+          "num_comments": 0,
+          "created_utc": 1700000600.0,
+          "created": 1700000600.0,
+          "permalink": "/r/rust/comments/1kx9ca1/question_removed_by_the_moderators/",
+          "url": "https://www.reddit.com/r/rust/comments/1kx9ca1/question_removed_by_the_moderators/",
+          "is_self": true,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": "moderator",
+          "subreddit_name_prefixed": "r/rust"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "subreddit": "rust",
+          "selftext": "[deleted]",
+          "saved": false,
+          "title": "Post whose author deleted their account",
+          "name": "t3_1kx9cb2",
+          "id": "1kx9cb2",
+          "author": "[deleted]",
+          "score": 3,
+          "num_comments": 1,
+          "created_utc": 1700000500.0,
+          "created": 1700000500.0,
+          "permalink": "/r/rust/comments/1kx9cb2/post_whose_author_deleted_their_account/",
+          "url": "https://www.reddit.com/r/rust/comments/1kx9cb2/post_whose_author_deleted_their_account/",
+          "is_self": true,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": "deleted",
+          "subreddit_name_prefixed": "r/rust"
+        }
+      },
+      {
+        "kind": "t1",
+        "data": {
+          "name": "t1_1kx9cc3",
+          "id": "1kx9cc3",
+          "author": "commenter",
+          "body": "a comment that should never appear in a post listing",
+          "created_utc": 1700000450.0
+        }
+      },
+      {
+        "kind": "t5",
+        "data": {
+          "name": "t5_2sub01",
+          "display_name": "rust",
+          "title": "A subreddit child",
+          "created_utc": 1700000440.0
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "subreddit": "rust",
+          "selftext": "no name",
+          "saved": false,
+          "title": "A post with no name field",
+          "author": "nameless",
+          "score": 1,
+          "num_comments": 0,
+          "created_utc": 1700000420.0,
+          "created": 1700000420.0,
+          "permalink": "/r/rust/comments/none/x/",
+          "is_self": true,
+          "stickied": false
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "subreddit": "rust",
+          "selftext": "a post with no title field",
+          "saved": false,
+          "name": "t3_1kx9cd4",
+          "id": "1kx9cd4",
+          "author": "titleless",
+          "score": 1,
+          "num_comments": 0,
+          "created_utc": 1700000430.0,
+          "created": 1700000430.0,
+          "permalink": "/r/rust/comments/1kx9cd4/x/",
+          "is_self": true,
+          "stickied": false
+        }
+      }
+    ]
+  }
+}
