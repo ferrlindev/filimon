@@ -548,14 +548,16 @@ plugin as is, and nothing about the login belongs there. A plugin with no
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `authorize_url` | yes | The provider's authorization endpoint. Must be `https://`. |
+| `grant` | no | `authorization_code` (the default: a user logs in with `fili auth login`) or `client_credentials` (app-only: no user, no login; see [App-only access](#app-only-access-client_credentials)). |
+| `authorize_url` | for `authorization_code` | The provider's authorization endpoint. Must be `https://`. Not allowed with `client_credentials`. |
 | `token_url` | yes | The provider's token endpoint. Must be `https://`. |
-| `scopes` | no | A list of scope strings, each one scope with no whitespace. Default: none. |
+| `scopes` | no | A list of scope strings, each one scope with no whitespace. Default: none. Not allowed with `client_credentials`. |
 | `client_id` | yes | The application's client id. It is public, so it lives in the TOML. |
-| `client_secret_env` | no | The name of a `.env` key that holds the client secret, for providers that need one. |
-| `revocation_url` | no | The provider's revocation endpoint, used by `fili auth logout`. Must be `https://`. |
-| `redirect_port` | no | The loopback port of the login callback. Default: `17420`. |
-| `authorize_params` | no | A table of extra parameters appended to the authorize URL. |
+| `client_secret_env` | for `client_credentials` | The name of a `.env` key that holds the client secret. Required for `client_credentials`; for `authorization_code` it is optional and only for providers that need one. |
+| `revocation_url` | no | The provider's revocation endpoint, used by `fili auth logout`. Must be `https://`. Not allowed with `client_credentials`. |
+| `redirect_port` | no | The loopback port of the login callback. Default: `17420`. Not allowed with `client_credentials`. |
+| `authorize_params` | no | A table of extra parameters appended to the authorize URL. Not allowed with `client_credentials`. |
+| `user_agent` | no | 1 to 200 printable ASCII characters, sent as the `User-Agent` of the host's token and revocation requests. The plugin's own requests are unaffected. |
 
 ```toml
 [host.oauth]
@@ -588,9 +590,45 @@ authorize_params = { duration = "permanent" }              # optional
   an invalid `[host.oauth]` stops `fili run`; set `enabled = false` on the
   source to skip it.
 
+### App-only access (client_credentials)
+
+Some providers hand out an application token with no user involved. Set
+`grant = "client_credentials"` and the host fetches that token itself: there is
+no login, no browser step and no token file. This is the mode of the app-only
+Reddit instance.
+
+```toml
+[host.oauth]
+grant = "client_credentials"
+token_url = "https://www.reddit.com/api/v1/access_token"
+client_id = "your-client-id"
+client_secret_env = "REDDIT_CLIENT_SECRET"                 # the value goes in .env
+user_agent = "linux:com.example.filimon:v0.1.0 (by /u/your-username)"
+```
+
+- The host requests the token with HTTP Basic authentication (client id and
+  secret) and the body `grant_type=client_credentials`. It keeps the token in
+  memory only, and fetches a new one when under 60 seconds of life remain
+  (3600 seconds are assumed when the answer has no `expires_in`). Nothing is
+  written to disk, so every `fili run` start and every `fili plugins run-once`
+  fetches a fresh token.
+- There is no login. `fili auth login <plugin>` refuses a `client_credentials`
+  plugin with exit 1, before it reads any secret or creates anything, and
+  `fili auth status` shows the plugin as `app-only`.
+- A `client_credentials` table must set `client_secret_env`, and must not set
+  `authorize_url`, `redirect_port`, `authorize_params`, `revocation_url` or
+  `scopes`: each of those is a config error naming the field, so a setting is
+  never silently ignored.
+- The plugin receives only the access token. The client id and the client secret
+  never reach it.
+- One grant applies per plugin instance. To use both grants against one
+  provider, register two instances of the plugin.
+
 ### Logging in and out
 
-- `fili auth login <plugin> [--no-browser]` starts a listener on
+- `fili auth login <plugin> [--no-browser]` (for the authorization code grant;
+  a `client_credentials` plugin is refused, see
+  [App-only access](#app-only-access-client_credentials)) starts a listener on
   `127.0.0.1:<redirect_port>`, prints the authorize URL and also tries to open
   your browser. `--no-browser` only prints it, which suits a remote shell: open
   the URL on any machine that can reach the loopback port (for example through
@@ -611,6 +649,9 @@ authorize_params = { duration = "permanent" }              # optional
   - `needs-login`: the host could not renew the login for good (see
     [Refresh and failures](#refresh-and-failures)). Run `fili auth login` again.
   - `not-logged-in`: the plugin declares `[host.oauth]` and nothing is stored.
+  - `app-only`: the plugin declares `grant = "client_credentials"`. Nothing is
+    stored or needed, and a token file of the same name, if one exists, is
+    ignored. `EXPIRES` and `REFRESH` show `-` (`null` in `--json`).
   - `unreadable`: the token file cannot be used. The row names the plugin and
     the path, and gives the reason in fixed words, never the file's content.
 - `fili auth logout <plugin>` deletes the token file first, and then, when the
@@ -624,8 +665,8 @@ and creates nothing, so these commands work while `fili run` is up. A running
 host picks up a login, a re-login or a logout at its next poll, with no
 restart. Exit codes are as in [Plugin CLI](#plugin-cli): `fili auth` with no
 subcommand is a usage error (2), and an unknown plugin, a fetcher, a disabled
-source or a plugin without `[host.oauth]` is refused with exit 1 before
-anything is created.
+source, a plugin without `[host.oauth]` or a `client_credentials` plugin is
+refused with exit 1 before anything is created.
 
 ### Where tokens live
 
@@ -648,7 +689,8 @@ again.
 ### What a plugin receives
 
 Only the access token, as `poll`'s `access-token` argument (`none` when there is
-no login, or the login needs a new one). `init` receives the plugin's own
+no login, or the login needs a new one; an app-only plugin receives the app
+token the host fetched). `init` receives the plugin's own
 `[host.secrets]` and settings as before. The refresh token, the client secret
 and every other host-side credential stay in the host; they are not in a
 plugin's arguments, settings, logs or items. The WIT contract is unchanged.
@@ -686,6 +728,20 @@ plugin's arguments, settings, logs or items. The WIT contract is unchanged.
   be renewed and ends when its access token does (the login command warns).
 - Which providers need `client_secret_env` is the provider's rule: a public or
   installed application type often has none.
+- Reddit: register the application as a web app. A web app has a secret and a
+  redirect URI, so one registration serves both the app-only instance
+  (`grant = "client_credentials"`) and the code-flow instance (with the
+  redirect URI `http://127.0.0.1:17420/callback`). An installed-app registration
+  has no secret and cannot use the `client_credentials` grant.
+- Reddit requires a unique, descriptive User-Agent of the form
+  `<platform>:<app ID>:<version> (by /u/<username>)`. Set it in
+  `[host.oauth] user_agent` for the host's token calls; the plugin sends its own
+  User-Agent for its API calls. Reddit may restrict new API access, so
+  credentials may need Reddit's approval before they work.
+- Google: use a Desktop-app OAuth client with the loopback redirect. Google's
+  token endpoint normally expects the client secret for desktop clients, so set
+  `client_secret_env`. A consent screen left in Testing mode makes refresh
+  tokens expire after about 7 days, so log in again then, or publish the app.
 
 ### Known limits
 
@@ -699,9 +755,8 @@ plugin's arguments, settings, logs or items. The WIT contract is unchanged.
 - Tokens are plain files protected by mode 0600. There is no keychain or
   encryption, and the mode check is Unix only.
 - One login per plugin: there are no multiple accounts for one source.
-- Whether the Reddit plugin uses app-only credentials or this login is decided
-  in the Reddit plugin phase. The sample plugin TOMLs do not declare
-  `[host.oauth]` yet.
+- The app-only token is memory-only, so it is fetched again at every start, and
+  one grant applies per plugin instance.
 
 ## Contract version
 
