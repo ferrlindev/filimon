@@ -20,6 +20,8 @@ pub mod scheduler;
 pub mod sink;
 
 #[cfg(test)]
+mod https_tests;
+#[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
 mod wasm_tests;
