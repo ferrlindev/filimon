@@ -146,6 +146,35 @@ pub enum ConfigError {
         span: SourceSpan,
     },
 
+    /// The `[crawler]` table's `fetcher` names no `[fetchers.<name>]` table.
+    #[error(
+        "`crawler.fetcher` references fetcher `{fetcher}`, which is not defined under [fetchers]"
+    )]
+    #[diagnostic(
+        code(fili::config::unknown_crawler_fetcher),
+        help("defined fetchers: {defined}")
+    )]
+    UnknownCrawlerFetcher {
+        fetcher: String,
+        /// Comma-separated defined fetcher names, or `none`.
+        defined: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not defined under [fetchers]")]
+        span: SourceSpan,
+    },
+
+    /// The `[crawler]` table's `fetcher` names a fetcher with `enabled = false`.
+    #[error("`crawler.fetcher` references fetcher `{fetcher}`, which is disabled")]
+    #[diagnostic(code(fili::config::disabled_crawler_fetcher))]
+    DisabledCrawlerFetcher {
+        fetcher: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this fetcher has enabled = false")]
+        span: SourceSpan,
+    },
+
     /// A plugin name uses characters outside `[a-z0-9_-]`, or is empty.
     #[error("`{table}.{plugin}`: plugin names may only contain a-z, 0-9, '_' and '-'")]
     #[diagnostic(code(fili::config::invalid_name))]
@@ -186,6 +215,11 @@ impl ConfigError {
             | Self::DisabledFetcher { plugin, .. }
             | Self::InvalidName { plugin, .. }
             | Self::DuplicateName { plugin } => Some(plugin),
+            // The crawler is a consumer of its own, so a scoped plugin load
+            // drops its problems like any other plugin's.
+            Self::UnknownCrawlerFetcher { .. } | Self::DisabledCrawlerFetcher { .. } => {
+                Some("crawler")
+            }
             Self::RegistryUnreadable { .. }
             | Self::RegistryMalformed { .. }
             | Self::DotenvInvalid { .. } => None,

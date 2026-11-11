@@ -5,8 +5,12 @@
 // DOM analyzer -> extract_link()
 
 use crate::models::{CrawlTarget, RawPage};
+use crate::plugins::host::fetch::CrawlFetcher;
 use scraper::{Html, Selector};
 use url::Url;
+
+/// The User-Agent every crawler request carries, whichever client sends it.
+pub const USER_AGENT: &str = "WISECrawler/1.0 (academic research)";
 
 // URL fragments strongly suggesting an article page.
 const ARTICLE_SIGNALS: &[&str] = &[
@@ -59,7 +63,7 @@ const NOISE_SIGNALS: &[&str] = &[
 /// deployment.
 fn build_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .user_agent("WISECrawler/1.0 (academic research)")
+        .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .danger_accept_invalid_certs(true)
         .build()
@@ -83,6 +87,27 @@ pub fn fetch_page(target: &CrawlTarget) -> Result<RawPage, String> {
         url: target.url.clone(),
         html,
     })
+}
+
+/// How `fili produce` fetches a page: with the built-in HTTP client, or through
+/// the fetcher component the registry's `[crawler]` table names.
+pub enum PageFetcher {
+    BuiltIn,
+    /// Boxed so the enum stays small.
+    Component(Box<CrawlFetcher>),
+}
+
+impl PageFetcher {
+    /// Fetches the page at `target`.
+    ///
+    /// # Errors
+    /// The failure as text, for the crawl to print before it moves on.
+    pub async fn fetch_page(&self, target: &CrawlTarget) -> Result<RawPage, String> {
+        match self {
+            Self::BuiltIn => fetch_page(target),
+            Self::Component(fetcher) => fetcher.get_page(&target.url).await,
+        }
+    }
 }
 
 /// Extract and rank all in-doman links from `page`
