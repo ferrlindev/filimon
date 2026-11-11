@@ -48,6 +48,13 @@ fn map_http_error(error: HttpError) -> PollError {
 }
 
 /// Run one poll.
+///
+/// Documented limits (for the plugin README, plan 07-11):
+/// - a feed with more new posts than one page loses the oldest overflow
+///   (deferred paging);
+/// - a post that arrives in the same second as the mark's post, after it, is
+///   not emitted (the filter is strictly newer by whole seconds);
+/// - `hot` only emits posts newer than its mark, so it is not a ranked re-poll.
 pub fn poll(
     http: &dyn Http,
     settings: &Settings,
@@ -66,14 +73,17 @@ pub fn poll(
         warnings.push("cursor could not be decoded; treating this as a first poll".to_string());
     }
 
-    let mut next = Cursor::default();
+    // Start from the stored marks so a feed with nothing new carries its mark
+    // forward unchanged; `retain_feeds` below drops the stale ones.
+    let feeds = settings.feeds();
+    let mut next: Cursor = old.clone();
     let mut items: Vec<Item> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     // Warning counters: only numbers ever reach a warning, never post content.
     let mut skipped = 0usize;
 
-    for feed in settings.feeds() {
-        let mark = old.0.get(&feed.key);
+    for feed in &feeds {
+        let mark = old.mark(&feed.key);
         // D-10: the first poll of a feed is one page; later polls return only
         // newer items, so they take the largest page.
         let limit = if mark.is_some() {
@@ -111,23 +121,24 @@ pub fn poll(
             .filter_map(|post| api::created_seconds(&post).map(|t| (t, post)))
             .filter(|(t, _)| mark.is_none_or(|m| *t > m.t))
             .collect();
-        fresh.sort_by(|(ta, a), (tb, b)| ta.cmp(tb).then_with(|| a.name.cmp(&b.name)));
+        // Oldest first; equal timestamps are ordered by fullname so the order
+        // is stable between polls.
+        fresh.sort_by(|(_, a), (_, b)| {
+            a.created_utc
+                .total_cmp(&b.created_utc)
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
-        match fresh.last() {
-            Some((t, post)) => {
-                next.0.insert(
-                    feed.key.clone(),
-                    Mark {
-                        t: *t,
-                        n: post.name.clone(),
-                    },
-                );
-            }
-            None => {
-                if let Some(mark) = mark {
-                    next.0.insert(feed.key.clone(), mark.clone());
-                }
-            }
+        // The new mark is the greatest post of this feed's page, including a
+        // post another feed already emitted. Nothing new keeps the old mark.
+        if let Some((t, post)) = fresh.last() {
+            next.set_mark(
+                feed.key.clone(),
+                Mark {
+                    t: *t,
+                    n: post.name.clone(),
+                },
+            );
         }
         for (_, post) in &fresh {
             if let Some(item) = api::post_to_item(post) {
@@ -137,6 +148,8 @@ pub fn poll(
             }
         }
     }
+    let keys: Vec<String> = feeds.iter().map(|feed| feed.key.clone()).collect();
+    next.retain_feeds(&keys);
 
     if skipped > 0 {
         warnings.push(format!(

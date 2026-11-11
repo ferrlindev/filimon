@@ -34,6 +34,24 @@ pub struct Mark {
 #[serde(transparent)]
 pub struct Cursor(pub BTreeMap<String, Mark>);
 
+impl Cursor {
+    /// The mark of one feed, if it has one.
+    pub fn mark(&self, key: &str) -> Option<&Mark> {
+        self.0.get(key)
+    }
+
+    /// Set (or replace) the mark of one feed.
+    pub fn set_mark(&mut self, key: String, mark: Mark) {
+        self.0.insert(key, mark);
+    }
+
+    /// Drop the marks of feeds that are no longer configured, so the cursor
+    /// cannot grow without bound as the settings change.
+    pub fn retain_feeds(&mut self, keys: &[String]) {
+        self.0.retain(|key, _| keys.contains(key));
+    }
+}
+
 /// Decode the cursor the host passed back. The `bool` is true when bytes were
 /// present but undecodable: the caller treats that as a first poll with a
 /// warning, so a layout change self-heals.
@@ -79,6 +97,26 @@ mod tests {
             r#"{"r/rust:new":{"t":1700000300,"n":"t3_1kx9ab2"}}"#
         );
         assert_eq!(decode(Some(&bytes)), (cursor, false));
+    }
+
+    #[test]
+    fn marks_are_read_set_and_dropped_for_feeds_that_are_no_longer_configured() {
+        let mark = |t: i64, n: &str| Mark {
+            t,
+            n: n.to_string(),
+        };
+        let mut cursor = Cursor::default();
+        assert_eq!(cursor.mark("r/rust:new"), None);
+        cursor.set_mark("r/rust:new".to_string(), mark(1, "t3_a"));
+        cursor.set_mark("r/old:new".to_string(), mark(2, "t3_b"));
+        cursor.set_mark("r/rust:new".to_string(), mark(3, "t3_c"));
+        assert_eq!(cursor.mark("r/rust:new"), Some(&mark(3, "t3_c")));
+
+        cursor.retain_feeds(&["r/rust:new".to_string(), "r/other:hot".to_string()]);
+        assert_eq!(cursor.0.len(), 1);
+        assert!(cursor.mark("r/old:new").is_none());
+        cursor.retain_feeds(&[]);
+        assert!(cursor.0.is_empty());
     }
 
     #[test]
