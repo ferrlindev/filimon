@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 4: Plugin CLI** - `fili plugins list | check | run-once` and a run command that polls all enabled sources (completed 2026-11-10)
 - [x] **Phase 5: Fetcher Layer** - Plugin HTTP routed through a configurable fetcher component, a host-enforced allowlist and timeout, a default TLS-validating fetcher, and an optional crawler hook (completed 2026-11-11)
 - [x] **Phase 6: Host-Managed OAuth** - `fili auth login | status | logout` with PKCE, host-side token storage and refresh, and only access tokens passed to plugins (completed 2026-11-11)
-- [ ] **Phase 7: Reddit & YouTube Plugins** - Two separately built reference `.wasm` source components on the official APIs, each with offline fixture tests
+- [x] **Phase 7: Reddit & YouTube Plugins** - Two separately built reference `.wasm` source components on the official APIs, each with offline fixture tests (completed 2026-11-12)
 - [ ] **Phase 8: Integration, Live E2E & Authoring** - Compiled plugins tested in the host against replayed and live APIs, a live end-to-end run, and a guide that lets third parties build plugins outside the repo
 
 ## Phase Details
@@ -213,7 +213,7 @@ Plans:
   3. `fili plugins run-once youtube` returns new uploads from the channels in its TOML, read from their uploads playlists. After `fili auth login youtube`, it also returns new uploads from the user's subscriptions.
   4. YouTube polls use only low-cost Data API endpoints (no 100-unit search calls). A quota-exceeded response shows up as a clear, named error, not a silently empty poll.
   5. Each plugin's unit tests pass against recorded API fixtures with no network access and no API keys.
-**Plans:** 12/12 plans executed
+**Plans:** 12/12 plans complete
 
 Plans:
 **Wave 1**
@@ -265,5 +265,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
 | 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
-| 7. Reddit & YouTube Plugins | 12/12 | In Progress | - |
+| 7. Reddit & YouTube Plugins | 12/12 | Complete    | 2026-11-12 |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
