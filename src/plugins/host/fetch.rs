@@ -38,6 +38,34 @@ pub const MAX_REDIRECTS: usize = 5;
 /// Longest text kept from a transport failure, in characters.
 const TRANSPORT_TEXT_CLIP: usize = 256;
 
+/// Largest request body a plugin may send, in bytes (1 MiB; WD-14). Requests
+/// are held whole in memory, so they are bounded like responses are.
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// Most request headers a plugin may send (WD-14).
+const MAX_REQUEST_HEADERS: usize = 100;
+
+/// Most header text a plugin may send: names plus values, in bytes (64 KiB;
+/// WD-14).
+const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+
+/// Longest url a plugin may send, in bytes (8 KiB; WD-14).
+const MAX_URL_BYTES: usize = 8 * 1024;
+
+/// Request headers a plugin may not set (WD-13). The HTTP client owns message
+/// framing and the connection, and a `host` header could point an allowed
+/// address at another virtual host and so defeat the allowlist. All lowercase.
+const FORBIDDEN_REQUEST_HEADERS: [&str; 8] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "proxy-connection",
+    "upgrade",
+    "te",
+    "trailer",
+];
+
 // ── Policy ────────────────────────────────────────────────────────────────────
 
 /// The hosts a consumer may fetch from.
@@ -145,22 +173,60 @@ impl FetchPolicy {
         self.timeout
     }
 
-    /// Judges `request` before any fetcher exists.
+    /// Judges `request` before any fetcher exists or any connection is made.
+    ///
+    /// The url rules come first, then the rest of the request: body size,
+    /// header count and size, header syntax and the forbidden headers. This one
+    /// check serves both a source's `fetch` and a fetcher's `send`, so a rule
+    /// added here holds at both. No error text carries guest data.
     ///
     /// # Errors
-    /// `InvalidRequest` for a url that cannot be used and `Denied` for a host
-    /// outside the allowlist.
+    /// `InvalidRequest` for a url, body or header that cannot be used and
+    /// `Denied` for a host outside the allowlist.
     pub fn check(&self, request: &types::Request) -> Result<url::Url, types::FetchError> {
+        let invalid = |text: &str| types::FetchError::InvalidRequest(text.to_string());
+        // Length first: a huge url is refused before it is parsed.
+        if request.url.len() > MAX_URL_BYTES {
+            return Err(invalid("url is too long"));
+        }
         let text = request.url.trim();
         if text.is_empty() {
-            return Err(types::FetchError::InvalidRequest(
-                "url is empty".to_string(),
-            ));
+            return Err(invalid("url is empty"));
         }
         // The url is never echoed back: it is guest data and may carry secrets.
-        let url = url::Url::parse(text)
-            .map_err(|_| types::FetchError::InvalidRequest("url cannot be parsed".to_string()))?;
+        let url = url::Url::parse(text).map_err(|_| invalid("url cannot be parsed"))?;
         self.check_url(&url)?;
+
+        if request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_REQUEST_BODY_BYTES)
+        {
+            return Err(types::FetchError::InvalidRequest(format!(
+                "request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
+            )));
+        }
+        let header_bytes: usize = request
+            .headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        if request.headers.len() > MAX_REQUEST_HEADERS || header_bytes > MAX_REQUEST_HEADER_BYTES {
+            return Err(invalid("headers are too large"));
+        }
+        // Syntax: a name that is not a token or a value with a line break.
+        to_header_map(&request.headers)?;
+        for (name, _) in &request.headers {
+            // Show the fixed list entry, never the guest's own text.
+            if let Some(forbidden) = FORBIDDEN_REQUEST_HEADERS
+                .iter()
+                .find(|forbidden| name.eq_ignore_ascii_case(forbidden))
+            {
+                return Err(types::FetchError::InvalidRequest(format!(
+                    "header `{forbidden}` is not allowed"
+                )));
+            }
+        }
         Ok(url)
     }
 
@@ -273,8 +339,6 @@ impl Egress {
         let mut method = to_method(&request.method)?;
         let mut headers = request.headers;
         let mut body = request.body;
-        // Reject a header that cannot be sent before any connection.
-        to_header_map(&headers)?;
         let client = self.client()?;
 
         let mut hops = 0;
@@ -1118,6 +1182,283 @@ mod tests {
             assert_eq!(echoed, Some(url.as_str()), "answer for another request");
         }
         assert_eq!(route.calls(), 8);
+    }
+
+    // ── Request validation tests (no wasm) ────────────────────────────────────
+
+    fn with_headers(url: &str, headers: &[(&str, &str)]) -> types::Request {
+        types::Request {
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            ..get(url)
+        }
+    }
+
+    fn invalid_text(result: &Result<impl std::fmt::Debug, types::FetchError>) -> Option<&str> {
+        match result {
+            Err(types::FetchError::InvalidRequest(text)) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_header_is_refused_before_any_connection() {
+        let server = TestHttpServer::start(|_| Reply::ok("x")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let egress = Egress::new();
+
+        for name in ["host", "Host", "HOST"] {
+            let request = with_headers(&server.url("/h"), &[(name, "other.example")]);
+            let result = egress.execute(&policy, request, in_five_seconds()).await;
+            assert!(invalid_text(&result).is_some(), "{name}: {result:?}");
+        }
+        assert!(server.seen().is_empty(), "a refused request made a connection");
+    }
+
+    #[test]
+    fn framing_and_hop_by_hop_headers_are_refused() {
+        let policy = policy("p", &["127.0.0.1"]);
+        for name in [
+            "Content-Length",
+            "TRANSFER-ENCODING",
+            "Connection",
+            "proxy-CONNECTION",
+            "Upgrade",
+            "TE",
+            "Trailer",
+        ] {
+            let result = policy.check(&with_headers("http://127.0.0.1/", &[(name, "x")]));
+            assert!(invalid_text(&result).is_some(), "{name}: {result:?}");
+        }
+        let harmless = policy.check(&with_headers("http://127.0.0.1/", &[("x-custom", "1")]));
+        assert!(harmless.is_ok(), "{harmless:?}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_header_is_refused_without_echoing_it() {
+        let server = TestHttpServer::start(|_| Reply::ok("x")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let egress = Egress::new();
+
+        for (name, value) in [("bad name", "ok"), ("x-ok", "ok\r\nx-injected: 1")] {
+            let request = with_headers(&server.url("/m"), &[(name, value)]);
+            let result = egress.execute(&policy, request, in_five_seconds()).await;
+            let text = invalid_text(&result).unwrap_or_else(|| panic!("{result:?}"));
+            assert!(!text.contains("injected"), "{text}");
+            assert!(!text.contains("bad name"), "{text}");
+        }
+        assert!(server.seen().is_empty(), "a refused request made a connection");
+    }
+
+    #[test]
+    fn too_many_or_too_large_headers_are_refused() {
+        let policy = policy("p", &["127.0.0.1"]);
+
+        let many: Vec<(String, String)> = (0..=MAX_REQUEST_HEADERS)
+            .map(|n| (format!("x-h{n}"), "v".to_string()))
+            .collect();
+        let request = types::Request {
+            headers: many,
+            ..get("http://127.0.0.1/")
+        };
+        let result = policy.check(&request);
+        assert!(invalid_text(&result).is_some(), "101 headers: {result:?}");
+
+        // One header whose name and value total the limit plus one byte.
+        let value = "v".repeat(MAX_REQUEST_HEADER_BYTES - "x-big".len() + 1);
+        let result = policy.check(&with_headers("http://127.0.0.1/", &[("x-big", &value)]));
+        assert!(invalid_text(&result).is_some(), "over the byte limit: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_body_is_refused() {
+        let server = TestHttpServer::start(|_| Reply::ok("x")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let request = types::Request {
+            method: types::Method::Post,
+            body: Some(vec![0_u8; MAX_REQUEST_BODY_BYTES + 1]),
+            ..get(&server.url("/b"))
+        };
+
+        let result = Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await;
+
+        let text = invalid_text(&result).unwrap_or_else(|| panic!("{result:?}"));
+        assert!(text.contains("1048576"), "{text}");
+        assert!(server.seen().is_empty(), "a refused request made a connection");
+    }
+
+    /// `http://127.0.0.1/?q=aaa...` padded to exactly `length` bytes.
+    fn url_of_length(length: usize) -> String {
+        let base = "http://127.0.0.1/?q=";
+        format!("{base}{}", "a".repeat(length - base.len()))
+    }
+
+    #[test]
+    fn an_oversized_url_is_refused() {
+        let policy = policy("p", &["127.0.0.1"]);
+
+        let result = policy.check(&request(&url_of_length(MAX_URL_BYTES + 1)));
+
+        assert!(invalid_text(&result).is_some(), "{result:?}");
+    }
+
+    #[test]
+    fn a_request_at_the_limits_is_accepted() {
+        let policy = policy("p", &["127.0.0.1"]);
+
+        let body = types::Request {
+            method: types::Method::Post,
+            body: Some(vec![0_u8; MAX_REQUEST_BODY_BYTES]),
+            ..get("http://127.0.0.1/")
+        };
+        assert!(policy.check(&body).is_ok(), "a 1 MiB body");
+
+        let headers = types::Request {
+            headers: (0..MAX_REQUEST_HEADERS)
+                .map(|n| (format!("x-h{n}"), "v".to_string()))
+                .collect(),
+            ..get("http://127.0.0.1/")
+        };
+        assert!(policy.check(&headers).is_ok(), "100 headers");
+
+        let value = "v".repeat(MAX_REQUEST_HEADER_BYTES - "x-big".len());
+        let big = with_headers("http://127.0.0.1/", &[("x-big", &value)]);
+        assert!(policy.check(&big).is_ok(), "exactly 64 KiB of header text");
+
+        let url = request(&url_of_length(MAX_URL_BYTES));
+        assert!(policy.check(&url).is_ok(), "an 8 KiB url");
+    }
+
+    // ── Fidelity and log hygiene tests (loopback server, no wasm) ─────────────
+
+    fn values_of<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+        headers
+            .iter()
+            .filter(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn egress_returns_every_same_name_response_header_in_order() {
+        let server = TestHttpServer::start(|_| {
+            Reply::ok("x")
+                .with_header("x-dup", "a")
+                .with_header("x-dup", "b")
+                .with_header("x-dup", "c")
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let response = Egress::new()
+            .execute(&policy, get(&server.url("/d")), in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        assert_eq!(values_of(&response.headers, "x-dup"), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn egress_request_headers_reach_the_server_in_order_with_duplicates() {
+        let server = TestHttpServer::start(|_| Reply::ok("x")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let request = with_headers(
+            &server.url("/m"),
+            &[("x-multi", "1"), ("x-other", "z"), ("x-multi", "2")],
+        );
+
+        Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(values_of(&seen[0].headers, "x-multi"), ["1", "2"]);
+        assert_eq!(seen[0].header("x-other"), Some("z"));
+    }
+
+    #[tokio::test]
+    async fn egress_returns_binary_bodies_unchanged() {
+        let server = TestHttpServer::start(|seen| Reply::ok(seen.body.clone())).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let body: Vec<u8> = (0..4).flat_map(|_| 0..=255_u8).collect();
+        let request = types::Request {
+            method: types::Method::Post,
+            body: Some(body.clone()),
+            ..get(&server.url("/echo"))
+        };
+
+        let response = Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        assert_eq!(server.seen()[0].body, body);
+        assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn egress_returns_a_429_as_an_ordinary_response() {
+        let server = TestHttpServer::start(|_| {
+            Reply::status(429)
+                .with_header("retry-after", "7")
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let response = Egress::new()
+            .execute(&policy, get(&server.url("/limited")), in_five_seconds())
+            .await
+            .expect("a 429 is an ordinary response");
+
+        assert_eq!(response.status, 429);
+        assert_eq!(values_of(&response.headers, "retry-after"), ["7"]);
+    }
+
+    #[tokio::test]
+    async fn egress_never_logs_headers_bodies_or_query_strings() {
+        let server = TestHttpServer::start(|_| Reply::ok("SECRET-RESPONSE")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let request = types::Request {
+            method: types::Method::Post,
+            headers: vec![("authorization".to_string(), "Bearer SECRET-AUTH".to_string())],
+            body: Some(b"SECRET-BODY".to_vec()),
+            ..get(&server.url("/secret/path?token=SECRET-QUERY"))
+        };
+        let (logs, _guard) = LogCapture::start();
+
+        let response = Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        assert_eq!(response.body, b"SECRET-RESPONSE");
+        let text = logs.text();
+        let ours: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("fili::plugins"))
+            .collect();
+        assert!(
+            ours.iter()
+                .any(|line| line.contains("outbound request") && line.contains("127.0.0.1")),
+            "no outbound request line: {text}"
+        );
+        for line in &ours {
+            for secret in [
+                "SECRET-QUERY",
+                "SECRET-AUTH",
+                "SECRET-BODY",
+                "SECRET-RESPONSE",
+                "/secret/path",
+            ] {
+                assert!(!line.contains(secret), "{secret} leaked: {line}");
+            }
+        }
     }
 
     // ── Policy Tests (no wasm) ────────────────────────────────────────────────
