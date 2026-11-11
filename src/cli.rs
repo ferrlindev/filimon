@@ -156,6 +156,13 @@ pub enum AuthCommand {
         #[arg(long)]
         no_browser: bool,
     },
+
+    /// Show every stored login and its expiry state; --json prints one JSON array.
+    Status {
+        /// Print the rows as one JSON array
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The `fili plugins` subcommands.
@@ -301,6 +308,28 @@ mod tests {
     #[test]
     fn auth_login_requires_a_plugin_name() {
         assert!(Cli::try_parse_from(["fili", "auth", "login"]).is_err());
+    }
+
+    #[test]
+    fn auth_status_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "status"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Status { json: false }
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_status_json_flag_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "status", "--json"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Status { json: true }
+            }
+        ));
     }
 
     #[test]

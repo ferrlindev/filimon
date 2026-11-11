@@ -20,12 +20,16 @@
 use std::io::Write;
 use std::path::Path;
 
+use miette::IntoDiagnostic;
+
 use crate::cli::AuthCommand;
 use crate::commands::plugins::state_dir_for;
+use crate::output::sanitize_for_terminal;
 use crate::plugins::auth::login::{LoginHooks, LoginOptions, LoginSummary, login};
 use crate::plugins::auth::store::TokenStore;
 use crate::plugins::config::{
-    ListedPlugin, OAuthConfig, RegistryListing, list_registry, load_plugin,
+    ListedPlugin, OAuthConfig, OAuthDeclared, OAuthProbeReport, RegistryListing, list_registry,
+    load_plugin, probe_oauth_sources,
 };
 use crate::plugins::host::engine::clean_guest_text;
 
@@ -62,6 +66,13 @@ pub async fn dispatch(
                 &mut err,
             )
             .await
+        }
+        AuthCommand::Status { json } => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
+            status(registry, state_dir_flag, *json, &mut out, &mut err)
         }
     }
 }
@@ -255,10 +266,88 @@ async fn perform_login(
     Ok(())
 }
 
+// ── Status ────────────────────────────────────────────────────────────────────
+
+/// A stored login's state as `status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusState {
+    LoggedIn,
+    Expired,
+    NeedsLogin,
+    NotLoggedIn,
+    /// The token file cannot be used; the cleaned text names the plugin, the
+    /// path and a fixed reason, never the file's content (D-02).
+    Unreadable(String),
+}
+
+/// One `status` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRow {
+    pub plugin: String,
+    pub state: StatusState,
+    /// Unix seconds; `None` when no file could be read.
+    pub expires_at: Option<i64>,
+    /// `None` when no file could be read.
+    pub has_refresh_token: Option<bool>,
+}
+
+/// The rows `status` shows.
+#[must_use]
+pub fn collect_status(
+    report: &OAuthProbeReport,
+    state_dir: &Path,
+    now: i64,
+    err: &mut impl Write,
+) -> Vec<StatusRow> {
+    let _ = (report, state_dir, now, err);
+    todo!("RED stub")
+}
+
+/// Relative expiry text.
+#[must_use]
+pub fn describe_expiry(expires_at: i64, now: i64) -> String {
+    let _ = (expires_at, now);
+    todo!("RED stub")
+}
+
+/// The human table.
+///
+/// # Errors
+/// Returns the write error of `out`.
+pub fn render_status(rows: &[StatusRow], now: i64, out: &mut impl Write) -> std::io::Result<()> {
+    let _ = (rows, now, out);
+    todo!("RED stub")
+}
+
+/// The JSON array.
+///
+/// # Errors
+/// Returns the write error of `out`.
+pub fn render_status_json(rows: &[StatusRow], out: &mut impl Write) -> std::io::Result<()> {
+    let _ = (rows, out);
+    todo!("RED stub")
+}
+
+/// `fili auth status`.
+///
+/// # Errors
+/// The registry's diagnostics, a state directory error, or an io error.
+pub fn status(
+    registry: &Path,
+    state_dir_flag: Option<&Path>,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> miette::Result<()> {
+    let _ = (registry, state_dir_flag, json, out, err);
+    todo!("RED stub")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::auth::testing::{oauth_config_for, token_body};
+    use crate::plugins::auth::store::{AccessToken, RefreshToken, StoredTokens};
+    use crate::plugins::auth::testing::{oauth_config_for, token_body, unix_now};
     use crate::plugins::host::testing::{Reply, TestHttpServer};
     use std::cell::Cell;
     use std::path::PathBuf;
@@ -572,6 +661,331 @@ mod tests {
             assert!(!shown.contains(secret), "{secret} leaked: {shown}");
         }
         assert!(!state.path().join("auth").exists());
+    }
+
+    // ── status ───────────────────────────────────────────────────────────────
+
+    const OAUTH_PLUGIN_TOML: &str = "[host]\npoll_interval_secs = 60\n\n[host.oauth]\nauthorize_url = \"https://auth.example/authorize\"\ntoken_url = \"https://auth.example/token\"\nclient_id = \"c\"\n";
+
+    /// A registry with one source per `(name, plugin toml)`; a `None` plugin
+    /// file is not written, so that source's file is missing.
+    fn registry_of(dir: &Path, sources: &[(&str, Option<&str>)]) -> PathBuf {
+        let mut text = String::new();
+        for (name, plugin_toml) in sources {
+            text.push_str(&source_table(name, true));
+            if let Some(plugin_toml) = plugin_toml {
+                std::fs::write(dir.join(format!("{name}.toml")), plugin_toml)
+                    .expect("plugin toml");
+            }
+        }
+        let path = dir.join("filimon.toml");
+        std::fs::write(&path, text).expect("registry");
+        path
+    }
+
+    /// Stores a login for `alias`.
+    fn put_login(
+        state: &Path,
+        alias: &str,
+        access: &str,
+        refresh: Option<&str>,
+        expires_at: i64,
+        needs_login: bool,
+    ) {
+        TokenStore::new(state, alias)
+            .write(&StoredTokens {
+                access_token: AccessToken::new(access.to_string()),
+                refresh_token: refresh.map(|text| RefreshToken::new(text.to_string())),
+                expires_at,
+                token_type: None,
+                scope: None,
+                needs_login,
+                obtained_at: expires_at - 3600,
+            })
+            .expect("write the login");
+    }
+
+    /// The whitespace-separated cells of the table line that starts with `plugin`.
+    fn row_cells(out: &str, plugin: &str) -> Vec<String> {
+        out.lines()
+            .find(|line| line.split_whitespace().next() == Some(plugin))
+            .unwrap_or_else(|| panic!("no row for {plugin}: {out}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Runs `status` and returns (stdout, stderr).
+    fn run_status(registry: &Path, state: &Path, json: bool) -> (String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        status(registry, Some(state), json, &mut out, &mut err).expect("status succeeds");
+        (
+            String::from_utf8(out).expect("utf8"),
+            String::from_utf8(err).expect("utf8"),
+        )
+    }
+
+    /// Five plugins in the five states, with sentinel tokens.
+    fn five_states(dir: &Path) -> (PathBuf, PathBuf) {
+        let registry = registry_of(
+            dir,
+            &[
+                ("broken", Some(OAUTH_PLUGIN_TOML)),
+                ("fresh", Some(OAUTH_PLUGIN_TOML)),
+                ("nologin", Some(OAUTH_PLUGIN_TOML)),
+                ("reauth", Some(OAUTH_PLUGIN_TOML)),
+                ("stale", Some(OAUTH_PLUGIN_TOML)),
+            ],
+        );
+        let state = dir.join("state");
+        let now = unix_now();
+        put_login(&state, "fresh", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now + 3600, false);
+        put_login(&state, "stale", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now - 180, false);
+        put_login(&state, "reauth", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now + 3600, true);
+        std::fs::create_dir_all(state.join("auth")).expect("auth dir");
+        std::fs::write(
+            state.join("auth").join("broken.json"),
+            b"{ not json AT-SENTINEL-S",
+        )
+        .expect("corrupt file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                state.join("auth").join("broken.json"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .expect("chmod");
+        }
+        (registry, state)
+    }
+
+    #[test]
+    fn status_lists_each_state_without_token_values() {
+        let dir = TempDir::new().expect("tempdir");
+        let (registry, state) = five_states(dir.path());
+
+        let (out, err) = run_status(&registry, &state, false);
+
+        let state_of = |plugin: &str| row_cells(&out, plugin)[1].clone();
+        assert_eq!(state_of("broken"), "unreadable", "{out}");
+        assert_eq!(state_of("fresh"), "logged-in", "{out}");
+        assert_eq!(state_of("nologin"), "not-logged-in", "{out}");
+        assert_eq!(state_of("reauth"), "needs-login", "{out}");
+        assert_eq!(state_of("stale"), "expired", "{out}");
+        for secret in ["AT-SENTINEL-S", "RT-SENTINEL-S"] {
+            assert!(!out.contains(secret) && !err.contains(secret), "{out}{err}");
+        }
+    }
+
+    #[test]
+    fn status_json_is_an_array_with_no_token_fields() {
+        let dir = TempDir::new().expect("tempdir");
+        let (registry, state) = five_states(dir.path());
+
+        let (out, _) = run_status(&registry, &state, true);
+
+        let value: serde_json::Value = serde_json::from_str(&out).expect("one JSON value");
+        let rows = value.as_array().expect("an array");
+        assert_eq!(rows.len(), 5, "{out}");
+        for row in rows {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["detail", "expires_at", "has_refresh_token", "plugin", "state"]
+            );
+        }
+        let fresh = rows.iter().find(|row| row["plugin"] == "fresh").expect("fresh");
+        assert_eq!(fresh["state"], "logged-in");
+        assert_eq!(fresh["has_refresh_token"], true);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(fresh["expires_at"].as_str().expect("text"))
+                .is_ok()
+        );
+        let nologin = rows.iter().find(|row| row["plugin"] == "nologin").expect("row");
+        assert!(nologin["expires_at"].is_null() && nologin["has_refresh_token"].is_null());
+        for secret in ["AT-SENTINEL-S", "RT-SENTINEL-S"] {
+            assert!(!out.contains(secret), "{out}");
+        }
+    }
+
+    #[test]
+    fn status_says_to_log_in_again_for_a_needs_login_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let (registry, state) = five_states(dir.path());
+
+        let (out, _) = run_status(&registry, &state, false);
+
+        assert!(
+            out.contains("`reauth`: run `fili auth login reauth` to log in again"),
+            "{out}"
+        );
+        assert!(!out.contains("fili auth login fresh"), "{out}");
+    }
+
+    #[test]
+    fn status_shows_an_expired_row_with_its_refresh_flag() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = registry_of(
+            dir.path(),
+            &[
+                ("renewable", Some(OAUTH_PLUGIN_TOML)),
+                ("terminal", Some(OAUTH_PLUGIN_TOML)),
+            ],
+        );
+        let state = dir.path().join("state");
+        let now = unix_now();
+        put_login(&state, "renewable", "AT-SENTINEL-S", Some("RT-SENTINEL-S"), now - 600, false);
+        put_login(&state, "terminal", "AT-SENTINEL-S", None, now - 600, false);
+
+        let (out, _) = run_status(&registry, &state, false);
+
+        let renewable = row_cells(&out, "renewable");
+        assert_eq!(renewable[1], "expired");
+        assert_eq!(renewable.last().map(String::as_str), Some("yes"));
+        let terminal = row_cells(&out, "terminal");
+        assert_eq!(terminal[1], "expired");
+        assert_eq!(terminal.last().map(String::as_str), Some("no"));
+        assert!(out.contains("fili auth login terminal"), "{out}");
+        assert!(!out.contains("fili auth login renewable"), "{out}");
+    }
+
+    #[test]
+    fn status_works_while_the_state_lock_is_held() {
+        let dir = TempDir::new().expect("tempdir");
+        let (registry, state) = five_states(dir.path());
+        let _held = crate::plugins::host::cursor::CursorStore::open(&state)
+            .expect("hold the state directory lock");
+
+        let (out, _) = run_status(&registry, &state, false);
+
+        assert_eq!(row_cells(&out, "fresh")[1], "logged-in", "{out}");
+    }
+
+    #[test]
+    fn status_creates_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = registry_of(dir.path(), &[("stub", Some(OAUTH_PLUGIN_TOML))]);
+        let state = dir.path().join("state");
+
+        let (out, _) = run_status(&registry, &state, false);
+
+        assert_eq!(row_cells(&out, "stub")[1], "not-logged-in", "{out}");
+        assert!(!state.exists(), "status created the state directory");
+    }
+
+    #[test]
+    fn status_skips_plugins_that_declare_no_oauth_and_have_no_login() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = registry_of(
+            dir.path(),
+            &[
+                ("plain", Some(MINIMAL_TOML)),
+                ("withauth", Some(OAUTH_PLUGIN_TOML)),
+            ],
+        );
+        let state = dir.path().join("state");
+
+        let (out, err) = run_status(&registry, &state, false);
+
+        assert!(!out.contains("plain"), "{out}");
+        assert!(!err.contains("plain"), "{err}");
+        assert_eq!(row_cells(&out, "withauth")[1], "not-logged-in");
+
+        // Nothing declares OAuth and nothing is stored: the empty-state line.
+        let registry = registry_of(dir.path(), &[("plain", Some(MINIMAL_TOML))]);
+        let (out, _) = run_status(&registry, &state, false);
+        assert!(
+            out.contains("No registered plugin declares [host.oauth] or has a stored login in "),
+            "{out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_an_unreadable_token_file_naming_plugin_and_path_without_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().expect("tempdir");
+        let registry = registry_of(dir.path(), &[("loose", Some(OAUTH_PLUGIN_TOML))]);
+        let state = dir.path().join("state");
+        put_login(&state, "loose", "AT-SENTINEL-S", None, unix_now() + 3600, false);
+        let file = state.join("auth").join("loose.json");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let (out, err) = run_status(&registry, &state, false);
+
+        assert_eq!(row_cells(&out, "loose")[1], "unreadable", "{out}");
+        let detail = out
+            .lines()
+            .find(|line| line.starts_with("`loose`: "))
+            .unwrap_or_else(|| panic!("no detail line: {out}"));
+        assert!(detail.contains("loose"), "{detail}");
+        assert!(
+            detail.contains(&file.display().to_string()),
+            "path missing: {detail}"
+        );
+        assert!(detail.contains("permissions"), "{detail}");
+        assert!(!out.contains("AT-SENTINEL-S") && !err.contains("AT-SENTINEL-S"));
+        assert_eq!(
+            std::fs::metadata(&file).expect("meta").permissions().mode() & 0o777,
+            0o644,
+            "status never repairs the file"
+        );
+    }
+
+    #[test]
+    fn status_notes_a_plugin_whose_config_cannot_be_read() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = registry_of(
+            dir.path(),
+            &[
+                ("garbled", Some("this = = broken")),
+                ("gone", None),
+                ("garbled-with-login", Some("this = = broken")),
+            ],
+        );
+        let state = dir.path().join("state");
+        put_login(
+            &state,
+            "garbled-with-login",
+            "AT-SENTINEL-S",
+            None,
+            unix_now() + 3600,
+            false,
+        );
+
+        let (out, err) = run_status(&registry, &state, false);
+
+        assert!(!out.lines().any(|l| l.starts_with("garbled ")), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("gone ")), "{out}");
+        assert!(
+            err.contains("skipped plugin `garbled`: its config could not be read"),
+            "{err}"
+        );
+        assert!(
+            err.contains("skipped plugin `gone`: its config could not be read"),
+            "{err}"
+        );
+        assert!(!err.contains("garbled-with-login"), "{err}");
+        assert_eq!(row_cells(&out, "garbled-with-login")[1], "logged-in", "{out}");
+    }
+
+    #[test]
+    fn describe_expiry_formats_each_range() {
+        let now = 1_000_000;
+        assert_eq!(describe_expiry(now + 30, now), "in 30s");
+        assert_eq!(describe_expiry(now + 3570, now), "in 59m 30s");
+        assert_eq!(describe_expiry(now + 7500, now), "in 2h 5m");
+        assert_eq!(describe_expiry(now + 90_000, now), "in 1d 1h");
+        assert_eq!(describe_expiry(now, now), "now");
+        assert_eq!(describe_expiry(now - 180, now), "3m 0s ago");
     }
 
     /// A cloneable in-memory writer, for a test that reads the output while the

@@ -636,6 +636,63 @@ pub fn list_registry(path: &Path) -> Result<RegistryListing, ConfigErrors> {
     })
 }
 
+// ── OAuth Probe ───────────────────────────────────────────────────────────────
+
+/// Whether a source's plugin file declares `[host.oauth]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthDeclared {
+    Yes,
+    No,
+    /// The plugin file could not be read or parsed; a fixed phrase that never
+    /// echoes file content.
+    Unknown(String),
+}
+
+/// One source and what its plugin file says about `[host.oauth]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthProbe {
+    pub name: String,
+    pub declares: OAuthDeclared,
+}
+
+/// Which registered sources declare `[host.oauth]`, from a lenient read of
+/// their plugin files.
+#[derive(Debug, Clone)]
+pub struct OAuthProbeReport {
+    /// The registry file's directory; every relative path resolves against it.
+    pub base_dir: PathBuf,
+    /// Sources with valid names, enabled or not, in name order.
+    pub sources: Vec<OAuthProbe>,
+}
+
+/// A plugin file seen only as far as `[host.oauth]`: unknown keys are fine and
+/// nothing in the table is validated.
+#[derive(Deserialize)]
+struct OAuthView {
+    host: Option<HostView>,
+}
+
+#[derive(Deserialize)]
+struct HostView {
+    oauth: Option<toml::Value>,
+}
+
+/// Reports, for every source in the registry at `path` (enabled or not),
+/// whether its plugin file declares `[host.oauth]`.
+///
+/// The read is lenient on purpose: it parses only far enough to see whether
+/// the table is there, never validates it, and touches no environment or
+/// secret, so it works for a plugin whose client secret is not set yet. A
+/// plugin file that cannot be read or parsed is `Unknown` with a fixed phrase.
+///
+/// # Errors
+/// `RegistryUnreadable` or `RegistryMalformed` when the registry file cannot
+/// be read or parsed.
+pub fn probe_oauth_sources(path: &Path) -> Result<OAuthProbeReport, ConfigErrors> {
+    let _ = path;
+    todo!("RED stub")
+}
+
 /// Resolves a parsed plugin's secrets and builds its `PluginConfig`.
 fn finish_plugin(
     name: &str,
@@ -3296,5 +3353,80 @@ component = "other-fetcher.wasm"
         assert!(registry.sources["good"].plugin.is_some());
         assert!(registry.crawler.is_none());
         assert!(load(&dir).is_err(), "the strict loader reports it");
+    }
+
+    // ── probe_oauth_sources ──────────────────────────────────────────────────
+
+    const OAUTH_PLUGIN: &str = "[host]\npoll_interval_secs = 60\n\n[host.oauth]\nauthorize_url = \"https://auth.example/authorize\"\ntoken_url = \"https://auth.example/token\"\nclient_id = \"c\"\nclient_secret_env = \"PROBE_SECRET_UNSET_EVERYWHERE\"\n";
+
+    fn source(name: &str, enabled: bool) -> String {
+        format!(
+            "[sources.{name}]\ncomponent = \"{name}.wasm\"\nconfig = \"{name}.toml\"\nenabled = {enabled}\n\n"
+        )
+    }
+
+    #[test]
+    fn probe_oauth_sources_reports_declared_undeclared_and_unreadable() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut registry = String::new();
+        for name in ["declared", "plain", "missing", "broken"] {
+            registry.push_str(&source(name, true));
+        }
+        // A disabled source is still probed, and a bad name is not listed.
+        registry.push_str(&source("off", false));
+        registry.push_str(&source("Bad_Name", true));
+        write(&dir, "filimon.toml", &registry);
+        write(&dir, "declared.toml", OAUTH_PLUGIN);
+        write(&dir, "plain.toml", "[host]\npoll_interval_secs = 60\n");
+        write(&dir, "broken.toml", "this is = = not toml SECRET-FILE-CONTENT\n");
+        write(&dir, "off.toml", OAUTH_PLUGIN);
+
+        let report = probe_oauth_sources(&dir.path().join("filimon.toml")).expect("probe");
+
+        assert_eq!(report.base_dir, dir.path());
+        let seen: Vec<(&str, &OAuthDeclared)> = report
+            .sources
+            .iter()
+            .map(|probe| (probe.name.as_str(), &probe.declares))
+            .collect();
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        let find = |name: &str| {
+            report
+                .sources
+                .iter()
+                .find(|probe| probe.name == name)
+                .map(|probe| probe.declares.clone())
+        };
+        assert_eq!(find("declared"), Some(OAuthDeclared::Yes));
+        assert_eq!(find("plain"), Some(OAuthDeclared::No));
+        assert_eq!(find("off"), Some(OAuthDeclared::Yes));
+        assert_eq!(find("Bad_Name"), None);
+        let Some(OAuthDeclared::Unknown(missing)) = find("missing") else {
+            panic!("a missing file is unknown");
+        };
+        assert_eq!(missing, "the plugin file cannot be read");
+        let Some(OAuthDeclared::Unknown(broken)) = find("broken") else {
+            panic!("a broken file is unknown");
+        };
+        assert_eq!(broken, "the plugin file is not valid TOML");
+        assert!(!broken.contains("SECRET-FILE-CONTENT"));
+    }
+
+    #[test]
+    fn probe_does_not_read_dotenv_or_resolve_secrets() {
+        let dir = TempDir::new().expect("tempdir");
+        write(&dir, "filimon.toml", &source("declared", true));
+        write(&dir, "declared.toml", OAUTH_PLUGIN);
+        assert!(!dir.path().join(".env").exists());
+
+        let report = probe_oauth_sources(&dir.path().join("filimon.toml"))
+            .expect("an unset secret does not stop the probe");
+
+        assert_eq!(report.sources.len(), 1);
+        assert_eq!(report.sources[0].declares, OAuthDeclared::Yes);
+        assert!(
+            load(&dir).is_err(),
+            "the strict loader does need that secret"
+        );
     }
 }
