@@ -213,12 +213,23 @@ pub(crate) struct SeenRequest {
     pub(crate) body: Vec<u8>,
 }
 
+impl SeenRequest {
+    /// The first header named `name` (lowercase), if any.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 /// What a `TestHttpServer` answers one request with.
 #[derive(Debug, Clone)]
 pub(crate) struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    delay: Duration,
     omit_length: bool,
 }
 
@@ -229,8 +240,34 @@ impl Reply {
             status: 200,
             headers: vec![],
             body: body.into(),
+            delay: Duration::ZERO,
             omit_length: false,
         }
+    }
+
+    /// A redirect with this status and a `Location` header.
+    pub(crate) fn redirect(status: u16, location: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("location".to_string(), location.to_string())],
+            body: vec![],
+            delay: Duration::ZERO,
+            omit_length: false,
+        }
+    }
+
+    /// An answer with this status and no body.
+    pub(crate) fn status(status: u16) -> Self {
+        Self {
+            status,
+            ..Self::ok("")
+        }
+    }
+
+    /// Waits `delay` after reading the request before it answers.
+    pub(crate) fn delayed(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 
     /// An answer with this status and header, for example an `x-test` header.
@@ -375,6 +412,9 @@ async fn serve_connection(
     };
     seen.lock().expect("seen requests").push(request.clone());
     let reply = handler(&request);
+    if !reply.delay.is_zero() {
+        tokio::time::sleep(reply.delay).await;
+    }
 
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n",

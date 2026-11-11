@@ -514,7 +514,11 @@ mod tests {
     use crate::plugins::host::instance::WasmtimeFactory;
     use crate::plugins::host::loader::{load_fetcher, load_source};
     use crate::plugins::host::once::poll_once;
-    use crate::plugins::host::testing::{self, LogCapture, Reply, TestHttpServer, fixture_wasm};
+    use std::sync::atomic::AtomicU16;
+
+    use crate::plugins::host::testing::{
+        self, LogCapture, Reply, SeenRequest, TestHttpServer, fixture_wasm,
+    };
 
     fn fetcher_route(engine: &HostEngine, allow: &[&str]) -> Arc<FetchRoute> {
         let path = fixture_wasm("stub-fetcher", "stub_fetcher.wasm");
@@ -681,6 +685,274 @@ mod tests {
 
         assert!(matches!(result, Err(types::FetchError::Denied(_))), "{result:?}");
         assert!(server.seen().is_empty(), "a denied send made a connection");
+    }
+
+    // ── Redirect, deadline and method tests ───────────────────────────────────
+
+    /// A server whose handler also learns the server's own port, so a reply
+    /// can point at `localhost:<port>`.
+    async fn start_with_port(
+        handler: impl Fn(&SeenRequest, u16) -> Reply + Send + Sync + 'static,
+    ) -> TestHttpServer {
+        let port = Arc::new(AtomicU16::new(0));
+        let shared = Arc::clone(&port);
+        let server =
+            TestHttpServer::start(move |seen| handler(seen, shared.load(Ordering::SeqCst))).await;
+        port.store(server.port(), Ordering::SeqCst);
+        server
+    }
+
+    fn post(url: &str, headers: &[(&str, &str)]) -> types::Request {
+        types::Request {
+            method: types::Method::Post,
+            url: url.to_string(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            body: Some(b"payload".to_vec()),
+        }
+    }
+
+    fn targets(server: &TestHttpServer) -> Vec<String> {
+        server.seen().into_iter().map(|seen| seen.target).collect()
+    }
+
+    #[tokio::test]
+    async fn egress_follows_a_redirect_to_an_allowed_host() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/start" => Reply::redirect(302, "/end"),
+            _ => Reply::ok("done"),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let response = Egress::new()
+            .execute(&policy, get(&server.url("/start")), in_five_seconds())
+            .await
+            .expect("the redirect is followed");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"done");
+        assert_eq!(targets(&server), ["/start", "/end"]);
+    }
+
+    #[tokio::test]
+    async fn egress_denies_a_redirect_to_a_host_outside_the_allowlist() {
+        let server = start_with_port(|seen, port| match seen.target.as_str() {
+            "/r" => Reply::redirect(302, &format!("http://localhost:{port}/x")),
+            _ => Reply::ok("reached"),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let result = Egress::new()
+            .execute(&policy, get(&server.url("/r")), in_five_seconds())
+            .await;
+
+        let Err(types::FetchError::Denied(text)) = result else {
+            panic!("expected a denial, got {result:?}");
+        };
+        assert!(text.contains("localhost"), "{text}");
+        assert_eq!(targets(&server), ["/r"], "the second host was contacted");
+    }
+
+    #[tokio::test]
+    async fn egress_stops_after_five_redirects_with_a_named_error() {
+        let server = TestHttpServer::start(|_| Reply::redirect(302, "/loop")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let result = Egress::new()
+            .execute(&policy, get(&server.url("/loop")), in_five_seconds())
+            .await;
+
+        let Err(types::FetchError::Transport(text)) = result else {
+            panic!("expected a transport error, got {result:?}");
+        };
+        assert!(text.contains("too many redirects"), "{text}");
+        assert!(text.contains('5'), "{text}");
+        assert_eq!(server.seen().len(), 6, "the first request plus five followed");
+    }
+
+    #[tokio::test]
+    async fn egress_a_303_redirect_turns_post_into_get_without_a_body() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/p" => Reply::redirect(303, "/g"),
+            _ => Reply::ok("got"),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let request = post(&server.url("/p"), &[("content-type", "text/plain")]);
+
+        Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the redirect is followed");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].body, b"payload");
+        assert_eq!(seen[1].method, "GET");
+        assert!(seen[1].body.is_empty());
+        assert_eq!(seen[1].header("content-type"), None);
+    }
+
+    #[tokio::test]
+    async fn egress_a_307_redirect_keeps_method_and_body() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/p" => Reply::redirect(307, "/g"),
+            _ => Reply::ok("got"),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let request = post(&server.url("/p"), &[("content-type", "text/plain")]);
+
+        Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the redirect is followed");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].method, "POST");
+        assert_eq!(seen[1].body, b"payload");
+        assert_eq!(seen[1].header("content-type"), Some("text/plain"));
+    }
+
+    const CREDENTIALS: [(&str, &str); 3] = [
+        ("authorization", "Bearer SECRET"),
+        ("cookie", "a=b"),
+        ("x-keep", "yes"),
+    ];
+
+    fn credentialed(url: &str) -> types::Request {
+        types::Request {
+            headers: CREDENTIALS
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            ..get(url)
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_drops_credentials_when_a_redirect_changes_host() {
+        let server = start_with_port(|seen, port| match seen.target.as_str() {
+            "/a" => Reply::redirect(302, &format!("http://localhost:{port}/b")),
+            _ => Reply::ok("b"),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1", "localhost"], Duration::from_secs(5));
+
+        Egress::new()
+            .execute(&policy, credentialed(&server.url("/a")), in_five_seconds())
+            .await
+            .expect("the redirect is followed");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].header("x-keep"), Some("yes"));
+        assert_eq!(seen[1].header("authorization"), None);
+        assert_eq!(seen[1].header("cookie"), None);
+    }
+
+    #[tokio::test]
+    async fn egress_keeps_credentials_when_a_redirect_stays_on_the_same_host() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/a" => Reply::redirect(302, "/b"),
+            _ => Reply::ok("b"),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        Egress::new()
+            .execute(&policy, credentialed(&server.url("/a")), in_five_seconds())
+            .await
+            .expect("the redirect is followed");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].header("authorization"), Some("Bearer SECRET"));
+        assert_eq!(seen[1].header("cookie"), Some("a=b"));
+        assert_eq!(seen[1].header("x-keep"), Some("yes"));
+    }
+
+    #[tokio::test]
+    async fn egress_returns_a_redirect_without_location_as_is() {
+        let server = TestHttpServer::start(|_| Reply::status(302)).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let response = Egress::new()
+            .execute(&policy, get(&server.url("/n")), in_five_seconds())
+            .await
+            .expect("a redirect without Location is an ordinary response");
+
+        assert_eq!(response.status, 302);
+        assert_eq!(server.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn egress_one_deadline_covers_every_redirect_hop() {
+        let hop = Duration::from_millis(250);
+        let server = TestHttpServer::start(move |seen| match seen.target.as_str() {
+            "/h1" => Reply::redirect(302, "/h2").delayed(hop),
+            "/h2" => Reply::redirect(302, "/h3").delayed(hop),
+            _ => Reply::ok("done").delayed(hop),
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_millis(600));
+        let started = std::time::Instant::now();
+
+        let result = Egress::new()
+            .execute(
+                &policy,
+                get(&server.url("/h1")),
+                tokio::time::Instant::now() + policy.timeout(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(types::FetchError::Timeout)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn egress_deadline_expires_on_a_slow_server() {
+        let server =
+            TestHttpServer::start(|_| Reply::ok("late").delayed(Duration::from_secs(5))).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_millis(300));
+        let started = std::time::Instant::now();
+
+        let result = Egress::new()
+            .execute(
+                &policy,
+                get(&server.url("/slow")),
+                tokio::time::Instant::now() + policy.timeout(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(types::FetchError::Timeout)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_the_methods_connect_and_trace() {
+        let server = TestHttpServer::start(|_| Reply::ok("x")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let egress = Egress::new();
+
+        for method in ["CONNECT", "TRACE", "connect", "Trace"] {
+            let request = types::Request {
+                method: types::Method::Other(method.to_string()),
+                ..get(&server.url("/m"))
+            };
+            let result = egress.execute(&policy, request, in_five_seconds()).await;
+            assert!(
+                matches!(result, Err(types::FetchError::InvalidRequest(_))),
+                "{method}: {result:?}"
+            );
+        }
+        assert!(server.seen().is_empty(), "a refused method made a connection");
     }
 
     #[tokio::test]
