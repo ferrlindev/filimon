@@ -23,3 +23,14 @@ component = "../../plugins/stub-fetcher/target/wasm32-unknown-unknown/release/st
 
 [fetchers.http]
 component = "../../plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm"
+
+# Optional: make `fili produce` fetch its pages through a fetcher component
+# instead of the built-in HTTP client. `fetcher` names an enabled entry under
+# [fetchers]. `timeout_secs` is the deadline of one page and defaults to 15.
+# `allowlist` adds hosts to the hosts of the seed urls; any other host,
+# including a redirect target, is denied.
+#
+# [crawler]
+# fetcher = "http"
+# timeout_secs = 15
+# allowlist = ["www.example.com"]

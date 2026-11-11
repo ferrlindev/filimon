@@ -228,6 +228,39 @@ fili plugins run-once stub
 fili run
 ```
 
+### Crawling through a fetcher component
+
+`fili produce` uses its built-in HTTP client by default. To fetch its pages
+through a fetcher component instead, add a `[crawler]` table to the registry
+file (`--registry`, `FILI_REGISTRY`, default `filimon.toml`). It names a fetcher
+defined under `[fetchers]` in the same file:
+
+```toml
+[fetchers.http]
+component = "plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm"
+
+[crawler]
+fetcher = "http"
+timeout_secs = 15              # optional, default 15
+allowlist = ["www.example.com"] # optional, extra hosts besides the seed urls' hosts
+```
+
+`fili produce` says which client it uses, one line before the crawl starts:
+
+- no registry file: `[Crawl] No plugin registry at <path>; using the built-in HTTP client`
+- a registry without a `[crawler]` table: `[Crawl] <path> has no [crawler] table; using the built-in HTTP client`
+- a `[crawler]` table: ``[Crawl] fetching through the fetcher `<name>`, timeout <n> s, hosts: <hosts>``
+
+A `[crawler]` table that cannot be used (an undefined or disabled fetcher, a
+component that does not load) is an error, and nothing is crawled.
+
+The hosts the crawler may reach are the hosts of the seed urls plus
+`allowlist`, matched by exact host name. A link that redirects to any other host
+is denied by name, and that page is skipped. Articles still reach the consumer
+through the same topic and SmartModule chain. The fetcher path validates
+certificates; the built-in client keeps its existing behaviour, which does not.
+See [`plugins/README.md`](plugins/README.md#fetcher-layer) for the full rules.
+
 ### `fili consume`
 
 `fili consume` reads news from `filimon-raw-pages` through the three SmartModules and social items from `filimon-social-items` with no SmartModules, and merges both into one output.
