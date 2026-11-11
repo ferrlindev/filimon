@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use wasmtime::component::Component;
 
@@ -60,9 +61,10 @@ pub struct LoadFailure {
 pub struct LoadReport {
     /// Linked, ready-to-instantiate source components by plugin alias.
     pub sources: BTreeMap<String, SourcePre<HostState>>,
-    /// Linked fetcher components by plugin alias. Nothing routes to them
-    /// before Phase 5.
-    pub fetchers: BTreeMap<String, FetcherPre<HostState>>,
+    /// Linked fetcher components by plugin alias. The host routes a source's
+    /// `fetch` calls to the one the registry assigns it, so one component is
+    /// shared by every source that names it.
+    pub fetchers: BTreeMap<String, Arc<FetcherPre<HostState>>>,
     /// Names of the fetchers in `fetchers`, in registry order.
     pub fetcher_names: Vec<String>,
     pub failures: Vec<LoadFailure>,
@@ -106,7 +108,7 @@ pub fn load_components(registry: &LoadedRegistry, host_engine: &HostEngine) -> L
         report.opened.push(fetcher.component.clone());
         match load_fetcher(&fetcher.name, fetcher.component.as_path(), host_engine) {
             Ok(pre) => {
-                report.fetchers.insert(fetcher.name.clone(), pre);
+                report.fetchers.insert(fetcher.name.clone(), Arc::new(pre));
                 report.fetcher_names.push(fetcher.name.clone());
             }
             Err(error) => report.failures.push(LoadFailure {
@@ -159,7 +161,7 @@ pub(crate) fn load_source(
     Ok(pre)
 }
 
-fn load_fetcher(
+pub(crate) fn load_fetcher(
     plugin: &str,
     path: &Path,
     host_engine: &HostEngine,

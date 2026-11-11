@@ -11,6 +11,7 @@ pub mod backoff;
 pub mod cursor;
 pub mod engine;
 pub mod error;
+pub mod fetch;
 pub mod instance;
 pub mod loader;
 pub mod map;
@@ -33,10 +34,11 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use self::cursor::CursorStore;
-use self::engine::HostEngine;
+use self::engine::{HostEngine, clean_guest_text};
 use self::error::HostError;
+use self::fetch::{FetchPolicy, FetchRoute};
 use self::instance::{InstanceFactory, WasmtimeFactory};
-use self::loader::{LoadFailure, load_components};
+use self::loader::{LoadFailure, PluginKind, load_components};
 use self::scheduler::{PluginReport, PluginSpec, run_plugin};
 use self::sink::ItemSink;
 use crate::plugins::config::LoadedRegistry;
@@ -126,13 +128,40 @@ impl Host {
         let report = load_components(registry, &host_engine);
         let mut plugins = Vec::new();
         let mut loaded_sources = Vec::new();
+        let mut load_failures = report.failures;
         for (name, pre) in report.sources {
             let Some(spec) = registry.sources.get(&name).and_then(PluginSpec::from_loaded) else {
                 continue;
             };
-            let factory = Arc::new(WasmtimeFactory::new(host_engine.engine().clone(), pre));
+            let mut factory = WasmtimeFactory::new(host_engine.engine().clone(), pre);
+            // No `fetcher` key: no route, every `fetch` answers `not-configured`
+            // (there is no implicit default fetcher).
+            if let Some(assigned) = registry.sources.get(&name).and_then(|s| s.fetcher.as_deref())
+            {
+                // A source never runs without the fetcher it was told to use.
+                let Some(fetcher_pre) = report.fetchers.get(assigned) else {
+                    let reason = fetcher_failure_reason(&load_failures, assigned);
+                    load_failures.push(LoadFailure {
+                        kind: PluginKind::Source,
+                        name: name.clone(),
+                        error: HostError::FetcherUnavailable {
+                            plugin: name,
+                            fetcher: assigned.to_string(),
+                            reason,
+                        },
+                    });
+                    continue;
+                };
+                let route = Arc::new(FetchRoute::new(
+                    assigned,
+                    Arc::clone(fetcher_pre),
+                    host_engine.engine().clone(),
+                    Arc::new(FetchPolicy::for_source(&name, &spec.host)),
+                ));
+                factory = factory.with_route(Some(route));
+            }
             loaded_sources.push(name);
-            plugins.push((spec, factory));
+            plugins.push((spec, Arc::new(factory)));
         }
 
         Ok(Self {
@@ -141,7 +170,7 @@ impl Host {
             plugins,
             loaded_sources,
             loaded_fetchers: report.fetcher_names,
-            load_failures: report.failures,
+            load_failures,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         })
     }
@@ -223,6 +252,18 @@ impl Host {
             plugins: reports,
         }
     }
+}
+
+/// Why the fetcher `fetcher` is not loaded: its own load failure text, or a
+/// plain statement when there is none (for example it is disabled).
+fn fetcher_failure_reason(failures: &[LoadFailure], fetcher: &str) -> String {
+    failures
+        .iter()
+        .find(|f| f.kind == PluginKind::Fetcher && f.name == fetcher)
+        .map_or_else(
+            || "it is not loaded".to_string(),
+            |f| clean_guest_text(&f.error.to_string(), 512),
+        )
 }
 
 /// Runs one task per plugin and joins them all.
@@ -679,6 +720,151 @@ mod tests {
         assert!(report.loaded_sources.is_empty());
         assert_eq!(report.load_failures.len(), 1);
         assert_eq!(report.load_failures[0].name, "broken");
+    }
+
+    /// Writes `filimon.toml`, `stub.toml` and `stub2.toml`: two sources that
+    /// both use `source_component` and both name the one fetcher `stub-fetcher`
+    /// (`fetcher_component`). Each allows only `example.invalid` and sets
+    /// `fetch_url` so its `init` calls `fetch`.
+    fn write_fetch_registry(
+        dir: &Path,
+        source_component: &Path,
+        fetcher_component: &Path,
+    ) -> PathBuf {
+        use std::fmt::Write as _;
+
+        let mut registry = String::new();
+        for name in ["stub", "stub2"] {
+            let _ = write!(
+                registry,
+                "[sources.{name}]\ncomponent = {component:?}\nconfig = \"{name}.toml\"\nfetcher = \"stub-fetcher\"\n\n",
+                component = source_component.display().to_string(),
+            );
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                "[host]\npoll_interval_secs = 60\nallowlist = [\"example.invalid\"]\n\n\
+                 [settings]\ngreeting = \"hi\"\nfetch_url = \"http://example.invalid/host\"\n",
+            )
+            .expect("write plugin toml");
+        }
+        let _ = write!(
+            registry,
+            "[fetchers.stub-fetcher]\ncomponent = {component:?}\n",
+            component = fetcher_component.display().to_string(),
+        );
+        let path = dir.join("filimon.toml");
+        std::fs::write(&path, registry).expect("write registry");
+        path
+    }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_host_run_routes_a_source_through_the_registry_assigned_fetcher() {
+        use self::testing::{LogCapture, fixture_wasm, load_test_registry};
+
+        let dir = TempDir::new().expect("tempdir");
+        let registry_path = write_fetch_registry(
+            dir.path(),
+            &fixture_wasm("stub-source", "stub_source.wasm"),
+            &fixture_wasm("stub-fetcher", "stub_fetcher.wasm"),
+        );
+        let registry = load_test_registry(&registry_path);
+        let (logs, _guard) = LogCapture::start();
+
+        let host = Host::load(
+            &registry,
+            HostOptions {
+                state_dir: dir.path().join("state"),
+            },
+        )
+        .expect("host loads");
+        assert_eq!(host.loaded_fetchers(), ["stub-fetcher".to_string()]);
+        assert!(host.load_failures().is_empty(), "{:?}", host.load_failures());
+
+        let sink = Arc::new(VecSink::default());
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(host.run(Arc::clone(&sink), token.clone()));
+        let started = std::time::Instant::now();
+        while sink.records().len() < 2 && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        token.cancel();
+        let report = handle.await.expect("host task");
+
+        assert_eq!(sink.records().len(), 2, "both sources produced a record");
+        assert_eq!(report.loaded_fetchers, vec!["stub-fetcher".to_string()]);
+        assert!(report.load_failures.is_empty(), "{:?}", report.load_failures);
+        let text = logs.text();
+        assert!(
+            text.contains("stub fetch: http://example.invalid/host"),
+            "{text}"
+        );
+        assert_eq!(text.matches("init fetch status 200").count(), 2, "{text}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_host_load_skips_a_source_whose_fetcher_cannot_load() {
+        use self::loader::PluginKind;
+        use self::testing::{fixture_wasm, load_test_registry};
+
+        let dir = TempDir::new().expect("tempdir");
+        let broken = dir.path().join("broken.wasm");
+        std::fs::write(&broken, b"this is not a wasm component").expect("write component");
+        let registry_path = write_fetch_registry(
+            dir.path(),
+            &fixture_wasm("stub-source", "stub_source.wasm"),
+            &broken,
+        );
+        let registry = load_test_registry(&registry_path);
+
+        let host = Host::load(
+            &registry,
+            HostOptions {
+                state_dir: dir.path().join("state"),
+            },
+        )
+        .expect("host loads");
+
+        assert!(host.loaded_sources().is_empty(), "{:?}", host.loaded_sources());
+        let failures = host.load_failures();
+        let fetcher_failures: Vec<_> = failures
+            .iter()
+            .filter(|f| f.kind == PluginKind::Fetcher)
+            .collect();
+        assert_eq!(fetcher_failures.len(), 1, "{failures:?}");
+        assert_eq!(fetcher_failures[0].name, "stub-fetcher");
+
+        // Both sources name the broken fetcher, so both are reported, each
+        // with its own name and the fetcher's.
+        let source_failures: Vec<_> = failures
+            .iter()
+            .filter(|f| f.kind == PluginKind::Source)
+            .collect();
+        assert_eq!(source_failures.len(), 2, "{failures:?}");
+        let stub = source_failures
+            .iter()
+            .find(|f| f.name == "stub")
+            .expect("a failure for `stub`");
+        assert!(
+            matches!(stub.error, HostError::FetcherUnavailable { .. }),
+            "{:?}",
+            stub.error
+        );
+        let text = stub.error.to_string();
+        assert!(text.contains("stub") && text.contains("stub-fetcher"), "{text}");
+
+        let host = host.with_shutdown_grace(Duration::from_secs(3));
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let report = host
+            .run_with_abort(
+                Arc::new(VecSink::default()),
+                shutdown,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(report.plugins.is_empty());
     }
 
     #[test]
