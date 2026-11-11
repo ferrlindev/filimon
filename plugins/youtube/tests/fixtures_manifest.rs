@@ -19,6 +19,7 @@ const REQUIRED: &[(&str, &str, bool, bool)] = &[
     ("403 quotaExceeded", "quota_exceeded_403", true, true),
     ("401 auth failure", "unauthorized_401", true, true),
     ("malformed JSON", "malformed", false, false),
+    ("subscriptions page", "subscriptions_page", false, true),
 ];
 
 fn fixtures_dir() -> PathBuf {

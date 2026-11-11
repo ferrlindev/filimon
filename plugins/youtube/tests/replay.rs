@@ -828,3 +828,601 @@ fn every_error_status_maps_to_an_error_never_an_empty_success() {
         assert!(result.is_err(), "status {status} gave {result:?}");
     }
 }
+
+// ── Plan 07-09: subscriptions (YTUB-02, YTUB-03, D-06, D-07, D-15) ───────────
+
+use std::rc::Rc;
+use youtube_source::settings::{MAX_SUBSCRIPTION_PAGES, quota_units_per_poll};
+
+const USER_TOKEN: &str = "TOKEN-1";
+const SUBSCRIPTIONS_URL_PREFIX: &str = "https://www.googleapis.com/youtube/v3/subscriptions?";
+const PLAYLIST_URL_PREFIX: &str = "https://www.googleapis.com/youtube/v3/playlistItems?";
+
+type Responder = Box<dyn Fn(&HttpRequest) -> Result<HttpResponse, HttpError>>;
+
+/// A mock that answers by endpoint: one responder for `subscriptions.list`,
+/// one for `playlistItems.list`. It records every request.
+struct RoutedHttp {
+    subscriptions: Responder,
+    playlists: Responder,
+    requests: RefCell<Vec<HttpRequest>>,
+}
+
+impl RoutedHttp {
+    fn new(
+        subscriptions: impl Fn(&HttpRequest) -> Result<HttpResponse, HttpError> + 'static,
+        playlists: impl Fn(&HttpRequest) -> Result<HttpResponse, HttpError> + 'static,
+    ) -> Self {
+        RoutedHttp {
+            subscriptions: Box::new(subscriptions),
+            playlists: Box::new(playlists),
+            requests: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<HttpRequest> {
+        self.requests.borrow().clone()
+    }
+
+    fn subscription_requests(&self) -> Vec<HttpRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r.url.starts_with(SUBSCRIPTIONS_URL_PREFIX))
+            .collect()
+    }
+
+    fn playlist_requests(&self) -> Vec<HttpRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r.url.starts_with(PLAYLIST_URL_PREFIX))
+            .collect()
+    }
+}
+
+impl Http for RoutedHttp {
+    fn get(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.requests.borrow_mut().push(request.clone());
+        if request.url.starts_with(SUBSCRIPTIONS_URL_PREFIX) {
+            (self.subscriptions)(request)
+        } else {
+            (self.playlists)(request)
+        }
+    }
+}
+
+/// The value of a url query parameter, if present.
+fn query_param(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(&format!("{name}=")).map(str::to_string))
+}
+
+fn sub_channel(index: usize) -> String {
+    format!("UCSubscribedChannel{index:05}")
+}
+
+fn sub_playlist(index: usize) -> String {
+    format!("UUSubscribedChannel{index:05}")
+}
+
+fn sub_channels(count: usize) -> Vec<String> {
+    (1..=count).map(sub_channel).collect()
+}
+
+/// A `subscriptions.list` answer with one entry per channel id.
+fn subs_response(ids: &[String], next_page_token: Option<&str>) -> HttpResponse {
+    let items: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "kind": "youtube#subscription",
+                "snippet": {
+                    "title": format!("Title of {id}"),
+                    "resourceId": { "kind": "youtube#channel", "channelId": id }
+                }
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "kind": "youtube#subscriptionListResponse",
+        "items": items,
+    });
+    if let Some(token) = next_page_token {
+        body["nextPageToken"] = Value::String(token.to_string());
+    }
+    json_page(&body)
+}
+
+/// Always the same single page, whatever is asked.
+fn fixed_subscriptions(
+    ids: Vec<String>,
+) -> impl Fn(&HttpRequest) -> Result<HttpResponse, HttpError> {
+    move |_| Ok(subs_response(&ids, None))
+}
+
+/// A faithful `subscriptions.list`: it serves `all` in pages of the requested
+/// `maxResults`, using the page token as a numeric offset.
+fn simulated_subscriptions(
+    all: Vec<String>,
+) -> impl Fn(&HttpRequest) -> Result<HttpResponse, HttpError> {
+    move |request| {
+        let size: usize = query_param(&request.url, "maxResults")
+            .and_then(|v| v.parse().ok())
+            .expect("maxResults");
+        let offset: usize = query_param(&request.url, "pageToken")
+            .and_then(|v| v.strip_prefix("OFFSET").and_then(|n| n.parse().ok()))
+            .unwrap_or(0);
+        let end = (offset + size).min(all.len());
+        let next = (end < all.len()).then(|| format!("OFFSET{end}"));
+        Ok(subs_response(&all[offset.min(end)..end], next.as_deref()))
+    }
+}
+
+/// Every answer: one new channel and a new token, forever.
+fn endless_subscriptions() -> impl Fn(&HttpRequest) -> Result<HttpResponse, HttpError> {
+    |request| {
+        let n: usize = query_param(&request.url, "pageToken")
+            .and_then(|t| t.strip_prefix("TOKEN").and_then(|n| n.parse().ok()))
+            .unwrap_or(0);
+        Ok(subs_response(
+            &[sub_channel(n + 1)],
+            Some(&format!("TOKEN{}", n + 1)),
+        ))
+    }
+}
+
+/// One video per playlist, named after the last digits of the playlist id.
+fn one_video_per_playlist() -> impl Fn(&HttpRequest) -> Result<HttpResponse, HttpError> {
+    |request| {
+        let playlist = query_param(&request.url, "playlistId").expect("playlistId");
+        let suffix = &playlist[playlist.len() - 5..];
+        Ok(page(vec![entry(
+            &format!("v{suffix}"),
+            "T",
+            "2024-05-01T00:00:00Z",
+        )]))
+    }
+}
+
+fn empty_playlists() -> impl Fn(&HttpRequest) -> Result<HttpResponse, HttpError> {
+    |_| Ok(page(Vec::new()))
+}
+
+fn subs_only() -> Settings {
+    settings("subscriptions = true\n")
+}
+
+fn poll_user(
+    http: &dyn Http,
+    settings: &Settings,
+    cursor: Option<&[u8]>,
+) -> Result<PollOutcome, PollError> {
+    poll(http, settings, Some(KEY), cursor, Some(USER_TOKEN))
+}
+
+/// The fixture `subscriptions_page` as an `HttpResponse`, optionally without
+/// its `nextPageToken`.
+fn fixture_subscriptions(keep_token: bool) -> HttpResponse {
+    let mut root: Value = serde_json::from_slice(&fixture("subscriptions_page").body).unwrap();
+    if !keep_token {
+        root.as_object_mut().unwrap().remove("nextPageToken");
+    }
+    json_page(&root)
+}
+
+/// Channel ids and titles of the fixture: the private strings that no
+/// warning or error text may carry.
+fn privacy_sentinels() -> Vec<String> {
+    let root: Value = serde_json::from_slice(&fixture("subscriptions_page").body).unwrap();
+    let mut sentinels = Vec::new();
+    for item in root["items"].as_array().unwrap() {
+        let id = item["snippet"]["resourceId"]["channelId"].as_str().unwrap();
+        sentinels.push(id.to_string());
+        sentinels.push(format!("UU{}", &id[2..]));
+        sentinels.push(item["snippet"]["title"].as_str().unwrap().to_string());
+    }
+    assert_eq!(sentinels.len(), 9);
+    sentinels
+}
+
+#[test]
+fn subscriptions_mode_requires_a_token_and_never_falls_back_to_the_api_key() {
+    for token in [None, Some("")] {
+        let http = RoutedHttp::new(fixed_subscriptions(sub_channels(3)), empty_playlists());
+        let result = poll(&http, &subs_only(), Some(KEY), None, token);
+        assert_eq!(result.unwrap_err(), PollError::AuthRequired);
+        assert!(http.requests().is_empty(), "no request without a token");
+    }
+    // Explicit channels alongside subscriptions do not change that.
+    let both = settings(&format!(
+        "channels = [\"{CHANNEL}\"]\nsubscriptions = true\n"
+    ));
+    let http = RoutedHttp::new(fixed_subscriptions(sub_channels(1)), empty_playlists());
+    assert_eq!(
+        poll(&http, &both, Some(KEY), None, None).unwrap_err(),
+        PollError::AuthRequired
+    );
+    assert!(http.requests().is_empty());
+}
+
+#[test]
+fn subscriptions_poll_sends_the_bearer_token_on_every_request_and_never_the_api_key() {
+    let http = RoutedHttp::new(fixed_subscriptions(sub_channels(2)), empty_playlists());
+    poll_user(&http, &subs_only(), None).expect("poll");
+    assert_eq!(http.requests().len(), 3);
+    for request in http.requests() {
+        let header = |name: &str| youtube_source::http::header(&request.headers, name);
+        assert_eq!(header("authorization"), Some("Bearer TOKEN-1"), "{}", request.url);
+        assert_eq!(header("x-goog-api-key"), None, "{}", request.url);
+        assert!(!request.url.contains(KEY) && !request.url.contains(USER_TOKEN));
+    }
+}
+
+#[test]
+fn subscriptions_then_one_playlist_request_per_channel() {
+    let http = RoutedHttp::new(
+        |_| Ok(fixture_subscriptions(false)),
+        one_video_per_playlist(),
+    );
+    let outcome = poll_user(&http, &subs_only(), None).expect("poll");
+    let urls: Vec<String> = http.requests().into_iter().map(|r| r.url).collect();
+    assert_eq!(urls.len(), 4);
+    assert_eq!(
+        urls[0],
+        "https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=50&order=relevance"
+    );
+    // One playlist per channel, in subscription order, as a first poll.
+    for (i, url) in urls[1..].iter().enumerate() {
+        assert!(url.starts_with(PLAYLIST_URL_PREFIX), "{url}");
+        assert!(url.contains(&format!("playlistId={}", sub_playlist(i + 1))), "{url}");
+        assert!(url.ends_with("maxResults=10"), "{url}");
+    }
+    let ids: Vec<&str> = outcome.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["v00001", "v00002", "v00003"]);
+    let (decoded, _) = cursor::decode(outcome.next_cursor.as_deref());
+    assert_eq!(decoded.0.len(), 3);
+}
+
+#[test]
+fn subscriptions_pagination_follows_next_page_token_until_the_limit() {
+    let first = subs_response(&sub_channels(2), Some("NEXTPAGE2"));
+    let second = subs_response(&[sub_channel(3)], Some("NEXTPAGE3"));
+    let pages = RefCell::new(VecDeque::from([first, second]));
+    let http = RoutedHttp::new(
+        move |_| {
+            Ok(pages
+                .borrow_mut()
+                .pop_front()
+                .expect("no third subscriptions request"))
+        },
+        empty_playlists(),
+    );
+    let limited = settings("subscriptions = true\nsubscriptions_limit = 3\n");
+    poll_user(&http, &limited, None).expect("poll");
+    let subs = http.subscription_requests();
+    assert_eq!(subs.len(), 2, "polling stops once three channels are collected");
+    assert!(subs[0].url.contains("maxResults=3") && !subs[0].url.contains("pageToken"));
+    assert!(subs[1].url.contains("maxResults=1"), "{}", subs[1].url);
+    assert!(subs[1].url.ends_with("&pageToken=NEXTPAGE2"), "{}", subs[1].url);
+    assert_eq!(http.playlist_requests().len(), 3);
+}
+
+#[test]
+fn a_hostile_next_page_token_loop_stops_at_the_page_cap() {
+    let http = RoutedHttp::new(endless_subscriptions(), empty_playlists());
+    let outcome = poll_user(&http, &subs_only(), None).expect("what it has is returned");
+    assert_eq!(
+        http.subscription_requests().len(),
+        MAX_SUBSCRIPTION_PAGES as usize
+    );
+    assert_eq!(http.playlist_requests().len(), MAX_SUBSCRIPTION_PAGES as usize);
+    let capped = outcome
+        .warnings
+        .iter()
+        .filter(|w| w.contains("page limit"))
+        .count();
+    assert_eq!(capped, 1, "{:?}", outcome.warnings);
+    assert!(outcome.next_cursor.is_some());
+}
+
+#[test]
+fn explicit_channels_and_subscriptions_are_combined_without_duplicates() {
+    let explicit_and_subscribed = sub_channel(2);
+    let combined = settings(&format!(
+        "channels = [\"{CHANNEL}\", \"{explicit_and_subscribed}\"]\nsubscriptions = true\n"
+    ));
+    let http = RoutedHttp::new(fixed_subscriptions(sub_channels(3)), empty_playlists());
+    poll_user(&http, &combined, None).expect("poll");
+    let playlist_ids: Vec<String> = http
+        .playlist_requests()
+        .iter()
+        .map(|r| query_param(&r.url, "playlistId").unwrap())
+        .collect();
+    // Explicit channels first, then the subscriptions in order, each once.
+    assert_eq!(
+        playlist_ids,
+        [
+            PLAYLIST.to_string(),
+            sub_playlist(2),
+            sub_playlist(1),
+            sub_playlist(3)
+        ]
+    );
+}
+
+#[test]
+fn a_404_for_a_subscribed_channel_is_skipped_and_counted_not_fatal() {
+    let http = RoutedHttp::new(fixed_subscriptions(sub_channels(3)), |request| {
+        let playlist = query_param(&request.url, "playlistId").unwrap();
+        if playlist == sub_playlist(2) {
+            Ok(error_response(404, Some("playlistNotFound")))
+        } else {
+            one_video_per_playlist()(request)
+        }
+    });
+    let outcome = poll_user(&http, &subs_only(), None).expect("the poll still succeeds");
+    let ids: Vec<&str> = outcome.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["v00001", "v00003"]);
+    assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+    let warning = &outcome.warnings[0];
+    assert!(warning.contains('1') && warning.contains("404"), "{warning}");
+    assert!(!warning.contains("SubscribedChannel"), "{warning}");
+    // The skipped channel has no mark, so it is retried on the next poll.
+    let (decoded, _) = cursor::decode(outcome.next_cursor.as_deref());
+    assert_eq!(decoded.mark(&sub_playlist(2)), None);
+
+    // The same 404 for an explicit channel is still the named config error.
+    let explicit = settings(&format!(
+        "channels = [\"{CHANNEL}\"]\nsubscriptions = true\n"
+    ));
+    let http = RoutedHttp::new(fixed_subscriptions(sub_channels(1)), |_| {
+        Ok(error_response(404, Some("playlistNotFound")))
+    });
+    let PollError::Config(text) = poll_user(&http, &explicit, None).unwrap_err() else {
+        panic!("expected Config for an explicit channel");
+    };
+    assert!(text.contains("channels") && text.contains(CHANNEL), "{text}");
+}
+
+#[test]
+fn subscription_list_errors_use_the_same_classification() {
+    let run = |response: HttpResponse| {
+        let http = RoutedHttp::new(move |_| Ok(response.clone()), empty_playlists());
+        let error = poll_user(&http, &subs_only(), None).unwrap_err();
+        assert!(
+            http.playlist_requests().is_empty(),
+            "no playlist request after a failure"
+        );
+        assert_eq!(http.requests().len(), 1);
+        error
+    };
+    assert_eq!(
+        run(fixture("quota_exceeded_403")),
+        PollError::Transient(QUOTA_TEXT.to_string())
+    );
+    assert_eq!(run(fixture("unauthorized_401")), PollError::AuthRequired);
+    assert_eq!(run(error_response(429, None)), PollError::RateLimited(None));
+    // A 404 on the list itself has no channel to name.
+    assert_eq!(
+        run(error_response(404, Some("notFound"))),
+        PollError::Transient("YouTube HTTP 404".to_string())
+    );
+    // A 200 that is not a subscriptions page is a transient, never an empty list.
+    let PollError::Transient(text) = run(fixture("malformed")) else {
+        panic!("expected Transient");
+    };
+    assert!(!text.contains("SENTINELTRUNCATED"), "{text}");
+    assert!(matches!(
+        run(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"{}".to_vec()
+        }),
+        PollError::Transient(_)
+    ));
+}
+
+#[test]
+fn a_user_with_no_subscriptions_gets_an_empty_poll_and_a_cursor() {
+    let http = RoutedHttp::new(fixed_subscriptions(Vec::new()), empty_playlists());
+    let outcome = poll_user(&http, &subs_only(), None).expect("poll");
+    assert!(outcome.items.is_empty());
+    let bytes = outcome
+        .next_cursor
+        .expect("Some, so the host's mark is not reset");
+    let (decoded, undecodable) = cursor::decode(Some(&bytes));
+    assert!(!undecodable);
+    assert!(decoded.0.is_empty());
+    assert_eq!(http.requests().len(), 1);
+}
+
+#[test]
+fn a_channel_that_leaves_and_re_enters_the_limit_is_treated_as_a_first_poll() {
+    let window = Rc::new(RefCell::new(sub_channels(3)));
+    let http = RoutedHttp::new(
+        {
+            let window = Rc::clone(&window);
+            move |_| Ok(subs_response(&window.borrow(), None))
+        },
+        one_video_per_playlist(),
+    );
+    let first = poll_user(&http, &subs_only(), None).expect("first");
+    assert_eq!(first.items.len(), 3);
+
+    // Channel 3 drops out of the window: its mark is dropped with it.
+    *window.borrow_mut() = sub_channels(2);
+    let second = poll_user(&http, &subs_only(), first.next_cursor.as_deref()).expect("second");
+    assert!(second.items.is_empty());
+    let (decoded, _) = cursor::decode(second.next_cursor.as_deref());
+    assert_eq!(decoded.mark(&sub_playlist(3)), None);
+    assert!(decoded.mark(&sub_playlist(1)).is_some());
+
+    // It returns: a first poll again, so the page is the first-poll size.
+    *window.borrow_mut() = sub_channels(3);
+    let before = http.playlist_requests().len();
+    let third = poll_user(&http, &subs_only(), second.next_cursor.as_deref()).expect("third");
+    let ids: Vec<&str> = third.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["v00003"]);
+    let fresh: Vec<HttpRequest> = http.playlist_requests().split_off(before);
+    assert!(fresh[2].url.contains(&format!("playlistId={}", sub_playlist(3))));
+    assert!(fresh[2].url.ends_with("maxResults=10"), "{}", fresh[2].url);
+    // The channels that stayed use the later size: 1000 / (50 worst case) = 20.
+    assert!(fresh[0].url.ends_with("maxResults=20"), "{}", fresh[0].url);
+}
+
+#[test]
+fn subscription_data_is_not_logged_or_echoed() {
+    let sentinels = privacy_sentinels();
+    let mut texts: Vec<String> = Vec::new();
+    let mut record = |result: Result<PollOutcome, PollError>| match result {
+        Ok(outcome) => texts.extend(outcome.warnings),
+        Err(error) => texts.push(format!("{error:?}")),
+    };
+
+    // Success with the fixture's own channels.
+    let http = RoutedHttp::new(
+        |_| Ok(fixture_subscriptions(false)),
+        one_video_per_playlist(),
+    );
+    record(poll_user(&http, &subs_only(), None));
+    // Every fixture channel's playlist is missing.
+    let http = RoutedHttp::new(
+        |_| Ok(fixture_subscriptions(false)),
+        |_| Ok(error_response(404, Some("playlistNotFound"))),
+    );
+    record(poll_user(&http, &subs_only(), None));
+    // Empty list.
+    let http = RoutedHttp::new(fixed_subscriptions(Vec::new()), empty_playlists());
+    record(poll_user(&http, &subs_only(), None));
+    // A skipped invalid id next to the fixture's channels.
+    let http = RoutedHttp::new(
+        |_| {
+            let mut ids: Vec<String> = privacy_sentinels()
+                .into_iter()
+                .filter(|s| s.starts_with("UCSub"))
+                .collect();
+            ids.push("UCshort".to_string());
+            Ok(subs_response(&ids, None))
+        },
+        empty_playlists(),
+    );
+    record(poll_user(&http, &subs_only(), None));
+    // Failures of the list call itself.
+    for response in [
+        fixture("unauthorized_401"),
+        fixture("quota_exceeded_403"),
+        fixture("malformed"),
+    ] {
+        let http = RoutedHttp::new(move |_| Ok(response.clone()), empty_playlists());
+        record(poll_user(&http, &subs_only(), None));
+    }
+    // The page cap.
+    let http = RoutedHttp::new(endless_subscriptions(), empty_playlists());
+    record(poll_user(&http, &subs_only(), None));
+
+    assert!(texts.len() >= 6, "{texts:?}");
+    for text in &texts {
+        for sentinel in &sentinels {
+            assert!(!text.contains(sentinel.as_str()), "{text:?} carries {sentinel}");
+        }
+        assert!(!text.contains("SubscribedChannel"), "{text:?}");
+    }
+}
+
+/// The request rules of the low-cost sweep: only the two list endpoints, none
+/// of `search`, `videos` or `channels`, exactly one credential header, a
+/// bearer token for subscriptions, and no secret in the url.
+fn assert_low_cost(requests: &[HttpRequest], secrets: &[&str]) {
+    for request in requests {
+        let url = &request.url;
+        assert!(
+            url.starts_with(PLAYLIST_URL_PREFIX) || url.starts_with(SUBSCRIPTIONS_URL_PREFIX),
+            "unexpected endpoint {url}"
+        );
+        let path = url.split('?').next().unwrap();
+        assert!(
+            path.split('/')
+                .all(|s| s != "search" && s != "videos" && s != "channels"),
+            "expensive endpoint {url}"
+        );
+        for secret in secrets {
+            assert!(!url.contains(secret), "credential in the url");
+        }
+        let header = |name: &str| youtube_source::http::header(&request.headers, name);
+        assert_eq!(header("accept"), Some("application/json"));
+        let credentials = request
+            .headers
+            .iter()
+            .filter(|(name, _)| {
+                name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("x-goog-api-key")
+            })
+            .count();
+        assert_eq!(credentials, 1, "exactly one credential header per request: {url}");
+        if url.starts_with(SUBSCRIPTIONS_URL_PREFIX) {
+            assert_eq!(header("authorization"), Some("Bearer TOKEN-1"), "{url}");
+        }
+    }
+}
+
+#[test]
+fn only_low_cost_list_endpoints_are_requested_in_every_mode() {
+    let combined = settings(&format!(
+        "channels = [\"{CHANNEL}\"]\nsubscriptions = true\n"
+    ));
+    let scenarios: Vec<(&str, Settings, Option<&str>, Option<&str>)> = vec![
+        ("channels only, key", one_channel(), Some(KEY), None),
+        ("channels only, token", one_channel(), None, Some(USER_TOKEN)),
+        ("subscriptions only", subs_only(), Some(KEY), Some(USER_TOKEN)),
+        ("combined", combined, Some(KEY), Some(USER_TOKEN)),
+    ];
+    for (name, settings, key, token) in scenarios {
+        let http = RoutedHttp::new(
+            simulated_subscriptions(sub_channels(5)),
+            one_video_per_playlist(),
+        );
+        let first = poll(&http, &settings, key, None, token).expect(name);
+        poll(&http, &settings, key, first.next_cursor.as_deref(), token).expect(name);
+        assert!(!http.requests().is_empty(), "{name}");
+        assert_low_cost(&http.requests(), &[KEY, USER_TOKEN]);
+    }
+}
+
+#[test]
+fn quota_formula_matches_the_requests_actually_made() {
+    // (explicit channels, subscribed channels the account has, limit)
+    let cases: [(usize, usize, usize); 6] = [
+        (0, 3, 50),
+        (0, 60, 50),
+        (0, 120, 71),
+        (2, 3, 50),
+        (1, 51, 60),
+        (0, 50, 50),
+    ];
+    for (explicit, subscribed, limit) in cases {
+        let mut text = String::from("subscriptions = true\n");
+        text.push_str(&format!("subscriptions_limit = {limit}\n"));
+        if explicit > 0 {
+            let quoted: Vec<String> = (0..explicit).map(|i| format!("\"UC{i:0>22}\"")).collect();
+            text.push_str(&format!("channels = [{}]\n", quoted.join(", ")));
+        }
+        let http = RoutedHttp::new(
+            simulated_subscriptions(sub_channels(subscribed)),
+            empty_playlists(),
+        );
+        poll_user(&http, &settings(&text), None).expect("poll");
+        let fetched = subscribed.min(limit);
+        let playlists = http.playlist_requests().len();
+        assert_eq!(playlists, explicit + fetched, "case {explicit}/{subscribed}/{limit}");
+        assert_eq!(
+            http.requests().len() as u32,
+            quota_units_per_poll(fetched as u32, playlists as u32),
+            "case {explicit}/{subscribed}/{limit}: one unit per request"
+        );
+    }
+    // Channels only: no subscription call, one unit per playlist.
+    let http = RoutedHttp::new(fixed_subscriptions(Vec::new()), empty_playlists());
+    poll(&http, &many_channels(7), Some(KEY), None, None).expect("poll");
+    assert_eq!(http.requests().len() as u32, quota_units_per_poll(0, 7));
+}
