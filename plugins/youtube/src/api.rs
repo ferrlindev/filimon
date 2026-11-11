@@ -3,6 +3,7 @@
 //! requested, and the API key travels in a header, never in the url.
 
 use crate::http::HttpRequest;
+use crate::poll::PollError;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -187,6 +188,69 @@ pub fn parse_playlist_page(body: &[u8]) -> Result<ParsedPage, ParseError> {
     Ok(ParsedPage { entries, skipped })
 }
 
+/// The D-15 quota text, verbatim. It is the same for `quotaExceeded` and
+/// `dailyLimitExceeded`, so the operator reads one phrase for "wait for the reset".
+pub const QUOTA_EXCEEDED_TEXT: &str =
+    "YouTube quota exceeded (quotaExceeded): daily Data API quota exhausted; resets at midnight Pacific";
+
+/// Longest Google error reason that may appear in an error text.
+const MAX_REASON_LEN: usize = 40;
+
+/// The first `error.errors[].reason` of a Google error body, only when it is
+/// 1 to 40 characters of letters, digits and `_`. Anything else (a non-JSON
+/// body, a missing field, an unsafe or long value) gives `None`, so a body
+/// is never echoed into an error text.
+pub fn error_reason(body: &[u8]) -> Option<String> {
+    let root: Value = serde_json::from_slice(body).ok()?;
+    let reason = root
+        .get("error")?
+        .get("errors")?
+        .as_array()?
+        .first()?
+        .get("reason")?
+        .as_str()?;
+    let safe = (1..=MAX_REASON_LEN).contains(&reason.len())
+        && reason.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    safe.then(|| reason.to_string())
+}
+
+/// Classify a response by status and Google error reason (D-15, research
+/// Pattern 4). `None` for 2xx. The texts are fixed phrases plus the status,
+/// the configured channel id and a safe reason; never a body, header,
+/// credential or url.
+pub fn classify_youtube(status: u16, body: &[u8], channel_id: &str) -> Option<PollError> {
+    if (200..300).contains(&status) {
+        return None;
+    }
+    let reason = error_reason(body);
+    let reason = reason.as_deref();
+    let error = match (status, reason) {
+        (403, Some("quotaExceeded" | "dailyLimitExceeded")) => {
+            PollError::Transient(QUOTA_EXCEEDED_TEXT.to_string())
+        }
+        (429, _) | (403, Some("rateLimitExceeded" | "userRateLimitExceeded")) => {
+            PollError::RateLimited(None)
+        }
+        (401, _) => PollError::AuthRequired,
+        (400, Some("keyInvalid")) => PollError::Config(
+            "YouTube rejected the api_key secret (keyInvalid); check YOUTUBE_API_KEY".to_string(),
+        ),
+        (403, Some("accessNotConfigured")) => PollError::Config(
+            "the YouTube Data API v3 is not enabled for the project of this key (accessNotConfigured)"
+                .to_string(),
+        ),
+        (403, Some(reason @ ("insufficientPermissions" | "forbidden"))) => PollError::Config(format!(
+            "YouTube refused access ({reason}); check the key restrictions or the login scope"
+        )),
+        (404, _) => PollError::Config(format!(
+            "settings.channels: YouTube found no uploads playlist for channel {channel_id} (HTTP 404); check the channel ID"
+        )),
+        (status, Some(reason)) => PollError::Transient(format!("YouTube HTTP {status} ({reason})")),
+        (status, None) => PollError::Transient(format!("YouTube HTTP {status}")),
+    };
+    Some(error)
+}
+
 /// Map an entry to an item (D-09, D-20). `None` for a placeholder or an entry
 /// with no usable time.
 pub fn video_to_item(entry: &Entry) -> Option<Item> {
@@ -228,5 +292,49 @@ mod tests {
         // Outside 1970 to year 2286: skipped rather than breaking the cursor size.
         assert_eq!(parse_rfc3339_ms("1969-12-31T23:59:59Z"), None);
         assert_eq!(parse_rfc3339_ms("9999-12-31T23:59:59Z"), None);
+    }
+
+    fn body_with_reason(reason: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "error": { "errors": [{ "reason": reason }] }
+        }))
+        .unwrap()
+    }
+
+    const CHANNEL: &str = "UC_x5XG1OV2P6uZZ5FSM9Ttw";
+
+    #[test]
+    fn error_reason_text_is_limited_to_a_safe_alphabet() {
+        assert_eq!(
+            error_reason(&body_with_reason("quotaExceeded")).as_deref(),
+            Some("quotaExceeded")
+        );
+        for unsafe_reason in [
+            "<script>alert(1)</script>".to_string(),
+            "a".repeat(41),
+            String::new(),
+            "has space".to_string(),
+            "line\nbreak".to_string(),
+        ] {
+            assert_eq!(error_reason(&body_with_reason(&unsafe_reason)), None);
+            // And it never reaches the resulting error text.
+            let error =
+                classify_youtube(500, &body_with_reason(&unsafe_reason), CHANNEL).unwrap();
+            let PollError::Transient(text) = error else {
+                panic!("expected Transient");
+            };
+            assert_eq!(text, "YouTube HTTP 500");
+        }
+        assert_eq!(error_reason(b"not json"), None);
+        assert_eq!(error_reason(b"{}"), None);
+        // A boundary-length reason is accepted.
+        assert!(error_reason(&body_with_reason(&"a".repeat(40))).is_some());
+    }
+
+    #[test]
+    fn two_hundred_range_statuses_are_not_errors() {
+        assert_eq!(classify_youtube(200, b"", CHANNEL), None);
+        assert_eq!(classify_youtube(204, b"", CHANNEL), None);
+        assert!(classify_youtube(300, b"", CHANNEL).is_some());
     }
 }

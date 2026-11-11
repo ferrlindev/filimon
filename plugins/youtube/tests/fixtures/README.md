@@ -28,4 +28,20 @@ research assumptions about the live API (A9 to A13) stay unconfirmed.
 | `playlist_empty.json` | A playlist with no entries: `items` is an empty array |
 | `playlist_placeholders.json` | One ordinary upload plus entries titled `Private video` and `Deleted video` and one entry with no `videoId`; the placeholders are newer than the ordinary entry |
 
-The `quotaExceeded`, 401 and malformed-JSON fixtures arrive in plan 07-08.
+## Provenance of each file
+
+Every file below is **synthetic** until plan 07-12 replaces it with a real
+capture.
+
+| Fixture | Provenance | How it was produced |
+|---------|------------|---------------------|
+| `playlist_page` | synthetic | hand-written from the `playlistItemListResponse` schema |
+| `playlist_newer` | synthetic | `playlist_page` plus two newer entries |
+| `playlist_empty` | synthetic | schema-shaped response with an empty `items` array |
+| `playlist_placeholders` | synthetic | schema-shaped page with `Private video`, `Deleted video` and no-`videoId` entries |
+| `quota_exceeded_403` (+ `.meta.json`) | synthetic | Google error envelope, status 403, `errors[0].reason` `quotaExceeded`, domain `youtube.quota` |
+| `unauthorized_401` (+ `.meta.json`) | synthetic | Google error envelope, status 401, reason `authError` |
+| `malformed` | synthetic | a playlist page cut off mid-string; carries the sentinel word `SENTINELTRUNCATED`, which no error text may echo |
+
+Other statuses and reasons (429, 400 `keyInvalid`, 403 `accessNotConfigured`,
+5xx and so on) are built inline in `tests/replay.rs`.
