@@ -173,22 +173,60 @@ impl FetchPolicy {
         self.timeout
     }
 
-    /// Judges `request` before any fetcher exists.
+    /// Judges `request` before any fetcher exists or any connection is made.
+    ///
+    /// The url rules come first, then the rest of the request: body size,
+    /// header count and size, header syntax and the forbidden headers. This one
+    /// check serves both a source's `fetch` and a fetcher's `send`, so a rule
+    /// added here holds at both. No error text carries guest data.
     ///
     /// # Errors
-    /// `InvalidRequest` for a url that cannot be used and `Denied` for a host
-    /// outside the allowlist.
+    /// `InvalidRequest` for a url, body or header that cannot be used and
+    /// `Denied` for a host outside the allowlist.
     pub fn check(&self, request: &types::Request) -> Result<url::Url, types::FetchError> {
+        let invalid = |text: &str| types::FetchError::InvalidRequest(text.to_string());
+        // Length first: a huge url is refused before it is parsed.
+        if request.url.len() > MAX_URL_BYTES {
+            return Err(invalid("url is too long"));
+        }
         let text = request.url.trim();
         if text.is_empty() {
-            return Err(types::FetchError::InvalidRequest(
-                "url is empty".to_string(),
-            ));
+            return Err(invalid("url is empty"));
         }
         // The url is never echoed back: it is guest data and may carry secrets.
-        let url = url::Url::parse(text)
-            .map_err(|_| types::FetchError::InvalidRequest("url cannot be parsed".to_string()))?;
+        let url = url::Url::parse(text).map_err(|_| invalid("url cannot be parsed"))?;
         self.check_url(&url)?;
+
+        if request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_REQUEST_BODY_BYTES)
+        {
+            return Err(types::FetchError::InvalidRequest(format!(
+                "request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
+            )));
+        }
+        let header_bytes: usize = request
+            .headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        if request.headers.len() > MAX_REQUEST_HEADERS || header_bytes > MAX_REQUEST_HEADER_BYTES {
+            return Err(invalid("headers are too large"));
+        }
+        // Syntax: a name that is not a token or a value with a line break.
+        to_header_map(&request.headers)?;
+        for (name, _) in &request.headers {
+            // Show the fixed list entry, never the guest's own text.
+            if let Some(forbidden) = FORBIDDEN_REQUEST_HEADERS
+                .iter()
+                .find(|forbidden| name.eq_ignore_ascii_case(forbidden))
+            {
+                return Err(types::FetchError::InvalidRequest(format!(
+                    "header `{forbidden}` is not allowed"
+                )));
+            }
+        }
         Ok(url)
     }
 
@@ -301,8 +339,6 @@ impl Egress {
         let mut method = to_method(&request.method)?;
         let mut headers = request.headers;
         let mut body = request.body;
-        // Reject a header that cannot be sent before any connection.
-        to_header_map(&headers)?;
         let client = self.client()?;
 
         let mut hops = 0;
