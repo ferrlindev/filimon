@@ -23,10 +23,10 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Fetchers
 
-- [ ] **FETCH-01**: A source plugin's `fetch` calls are routed to the fetcher component configured for that source in `filimon.toml`
-- [ ] **FETCH-02**: The host enforces each source's domain allowlist and request timeout regardless of which fetcher handles the request
-- [ ] **FETCH-03**: filimon ships a default HTTP fetcher component with TLS certificate validation enabled
-- [ ] **FETCH-04**: The news crawler can be configured to fetch pages through a fetcher component instead of its built-in client (hook for a future headless-browser fetcher)
+- [x] **FETCH-01**: A source plugin's `fetch` calls are routed to the fetcher component configured for that source in `filimon.toml`
+- [x] **FETCH-02**: The host enforces each source's domain allowlist and request timeout regardless of which fetcher handles the request
+- [x] **FETCH-03**: filimon ships a default HTTP fetcher component with TLS certificate validation enabled
+- [x] **FETCH-04**: The news crawler can be configured to fetch pages through a fetcher component instead of its built-in client (hook for a future headless-browser fetcher)
 
 ### Config & Secrets
 
@@ -134,10 +134,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HOST-03 | Phase 3 | Complete |
 | HOST-04 | Phase 3 | Complete |
 | HOST-05 | Phase 3 | Complete |
-| FETCH-01 | Phase 5 | Pending |
-| FETCH-02 | Phase 5 | Pending |
-| FETCH-03 | Phase 5 | Pending |
-| FETCH-04 | Phase 5 | Pending |
+| FETCH-01 | Phase 5 | Complete |
+| FETCH-02 | Phase 5 | Complete |
+| FETCH-03 | Phase 5 | Complete |
+| FETCH-04 | Phase 5 | Complete |
 | CONF-01 | Phase 1 | Complete |
 | CONF-02 | Phase 1 | Complete |
 | CONF-03 | Phase 1 | Complete |
