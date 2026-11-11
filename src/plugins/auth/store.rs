@@ -14,13 +14,19 @@
 // deleted (D-02). The directory is created 0700 and files 0600 from the first
 // byte (D-01).
 //
+// Login, refresh and logout take `lock`, a per-alias advisory lock on
+// `<state-dir>/auth/<alias>.lock`. It is a different file from the state
+// directory's own `.lock` that `fili run` holds for its whole life, so `fili
+// auth` commands work beside a running host.
+//
 // Token values live in redacting newtypes: `Debug` prints `***` and there is no
 // `Display`, so a token cannot reach a log line by formatting (D-06).
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::fs::File;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +42,12 @@ pub const TOKEN_FILE_VERSION: u32 = 1;
 
 /// Largest token file `read` looks at, in bytes.
 pub const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+
+/// How long `lock` waits for another holder before giving up.
+pub const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// How often `lock` retries while another holder has it.
+const LOCK_POLL: Duration = Duration::from_millis(25);
 
 /// Any group or other permission bit makes a token file too loose.
 #[cfg(unix)]
@@ -313,10 +325,105 @@ impl TokenStore {
         }
         Ok(())
     }
+
+    /// Takes this alias's advisory lock, waiting up to `LOCK_WAIT` for another
+    /// holder. Login, refresh and logout hold it around every read-modify-write
+    /// so they cannot lose each other's tokens. The lock lives in its own file,
+    /// `<state-dir>/auth/<alias>.lock`, and is released when the guard drops or
+    /// the process dies. The state directory's own `.lock`, which `fili run`
+    /// holds, is never touched.
+    ///
+    /// # Errors
+    /// `InvalidName` for an alias that fails the name rule; `TokenWrite` when
+    /// the directory or the lock file cannot be created, or when another fili
+    /// process still holds the lock after `LOCK_WAIT`.
+    pub async fn lock(&self) -> Result<AuthLock, AuthError> {
+        let path = self.path_with("lock")?;
+        let fail = |reason: String| AuthError::TokenWrite {
+            plugin: self.alias.clone(),
+            path: path.display().to_string(),
+            reason: clean_guest_text(&reason, IO_TEXT_CLIP),
+        };
+        self.ensure_dir().map_err(|e| fail(e.to_string()))?;
+
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|e| fail(e.to_string()))?;
+
+        // Never the blocking `lock`: that would hold a runtime worker.
+        let started = tokio::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(AuthLock { _file: file }),
+                Err(TryLockError::WouldBlock) => {
+                    if started.elapsed() >= LOCK_WAIT {
+                        return Err(fail(
+                            "another fili process is updating this login; try again".to_string(),
+                        ));
+                    }
+                    tokio::time::sleep(LOCK_POLL).await;
+                }
+                Err(TryLockError::Error(e)) => return Err(fail(e.to_string())),
+            }
+        }
+    }
+
+    /// Marks the stored login as needing a new login and keeps every other
+    /// field and the file mode (D-09). `Ok(false)` when there is no file. The
+    /// lock is proof the caller holds it for this read-modify-write.
+    ///
+    /// # Errors
+    /// Whatever `read` or `write` refuses.
+    pub fn mark_needs_login(&self, _lock: &AuthLock) -> Result<bool, AuthError> {
+        let Some(mut tokens) = self.read()? else {
+            return Ok(false);
+        };
+        tokens.needs_login = true;
+        self.write(&tokens)?;
+        Ok(true)
+    }
+
+    /// Deletes this alias's token file and nothing else (D-03). `Ok(true)` when
+    /// a file was removed, `Ok(false)` when there was none. It never reads the
+    /// file, so it also removes one that `read` refuses. The lock is proof the
+    /// caller holds it.
+    ///
+    /// # Errors
+    /// `InvalidName` for a bad alias; `TokenWrite` when the file cannot be
+    /// removed.
+    pub fn delete(&self, _lock: &AuthLock) -> Result<bool, AuthError> {
+        let path = self.file_path()?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(AuthError::TokenWrite {
+                plugin: self.alias.clone(),
+                path: path.display().to_string(),
+                reason: format!(
+                    "cannot be deleted: {}",
+                    clean_guest_text(&e.to_string(), IO_TEXT_CLIP)
+                ),
+            }),
+        }
+    }
+}
+
+/// Proof that one alias's lock is held. The lock is released when this drops,
+/// including when the process dies.
+#[derive(Debug)]
+pub struct AuthLock {
+    _file: File,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -339,7 +446,11 @@ mod tests {
     #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
     }
 
     /// Writes `<state>/auth/<alias>.json` with `content` and `mode`.
@@ -391,7 +502,10 @@ mod tests {
 
             let text = refusal(store.read(), "AT-1");
             assert!(text.contains("`stub`"), "{mode:o}: {text}");
-            assert!(text.contains(&path.display().to_string()), "{mode:o}: {text}");
+            assert!(
+                text.contains(&path.display().to_string()),
+                "{mode:o}: {text}"
+            );
             assert!(text.contains("permissions"), "{mode:o}: {text}");
             assert!(text.contains(&format!("{mode:03o}")), "{mode:o}: {text}");
             assert_eq!(std::fs::read(&path).expect("bytes"), body.as_bytes());
@@ -474,7 +588,8 @@ mod tests {
     #[test]
     fn unknown_fields_are_tolerated() {
         let dir = TempDir::new().expect("tempdir");
-        let body = valid_json("stub").replace("\"version\":1,", "\"version\":1,\"future_field\":1,");
+        let body =
+            valid_json("stub").replace("\"version\":1,", "\"version\":1,\"future_field\":1,");
         put_file(dir.path(), "stub", body.as_bytes(), 0o600);
         let store = TokenStore::new(dir.path(), "stub");
 
@@ -485,19 +600,28 @@ mod tests {
     fn read_never_creates_or_modifies_anything() {
         let dir = TempDir::new().expect("tempdir");
         let missing = dir.path().join("not-there");
-        assert_eq!(TokenStore::new(&missing, "stub").read().expect("read"), None);
+        assert_eq!(
+            TokenStore::new(&missing, "stub").read().expect("read"),
+            None
+        );
         assert!(!missing.exists(), "the state directory is still absent");
 
         let path = put_file(dir.path(), "stub", valid_json("stub").as_bytes(), 0o600);
         let before = (
             std::fs::read(&path).expect("bytes"),
-            std::fs::metadata(&path).expect("metadata").modified().expect("mtime"),
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
         );
         let store = TokenStore::new(dir.path(), "stub");
         assert!(store.read().expect("read").is_some());
         let after = (
             std::fs::read(&path).expect("bytes"),
-            std::fs::metadata(&path).expect("metadata").modified().expect("mtime"),
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
         );
         assert_eq!(before, after);
         let names: Vec<_> = std::fs::read_dir(dir.path().join("auth"))
@@ -579,5 +703,138 @@ mod tests {
             );
         }
         assert!(!dir.path().join("auth").exists());
+    }
+
+    // ── The lock, mark_needs_login and delete ─────────────────────────────────
+
+    #[tokio::test]
+    async fn lock_serialises_two_holders() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = Arc::new(TokenStore::new(dir.path(), "stub"));
+        let first = store.lock().await.expect("first lock");
+
+        let second_store = Arc::clone(&store);
+        let mut second = tokio::spawn(async move { second_store.lock().await.map(|_| ()) });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the second holder must wait while the first holds the lock"
+        );
+
+        drop(first);
+        let finished = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the second holder gets the lock once the first drops it")
+            .expect("task");
+        assert!(finished.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_lock_is_released_when_dropped() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(dir.path(), "stub");
+        let first = store.lock().await.expect("take");
+        drop(first);
+        let again = tokio::time::timeout(Duration::from_millis(500), store.lock())
+            .await
+            .expect("retaking is immediate");
+        assert!(again.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_creates_the_auth_directory_0700() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(dir.path(), "stub");
+        let _lock = store.lock().await.expect("lock");
+        assert_eq!(mode_of(&dir.path().join("auth")), 0o700);
+        assert_eq!(mode_of(&dir.path().join("auth").join("stub.lock")), 0o600);
+    }
+
+    #[tokio::test]
+    async fn lock_uses_its_own_file_and_never_the_state_lock() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(dir.path(), "stub");
+        let _lock = store.lock().await.expect("lock");
+        assert!(dir.path().join("auth").join("stub.lock").is_file());
+        assert!(
+            !dir.path().join(".lock").exists(),
+            "the state directory's own lock is never touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_aliases_do_not_block_each_other() {
+        let dir = TempDir::new().expect("tempdir");
+        let a = TokenStore::new(dir.path(), "a");
+        let b = TokenStore::new(dir.path(), "b");
+        let _held = a.lock().await.expect("lock a");
+        let other = tokio::time::timeout(Duration::from_millis(500), b.lock())
+            .await
+            .expect("b is not delayed by a");
+        assert!(other.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mark_needs_login_keeps_every_other_field_and_the_mode() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(dir.path(), "stub");
+        let stored = tokens("AT-1", 2_000_000_000);
+        store.write(&stored).expect("write");
+        let lock = store.lock().await.expect("lock");
+
+        assert!(store.mark_needs_login(&lock).expect("mark"));
+
+        let after = store.read().expect("read").expect("a login");
+        assert_eq!(
+            after,
+            StoredTokens {
+                needs_login: true,
+                ..stored
+            }
+        );
+        #[cfg(unix)]
+        assert_eq!(mode_of(&dir.path().join("auth").join("stub.json")), 0o600);
+    }
+
+    #[tokio::test]
+    async fn mark_needs_login_on_a_missing_file_is_false() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(dir.path(), "stub");
+        let lock = store.lock().await.expect("lock");
+
+        assert!(!store.mark_needs_login(&lock).expect("mark"));
+        assert!(!dir.path().join("auth").join("stub.json").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_file_and_reports_absence() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(dir.path(), "stub");
+        store.write(&tokens("AT-1", 2_000_000_000)).expect("write");
+        let lock = store.lock().await.expect("lock");
+        let path = dir.path().join("auth").join("stub.json");
+
+        assert!(store.delete(&lock).expect("first delete"));
+        assert!(!path.exists());
+        assert!(!store.delete(&lock).expect("second delete"));
+    }
+
+    #[tokio::test]
+    async fn delete_leaves_other_aliases_alone() {
+        let dir = TempDir::new().expect("tempdir");
+        let a = TokenStore::new(dir.path(), "a");
+        let b = TokenStore::new(dir.path(), "b");
+        a.write(&tokens("AT-A", 2_000_000_000)).expect("write a");
+        b.write(&tokens("AT-B", 2_000_000_000)).expect("write b");
+        let b_path = dir.path().join("auth").join("b.json");
+        let before = std::fs::read(&b_path).expect("bytes");
+        let lock = a.lock().await.expect("lock a");
+
+        assert!(a.delete(&lock).expect("delete a"));
+
+        assert_eq!(std::fs::read(&b_path).expect("bytes"), before);
+        assert!(!dir.path().join("auth").join("a.json").exists());
     }
 }
