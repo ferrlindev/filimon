@@ -1,0 +1,87 @@
+{
+  "kind": "Listing",
+  "data": {
+    "after": "t3_1kx9bc3",
+    "dist": 3,
+    "modhash": null,
+    "geo_filter": "",
+    "before": null,
+    "children": [
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "rust",
+          "selftext": "Please read the rules before posting.",
+          "author_fullname": "t2_synthetic1",
+          "saved": false,
+          "title": "Read this first: subreddit rules and posting guide",
+          "name": "t3_1kx9ba1",
+          "id": "1kx9ba1",
+          "author": "mod_bot",
+          "score": 42,
+          "num_comments": 17,
+          "created_utc": 1700000050.0,
+          "created": 1700000050.0,
+          "permalink": "/r/rust/comments/1kx9ba1/read_this_first_subreddit_rules_and_posting/",
+          "url": "https://www.reddit.com/r/rust/comments/1kx9ba1/read_this_first_subreddit_rules_and_posting/",
+          "is_self": true,
+          "stickied": true,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/rust"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "rust",
+          "selftext": "I have been porting a small parser to async and the borrow checker keeps rejecting a self-referential buffer. What is the usual way out?",
+          "author_fullname": "t2_synthetic1",
+          "saved": false,
+          "title": "A hot take on trait objects",
+          "name": "t3_1kx9bb2",
+          "id": "1kx9bb2",
+          "author": "dyn_dan",
+          "score": 250,
+          "num_comments": 17,
+          "created_utc": 1700000400.0,
+          "created": 1700000400.0,
+          "permalink": "/r/rust/comments/1kx9bb2/a_hot_take_on_trait_objects/",
+          "url": "https://www.reddit.com/r/rust/comments/1kx9bb2/a_hot_take_on_trait_objects/",
+          "is_self": true,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/rust"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "rust",
+          "selftext": "",
+          "author_fullname": "t2_synthetic2",
+          "saved": false,
+          "title": "Benchmarks: arena allocators compared",
+          "name": "t3_1kx9bc3",
+          "id": "1kx9bc3",
+          "author": "alloc_ana",
+          "score": 180,
+          "num_comments": 58,
+          "created_utc": 1700000350.0,
+          "created": 1700000350.0,
+          "permalink": "/r/rust/comments/1kx9bc3/benchmarks_arena_allocators_compared/",
+          "url": "https://blog.example.org/2026-edition-roadmap?a=1&b=2",
+          "is_self": false,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/rust"
+        }
+      }
+    ]
+  }
+}
