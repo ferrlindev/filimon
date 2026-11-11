@@ -3,22 +3,99 @@
 //! Every error text names the field and never repeats the rejected value (a
 //! value can carry CR or LF, and a config error is logged by the host).
 
+use crate::cursor::MAX_FEEDS;
 use serde::Deserialize;
+use toml::Value;
 
 /// Page size of the first poll of a feed (D-10).
 pub const DEFAULT_FIRST_POLL_LIMIT: u32 = 25;
+/// The app id in the user agent unless `[settings] app_id` overrides it (D-22).
+const DEFAULT_APP_ID: &str = "reddit";
 /// Page size of a later poll of a feed: Reddit's page maximum.
 pub const LATER_POLL_LIMIT: u32 = 100;
 /// Mirror of the host cap `MAX_ITEMS_PER_POLL` in `src/plugins/host/map.rs`:
 /// the host keeps the first 1000 items of a poll and silently drops the rest.
 pub const MAX_ITEMS_PER_POLL: usize = 1000;
 
-/// The raw `[settings]` table. Unknown keys are rejected.
+/// The raw `[settings]` table. Unknown keys are rejected. Values stay untyped
+/// so a wrong type is reported by this module, which never echoes the value
+/// (serde's own type errors quote it).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    subreddits: Vec<String>,
-    user_agent_contact: Option<String>,
+    subreddits: Option<Value>,
+    listings: Option<Value>,
+    user_agent_contact: Option<Value>,
+    app_id: Option<Value>,
+    first_poll_limit: Option<Value>,
+}
+
+/// Longest subreddit name Reddit allows.
+const MAX_SUBREDDIT_LEN: usize = 21;
+/// Page size bounds for `first_poll_limit`.
+const MAX_PAGE_LIMIT: i64 = 100;
+
+fn valid_subreddit(name: &str) -> bool {
+    (1..=MAX_SUBREDDIT_LEN).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn parse_subreddits(value: Option<Value>) -> Result<Vec<String>, String> {
+    const RULE: &str = "settings.subreddits: required, a non-empty list of subreddit names of 1 to 21 letters, digits or _ (no r/ prefix)";
+    let Some(Value::Array(entries)) = value else {
+        return Err(RULE.to_string());
+    };
+    if entries.is_empty() {
+        return Err(RULE.to_string());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let Value::String(name) = entry else {
+            return Err(RULE.to_string());
+        };
+        if !valid_subreddit(&name) {
+            return Err(RULE.to_string());
+        }
+        if !names.iter().any(|seen| seen.eq_ignore_ascii_case(&name)) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn parse_listings(value: Option<Value>) -> Result<Vec<&'static str>, String> {
+    const RULE: &str = "settings.listings: expected a non-empty list of \"new\" or \"hot\"";
+    let Some(value) = value else {
+        return Ok(vec!["new"]);
+    };
+    let Value::Array(entries) = value else {
+        return Err(RULE.to_string());
+    };
+    if entries.is_empty() {
+        return Err(RULE.to_string());
+    }
+    let mut listings: Vec<&'static str> = Vec::new();
+    for entry in entries {
+        let listing = match entry.as_str() {
+            Some("new") => "new",
+            Some("hot") => "hot",
+            _ => return Err(RULE.to_string()),
+        };
+        if !listings.contains(&listing) {
+            listings.push(listing);
+        }
+    }
+    Ok(listings)
+}
+
+fn parse_first_poll_limit(value: Option<Value>) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_FIRST_POLL_LIMIT);
+    };
+    match value {
+        Value::Integer(n) if (1..=MAX_PAGE_LIMIT).contains(&n) => Ok(n as u32),
+        _ => Err("settings.first_poll_limit: expected a whole number from 1 to 100".to_string()),
+    }
 }
 
 /// One feed: a subreddit and a listing.
@@ -34,35 +111,67 @@ pub struct Feed {
 #[derive(Debug, Clone)]
 pub struct Settings {
     subreddits: Vec<String>,
+    listings: Vec<&'static str>,
     user_agent: String,
+    first_poll_limit: u32,
 }
 
 impl Settings {
     /// Parse and validate the raw `[settings]` TOML. The `Err` text becomes a
-    /// `config` error.
+    /// `config` error naming the field and never repeating the rejected value.
     pub fn parse(text: &str) -> Result<Settings, String> {
         let raw: Raw = toml::from_str(text).map_err(|e| format!("settings: {}", e.message()))?;
-        let contact = raw
-            .user_agent_contact
-            .as_deref()
-            .ok_or_else(|| "settings.user_agent_contact: required".to_string())?;
-        let user_agent = user_agent(contact, "reddit")?;
+        let subreddits = parse_subreddits(raw.subreddits)?;
+        let listings = parse_listings(raw.listings)?;
+        let contact = match raw.user_agent_contact {
+            Some(Value::String(contact)) => contact,
+            Some(_) => {
+                return Err("settings.user_agent_contact: expected a string".to_string());
+            }
+            None => {
+                return Err(
+                    "settings.user_agent_contact: required (a Reddit username such as \"u/yourname\")"
+                        .to_string(),
+                );
+            }
+        };
+        let app_id = match raw.app_id {
+            None => DEFAULT_APP_ID.to_string(),
+            Some(Value::String(app_id)) => app_id,
+            Some(_) => return Err("settings.app_id: expected a string".to_string()),
+        };
+        let user_agent = user_agent(&contact, &app_id)?;
+        let first_poll_limit = parse_first_poll_limit(raw.first_poll_limit)?;
+
+        // The cursor holds one mark per feed, and the host disables a plugin
+        // whose cursor passes its cap (Pitfall 2).
+        let feed_count = subreddits.len() * listings.len();
+        if feed_count > MAX_FEEDS {
+            return Err(format!(
+                "settings.subreddits: {feed_count} feeds (subreddits x listings) exceed the most the cursor can hold ({MAX_FEEDS})"
+            ));
+        }
         Ok(Settings {
-            subreddits: raw.subreddits,
+            subreddits,
+            listings,
             user_agent,
+            first_poll_limit,
         })
     }
 
-    /// The feeds to poll, in order.
+    /// The feeds to poll: every subreddit, each with every listing, in order.
     pub fn feeds(&self) -> Vec<Feed> {
-        self.subreddits
-            .iter()
-            .map(|name| Feed {
-                subreddit: name.clone(),
-                listing: "new",
-                key: format!("r/{}:new", name.to_ascii_lowercase()),
-            })
-            .collect()
+        let mut feeds = Vec::with_capacity(self.subreddits.len() * self.listings.len());
+        for name in &self.subreddits {
+            for listing in &self.listings {
+                feeds.push(Feed {
+                    subreddit: name.clone(),
+                    listing,
+                    key: format!("r/{}:{listing}", name.to_ascii_lowercase()),
+                });
+            }
+        }
+        feeds
     }
 
     /// The `User-Agent` header value every request carries.
@@ -70,14 +179,23 @@ impl Settings {
         &self.user_agent
     }
 
-    /// Page size for a feed that has no mark yet.
-    pub fn first_page_limit(&self) -> u32 {
-        DEFAULT_FIRST_POLL_LIMIT
+    /// The most items per feed such that one poll never returns more than the
+    /// host keeps (the host silently drops the excess), and at least 1.
+    fn page_cap(&self) -> u32 {
+        let feeds = (self.subreddits.len() * self.listings.len()).max(1);
+        ((MAX_ITEMS_PER_POLL / feeds) as u32).max(1)
     }
 
-    /// Page size for a feed that already has a mark.
+    /// Page size for a feed that has no mark yet: `first_poll_limit`, shrunk
+    /// to fit the per-poll item cap.
+    pub fn first_page_limit(&self) -> u32 {
+        self.first_poll_limit.min(self.page_cap()).max(1)
+    }
+
+    /// Page size for a feed that already has a mark: Reddit's page maximum,
+    /// shrunk to fit the per-poll item cap.
     pub fn later_page_limit(&self) -> u32 {
-        LATER_POLL_LIMIT
+        LATER_POLL_LIMIT.min(self.page_cap()).max(1)
     }
 }
 
@@ -100,6 +218,15 @@ pub fn user_agent(contact: &str, app_id: &str) -> Result<String, String> {
         return Err(
             "settings.user_agent_contact: expected a Reddit username of 3 to 20 letters, digits, _ or - (for example \"u/yourname\")"
                 .to_string(),
+        );
+    }
+    let app_id_valid = (1..=32).contains(&app_id.len())
+        && app_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if !app_id_valid {
+        return Err(
+            "settings.app_id: expected 1 to 32 lower-case letters, digits, _ or -".to_string(),
         );
     }
     Ok(format!(

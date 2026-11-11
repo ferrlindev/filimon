@@ -72,7 +72,13 @@ pub fn poll(
 
     for feed in settings.feeds() {
         let mark = old.0.get(&feed.key);
-        let limit = settings.first_page_limit();
+        // D-10: the first poll of a feed is one page; later polls return only
+        // newer items, so they take the largest page.
+        let limit = if mark.is_some() {
+            settings.later_page_limit()
+        } else {
+            settings.first_page_limit()
+        };
         let request = api::listing_request(
             &feed.subreddit,
             feed.listing,

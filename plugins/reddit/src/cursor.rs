@@ -11,11 +11,14 @@ use std::collections::BTreeMap;
 /// makes the host disable the plugin.
 pub const MAX_CURSOR_BYTES: usize = 4096;
 
-/// Bytes of the longest possible cursor entry plus its comma.
-pub const WORST_ENTRY_BYTES: usize = 1;
+/// Bytes of the longest possible cursor entry plus its comma:
+/// `"r/<21 chars>:<3 chars>":{"t":<10 digits>,"n":"t3_<10 chars>"},`
+/// is 29 + 1 + 36 + 1 bytes. A test measures it against a real encode.
+pub const WORST_ENTRY_BYTES: usize = 67;
 
-/// Most feeds whose worst-case cursor still fits the host cap.
-pub const MAX_FEEDS: usize = 1;
+/// Most feeds whose worst-case cursor still fits the host cap, leaving room
+/// for the two braces.
+pub const MAX_FEEDS: usize = (MAX_CURSOR_BYTES - 2) / WORST_ENTRY_BYTES;
 
 /// The newest post seen in one feed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
