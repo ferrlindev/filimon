@@ -1,8 +1,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // plugins/auth/client.rs - The host's token endpoint client
 //
-// Three form POSTs on the async `reqwest::Client`: exchange an authorization
-// code (with its PKCE verifier), refresh an access token and revoke a token.
+// Four form POSTs on the async `reqwest::Client`: exchange an authorization
+// code (with its PKCE verifier), refresh an access token, request an app-only
+// token (`client_credentials`) and revoke a token.
 // It is the host's own client, outside the plugin fetch allowlist and its
 // egress policy, so a plugin's allowlist need not list login hosts.
 //
@@ -122,11 +123,17 @@ impl TokenClient {
     }
 
     fn build(oauth: &OAuthConfig, timeout: Duration) -> Result<Self, AuthError> {
+        // The operator's `[host.oauth] user_agent` (research T4), else the
+        // default. Token and revocation requests share this client.
+        let user_agent = oauth
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| concat!("fili/", env!("CARGO_PKG_VERSION")).to_string());
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("fili/", env!("CARGO_PKG_VERSION")))
+            .user_agent(user_agent.as_str())
             .build()
             .map_err(|error| AuthError::TokenRequest {
                 reason: describe_transport_error(error),
@@ -193,6 +200,34 @@ impl TokenClient {
             // A broken answer is not a reason to throw the login away (D-09).
             return parse_token_set(&body).map_err(|_| {
                 RefreshFailure::Transient("answer has no usable access token".to_string())
+            });
+        }
+        Err(classify_refresh_error(status, &body))
+    }
+
+    /// Requests an app-only access token with the `client_credentials` grant
+    /// (D-03): the form is exactly `grant_type=client_credentials` and the
+    /// client authenticates with HTTP Basic, so no secret is in the body.
+    ///
+    /// # Errors
+    /// A [`RefreshFailure`] classifying why no token was obtained: a transport
+    /// failure, an oversized answer, a 5xx, 408 or 429 and an answer without
+    /// a usable token are `Transient`; a rejection (401, another 4xx, a
+    /// redirect, or a success status carrying an OAuth `error`) is `Rejected`.
+    pub async fn client_credentials(&self) -> Result<TokenSet, RefreshFailure> {
+        let form = vec![("grant_type", "client_credentials")];
+        let (status, body) = match self.post_form(&self.oauth.token_url, form).await {
+            Ok(answer) => answer,
+            Err(SendFailure::Transport(text)) => return Err(RefreshFailure::Transient(text)),
+            Err(SendFailure::TooLarge) => return Err(RefreshFailure::Transient(too_large_text())),
+        };
+        if status.is_success() {
+            // Reddit has answered a bad app-token request with a 2xx status
+            // and an `error` body: a permanent misconfiguration must not look
+            // like a transient fault.
+            return parse_token_set(&body).map_err(|_| match parse_oauth_error(&body) {
+                Some(text) => RefreshFailure::Rejected(text),
+                None => RefreshFailure::Transient("answer has no usable access token".to_string()),
             });
         }
         Err(classify_refresh_error(status, &body))
@@ -405,7 +440,9 @@ fn describe_transport_error(error: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::auth::testing::{form_pairs, oauth_config_for, token_body};
+    use crate::plugins::auth::testing::{
+        client_credentials_config_for, form_pairs, oauth_config_for, token_body,
+    };
     use crate::plugins::host::testing::{Reply, SeenRequest, TestHttpServer};
     use base64::Engine as _;
 
@@ -1043,6 +1080,212 @@ mod tests {
         for failure in &failures {
             let text = format!("{} {failure:?}", failure.text());
             for secret in ["RT-1", "RT-2", "CS-SENTINEL", BODY_SENTINEL] {
+                assert!(!text.contains(secret), "`{secret}` leaked into: {text}");
+            }
+            assert!(!failure.text().contains('\u{1b}'), "{:?}", failure.text());
+        }
+    }
+
+    // ── Client credentials (D-03) and the configurable User-Agent (T4) ────────
+
+    const REDDIT_USER_AGENT: &str = "filimon:reddit:0.1.0 (by /u/tester)";
+
+    /// Runs one `client_credentials` request against a server answering
+    /// `reply`, with `user_agent` configured when given.
+    async fn credentials_against(
+        reply: Reply,
+        user_agent: Option<&str>,
+    ) -> (Result<TokenSet, RefreshFailure>, Vec<SeenRequest>) {
+        let server = serve(reply).await;
+        let config = OAuthConfig {
+            user_agent: user_agent.map(str::to_string),
+            ..client_credentials_config_for(&server.url("/token"), "CS-SENTINEL")
+        };
+        let client = TokenClient::new(&config).expect("client");
+        (client.client_credentials().await, server.seen())
+    }
+
+    /// The failure of an app token request that must fail.
+    async fn credentials_failure_of(reply: Reply) -> RefreshFailure {
+        credentials_against(reply, None)
+            .await
+            .0
+            .expect_err("the app token request must fail")
+    }
+
+    #[tokio::test]
+    async fn client_credentials_posts_the_grant_with_basic_auth_and_no_body_secret() {
+        let (result, seen) = credentials_against(
+            Reply::json(200, &token_body("AT-APP", None, Some(3600))),
+            None,
+        )
+        .await;
+        result.expect("app token");
+        assert_eq!(seen.len(), 1);
+        let request = &seen[0];
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.header("authorization"),
+            Some(basic("client-1", "CS-SENTINEL").as_str())
+        );
+        assert_eq!(request.header("accept"), Some("application/json"));
+        assert_eq!(
+            form_pairs(&request.body),
+            vec![("grant_type".to_string(), "client_credentials".to_string())]
+        );
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        assert!(!body.contains("CS-SENTINEL"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn client_credentials_sends_the_configured_user_agent_and_the_default_otherwise() {
+        let (result, seen) = credentials_against(
+            Reply::json(200, &token_body("AT-APP", None, None)),
+            Some(REDDIT_USER_AGENT),
+        )
+        .await;
+        result.expect("app token");
+        assert_eq!(seen[0].header("user-agent"), Some(REDDIT_USER_AGENT));
+        let (result, seen) =
+            credentials_against(Reply::json(200, &token_body("AT-APP", None, None)), None).await;
+        result.expect("app token");
+        assert!(
+            seen[0]
+                .header("user-agent")
+                .is_some_and(|ua| ua.starts_with("fili/")),
+            "{:?}",
+            seen[0].header("user-agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_configured_user_agent_applies_to_revocation_requests() {
+        let server = serve(Reply::status(200)).await;
+        let mut config = oauth_config_for(&server.url("/token"), None);
+        config.revocation_url = Some(url::Url::parse(&server.url("/revoke")).expect("url"));
+        config.user_agent = Some(REDDIT_USER_AGENT.to_string());
+        let client = TokenClient::new(&config).expect("client");
+        assert!(
+            client
+                .revoke("AT-1", TokenKind::Access)
+                .await
+                .expect("revoke")
+        );
+        let seen = server.seen();
+        assert_eq!(seen[0].target, "/revoke");
+        assert_eq!(seen[0].header("user-agent"), Some(REDDIT_USER_AGENT));
+    }
+
+    #[tokio::test]
+    async fn client_credentials_parses_a_reddit_style_answer_without_a_refresh_token() {
+        let (result, _) = credentials_against(
+            Reply::json(
+                200,
+                r#"{"access_token":"AT-APP","token_type":"bearer","expires_in":86400,"scope":"*"}"#,
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            result.expect("app token"),
+            TokenSet {
+                access_token: "AT-APP".to_string(),
+                refresh_token: None,
+                expires_in: Some(86400),
+                scope: Some("*".to_string()),
+                token_type: Some("bearer".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn client_credentials_without_expires_in_leaves_it_none() {
+        let (result, _) =
+            credentials_against(Reply::json(200, r#"{"access_token":"AT-APP"}"#), None).await;
+        assert_eq!(result.expect("app token").expires_in, None);
+    }
+
+    #[tokio::test]
+    async fn a_200_with_an_oauth_error_is_rejected_not_transient() {
+        let failure =
+            credentials_failure_of(Reply::json(200, r#"{"error":"unsupported_grant_type"}"#)).await;
+        assert!(
+            matches!(&failure, RefreshFailure::Rejected(text) if text.contains("unsupported_grant_type")),
+            "{failure:?}"
+        );
+        let failure = credentials_failure_of(Reply::json(200, "{}")).await;
+        assert!(
+            matches!(failure, RefreshFailure::Transient(_)),
+            "{failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_401_is_rejected_a_5xx_and_429_are_transient() {
+        let failure = credentials_failure_of(Reply::json(
+            401,
+            r#"{"message":"Unauthorized","error":401}"#,
+        ))
+        .await;
+        assert!(
+            matches!(&failure, RefreshFailure::Rejected(text) if text == "HTTP 401"),
+            "{failure:?}"
+        );
+        for status in [503, 429] {
+            let failure = credentials_failure_of(Reply::status(status)).await;
+            assert!(
+                matches!(failure, RefreshFailure::Transient(_)),
+                "{status}: {failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_for_client_credentials() {
+        let target = serve(Reply::json(200, &token_body("AT-APP", None, None))).await;
+        let first = serve(Reply::redirect(307, &target.url("/token"))).await;
+        let config = client_credentials_config_for(&first.url("/token"), "CS-SENTINEL");
+        let client = TokenClient::new(&config).expect("client");
+        let failure = client
+            .client_credentials()
+            .await
+            .expect_err("a redirect is a rejection");
+        assert!(
+            matches!(&failure, RefreshFailure::Rejected(text) if text == "HTTP 307"),
+            "{failure:?}"
+        );
+        assert!(
+            target.seen().is_empty(),
+            "the redirect target was contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_credentials_errors_never_carry_the_secret_or_the_body() {
+        let mut failures = vec![];
+        for reply in [
+            Reply::json(
+                200,
+                r#"{"error":"invalid_client","error_description":"nope\u001b[0m"}"#,
+            ),
+            Reply::json(200, BODY_SENTINEL),
+            Reply::json(200, "{}"),
+            Reply::json(401, &format!("<html>{BODY_SENTINEL}</html>")),
+            Reply::json(502, &format!("<html>{BODY_SENTINEL}</html>")),
+            Reply::json(400, BODY_SENTINEL),
+            Reply::status(503),
+            Reply::status(429),
+            Reply::redirect(307, "http://127.0.0.1:9/AT-APP"),
+            Reply::ok(vec![b'a'; MAX_RESPONSE_BYTES + 1]),
+        ] {
+            failures.push(credentials_failure_of(reply).await);
+        }
+        let config = client_credentials_config_for(&closed_port_url().await, "CS-SENTINEL");
+        let client = TokenClient::new(&config).expect("client");
+        failures.push(client.client_credentials().await.expect_err("unreachable"));
+        for failure in &failures {
+            let text = format!("{} {failure:?}", failure.text());
+            for secret in ["AT-APP", "CS-SENTINEL", BODY_SENTINEL] {
                 assert!(!text.contains(secret), "`{secret}` leaked into: {text}");
             }
             assert!(!failure.text().contains('\u{1b}'), "{:?}", failure.text());

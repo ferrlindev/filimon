@@ -26,6 +26,22 @@
 //                                   else RefreshFailed; nothing is marked
 //   no refresh token, expired    -> NeedsLogin
 //
+// The `client_credentials` grant (D-03) has no login and no file. The host
+// fetches the app token itself, holds it in memory only and serves every poll
+// from that cache:
+//
+//   nothing cached               -> fetch first      (single flight)
+//   at least 60 s of life left   -> Token            (cached, no request)
+//   under 60 s of life left      -> fetch again first
+//   fetch ok                     -> Token           (cached; no expires_in
+//                                                    means 3600 s)
+//   fetch failed, cached token
+//   still valid                  -> Token(cached)   (a warning is logged)
+//   fetch failed, nothing valid  -> RefreshFailed   (a backed-off cycle)
+//
+// It never answers NotLoggedIn, NeedsLogin or FileProblem, and a stale login
+// file of the same alias is ignored. A new process fetches a fresh token.
+//
 // Expiry is judged by an injectable wall-clock function. Tokio's paused time
 // does not move the wall clock, so a test that pauses time can neither make a
 // token look fresh nor stale by accident.
@@ -37,7 +53,7 @@ use std::sync::{Arc, OnceLock};
 use super::client::{DEFAULT_EXPIRES_IN_SECS, RefreshFailure, TokenClient, TokenSet};
 use super::error::AuthError;
 use super::store::{AccessToken, AuthLock, RefreshToken, StoredTokens, TokenStore};
-use crate::plugins::config::OAuthConfig;
+use crate::plugins::config::{OAuthConfig, OAuthGrant};
 use crate::plugins::host::engine::clean_guest_text;
 
 /// Longest error text kept in an outcome, in characters.
@@ -81,6 +97,15 @@ pub struct TokenProvider {
     gate: tokio::sync::Mutex<()>,
     /// Built on first use; a build failure is kept as cleaned text.
     client: OnceLock<Result<TokenClient, String>>,
+    /// The app-only token of the `client_credentials` grant. Memory only: it
+    /// is never written to disk. Held across the request (single flight).
+    app_token: tokio::sync::Mutex<Option<AppToken>>,
+}
+
+/// A fetched app-only access token and when it expires (Unix seconds).
+struct AppToken {
+    token: AccessToken,
+    expires_at: i64,
 }
 
 impl std::fmt::Debug for TokenProvider {
@@ -103,6 +128,7 @@ impl TokenProvider {
             clock: system_clock(),
             gate: tokio::sync::Mutex::new(()),
             client: OnceLock::new(),
+            app_token: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -117,6 +143,12 @@ impl TokenProvider {
     /// Re-reads the token file and decides what the next poll receives,
     /// refreshing the token first when it is due.
     pub async fn access_token(&self) -> TokenOutcome {
+        // An app-only plugin has no login: its token is fetched by the host
+        // and held in memory, so the token file is never read, created or
+        // locked for this grant.
+        if self.oauth.grant == OAuthGrant::ClientCredentials {
+            return self.app_token().await;
+        }
         let tokens = match self.store.read() {
             Ok(Some(tokens)) => tokens,
             Ok(None) => return TokenOutcome::NotLoggedIn,
@@ -130,6 +162,57 @@ impl TokenProvider {
             return TokenOutcome::Token(tokens.access_token);
         }
         self.renew(tokens, now).await
+    }
+
+    /// The app-only token of the `client_credentials` grant (D-03): served
+    /// from memory while at least [`REFRESH_MARGIN_SECS`] seconds of life are
+    /// left, fetched otherwise. The tokio mutex is held across the request, so
+    /// a concurrent caller waits and then finds the fresh cache (single
+    /// flight). There is no retry here: one request per due poll, the
+    /// scheduler's backoff does the waiting.
+    async fn app_token(&self) -> TokenOutcome {
+        let mut cache = self.app_token.lock().await;
+        let now = (self.clock)();
+        if let Some(cached) = cache.as_ref()
+            && cached.expires_at.saturating_sub(now) >= REFRESH_MARGIN_SECS
+        {
+            return TokenOutcome::Token(cached.token.clone());
+        }
+        let fetched = match self.client() {
+            Ok(client) => client.client_credentials().await,
+            Err(text) => Err(RefreshFailure::Transient(format!(
+                "http client unavailable: {text}"
+            ))),
+        };
+        match fetched {
+            Ok(set) => {
+                let lifetime = i64::try_from(set.expires_in.unwrap_or(DEFAULT_EXPIRES_IN_SECS))
+                    .unwrap_or(i64::MAX);
+                let token = AccessToken::new(set.access_token);
+                *cache = Some(AppToken {
+                    token: token.clone(),
+                    expires_at: (self.clock)().saturating_add(lifetime),
+                });
+                TokenOutcome::Token(token)
+            }
+            Err(
+                RefreshFailure::Transient(text)
+                | RefreshFailure::Rejected(text)
+                | RefreshFailure::Permanent(text),
+            ) => {
+                let text = clean_guest_text(&text, ERROR_TEXT_CLIP);
+                if let Some(cached) = cache.as_ref()
+                    && cached.expires_at > (self.clock)()
+                {
+                    tracing::warn!(
+                        plugin = %self.plugin,
+                        "the app token request failed, using the current token: {text}"
+                    );
+                    return TokenOutcome::Token(cached.token.clone());
+                }
+                TokenOutcome::RefreshFailed(format!("the app token request failed: {text}"))
+            }
+        }
     }
 
     /// The token is under the margin. With no refresh token to use and some
@@ -817,5 +900,219 @@ mod tests {
             assert!(!text.contains(hidden), "{text}");
             assert!(!format!("{provider:?}").contains(hidden));
         }
+    }
+
+    // ── The app-only token: the client_credentials grant (D-03) ───────────────
+
+    use crate::plugins::auth::testing::client_credentials_config_for;
+    use base64::Engine as _;
+
+    impl Rig {
+        /// A provider for the app-only grant against the rig's endpoint, on
+        /// the rig's clock.
+        fn app_provider(&self) -> TokenProvider {
+            let now = Arc::clone(&self.now);
+            TokenProvider::new(
+                "stub",
+                client_credentials_config_for(&self.server.url("/token"), "CS-SENTINEL"),
+                self.dir.path(),
+            )
+            .with_clock(Arc::new(move || now.load(Ordering::SeqCst)))
+        }
+
+        fn set_clock(&self, now: i64) {
+            self.now.store(now, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_credentials_fetches_a_token_on_first_use_and_caches_it_in_memory() {
+        let rig = Rig::new(vec![
+            good("AT-APP-1", None, Some(3600)),
+            good("AT-APP-2", None, Some(3600)),
+        ])
+        .await;
+        let provider = rig.app_provider();
+
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+        assert_eq!(rig.requests(), 1);
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+        assert_eq!(rig.requests(), 1, "the second call is served from memory");
+
+        let seen = rig.server.seen();
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("client-1:CS-SENTINEL")
+        );
+        assert_eq!(seen[0].header("authorization"), Some(expected.as_str()));
+        assert_eq!(
+            form_pairs(&seen[0].body),
+            vec![("grant_type".to_string(), "client_credentials".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_app_token_with_exactly_the_margin_left_is_reused_and_one_second_less_refetches()
+     {
+        let rig = Rig::new(vec![
+            good("AT-APP-1", None, Some(3600)),
+            good("AT-APP-2", None, Some(3600)),
+        ])
+        .await;
+        let provider = rig.app_provider();
+        // Clock 1_000, expires_in 3_600: the token expires at 4_600.
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+
+        rig.set_clock(4_600 - REFRESH_MARGIN_SECS);
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+        assert_eq!(rig.requests(), 1, "60 seconds left: reused");
+
+        rig.set_clock(4_600 - REFRESH_MARGIN_SECS + 1);
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-2");
+        assert_eq!(rig.requests(), 2, "59 seconds left: fetched again");
+    }
+
+    #[tokio::test]
+    async fn a_missing_expires_in_defaults_to_3600_seconds() {
+        let rig = Rig::new(vec![
+            good("AT-APP-1", None, None),
+            good("AT-APP-2", None, None),
+        ])
+        .await;
+        let provider = rig.app_provider();
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+
+        rig.set_clock(1_000 + 3_540);
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+        assert_eq!(rig.requests(), 1);
+
+        rig.set_clock(1_000 + 3_541);
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-2");
+        assert_eq!(rig.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_app_token_calls_make_one_request() {
+        let rig = Rig::new(vec![
+            good("AT-APP-1", None, Some(3600)).delayed(Duration::from_millis(100)),
+        ])
+        .await;
+        let provider = rig.app_provider();
+
+        let (first, second) = tokio::join!(provider.access_token(), provider.access_token());
+
+        assert_eq!(token_text(first), "AT-APP-1");
+        assert_eq!(token_text(second), "AT-APP-1");
+        assert_eq!(rig.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_fetch_is_refresh_failed_with_cleaned_text() {
+        let rig = Rig::new(vec![Reply::json(
+            503,
+            "BODY-SENTINEL AT-APP-1 CS-SENTINEL",
+        )])
+        .await;
+        let provider = rig.app_provider();
+
+        let text = match provider.access_token().await {
+            TokenOutcome::RefreshFailed(text) => text,
+            other => panic!("expected a refresh failure, got {other:?}"),
+        };
+
+        assert!(text.contains("app token"), "{text}");
+        for hidden in ["BODY-SENTINEL", "AT-APP-1", "CS-SENTINEL"] {
+            assert!(!text.contains(hidden), "{text}");
+            assert!(!format!("{provider:?}").contains(hidden));
+        }
+        assert_eq!(rig.requests(), 1, "one request, no retry loop");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_client_is_refresh_failed_and_never_needs_login() {
+        let rig = Rig::new(vec![
+            Reply::json(401, r#"{"message":"Unauthorized","error":401}"#),
+            Reply::json(200, r#"{"error":"unsupported_grant_type"}"#),
+        ])
+        .await;
+        let provider = rig.app_provider();
+
+        match provider.access_token().await {
+            TokenOutcome::RefreshFailed(text) => assert!(text.contains("HTTP 401"), "{text}"),
+            other => panic!("expected a refresh failure, got {other:?}"),
+        }
+        match provider.access_token().await {
+            TokenOutcome::RefreshFailed(text) => {
+                assert!(text.contains("unsupported_grant_type"), "{text}");
+            }
+            other => panic!("expected a refresh failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_refetch_keeps_using_a_still_valid_cached_token() {
+        let rig = Rig::new(vec![
+            good("AT-APP-1", None, Some(100)),
+            Reply::status(503),
+            Reply::status(503),
+        ])
+        .await;
+        let provider = rig.app_provider();
+        // Clock 1_000, expires_in 100: expires at 1_100.
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+
+        // 50 seconds left: inside the margin, so a refetch is tried; it fails
+        // and the token that is still valid keeps being used.
+        rig.set_clock(1_000 + 50);
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+        assert_eq!(rig.requests(), 2);
+
+        // Past its expiry nothing is left to use.
+        rig.set_clock(1_000 + 101);
+        assert!(matches!(
+            provider.access_token().await,
+            TokenOutcome::RefreshFailed(_)
+        ));
+        assert_eq!(rig.requests(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_app_token_is_never_written_to_disk() {
+        let rig = Rig::new(vec![good("AT-APP-1", None, Some(3600)), Reply::status(503)]).await;
+        let provider = rig.app_provider();
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+        assert!(!rig.dir.path().join("auth").exists(), "after a success");
+
+        rig.set_clock(1_000 + 3_600);
+        assert!(matches!(
+            provider.access_token().await,
+            TokenOutcome::RefreshFailed(_)
+        ));
+        assert!(!rig.dir.path().join("auth").exists(), "after a failure");
+    }
+
+    #[tokio::test]
+    async fn a_stale_token_file_for_the_same_alias_is_ignored() {
+        let rig = Rig::new(vec![good("AT-APP-1", None, Some(3600))]).await;
+        rig.login("AT-STALE-LOGIN", Some("RT-STALE-LOGIN"), 1_000 + 7_200);
+        let before = rig.file_bytes();
+        let provider = rig.app_provider();
+
+        assert_eq!(token_text(provider.access_token().await), "AT-APP-1");
+
+        assert_eq!(rig.requests(), 1);
+        assert_eq!(rig.file_bytes(), before, "the login file is never touched");
+    }
+
+    #[tokio::test]
+    async fn a_new_provider_fetches_again_because_nothing_is_persisted() {
+        let rig = Rig::new(vec![
+            good("AT-APP-1", None, Some(3600)),
+            good("AT-APP-2", None, Some(3600)),
+        ])
+        .await;
+        assert_eq!(token_text(rig.app_provider().access_token().await), "AT-APP-1");
+        assert_eq!(token_text(rig.app_provider().access_token().await), "AT-APP-2");
+        assert_eq!(rig.requests(), 2);
     }
 }
