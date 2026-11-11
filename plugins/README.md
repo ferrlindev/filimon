@@ -306,7 +306,8 @@ and try plugins without running it (see [Plugin CLI](#plugin-cli)).
 - `fetch` is answered by the source's assigned fetcher (see
   [Fetcher layer](#fetcher-layer)). It answers `not-configured` only for a
   source that has no `fetcher` key.
-- `poll` receives no access token (`none`) until the OAuth phase lands.
+- `poll` receives the plugin's current access token, or `none` when the plugin
+  has no login (see [OAuth](#oauth)).
 - The guest `log` import is live: guest log lines become host log events with a
   `plugin` field, cleaned of control characters and clipped.
 
@@ -529,6 +530,178 @@ aborted at shutdown; those are named in a warning. The command exits 1 when
 every plugin ended disabled by a fault, when no source is enabled, when none
 could be loaded, or on any startup error. One plugin's batches reach the sink
 in poll order; the order across plugins is not specified.
+
+## OAuth
+
+A source can ask the host to manage an OAuth 2.0 login for it. The user logs in
+once with `fili auth login <plugin>` (authorization code flow with PKCE), the
+host keeps the tokens, refreshes the access token before it runs out, and hands
+the plugin only a current access token. The plugin never sees the refresh token
+or the client secret.
+
+### Declaring OAuth
+
+Add a `[host.oauth]` table to the plugin's TOML, beside `[host]` and
+`[host.secrets]`. It is not part of `[settings]`: `[settings]` is passed to the
+plugin as is, and nothing about the login belongs there. A plugin with no
+`[host.oauth]` table has no login and always polls with `access-token = none`.
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `authorize_url` | yes | The provider's authorization endpoint. Must be `https://`. |
+| `token_url` | yes | The provider's token endpoint. Must be `https://`. |
+| `scopes` | no | A list of scope strings, each one scope with no whitespace. Default: none. |
+| `client_id` | yes | The application's client id. It is public, so it lives in the TOML. |
+| `client_secret_env` | no | The name of a `.env` key that holds the client secret, for providers that need one. |
+| `revocation_url` | no | The provider's revocation endpoint, used by `fili auth logout`. Must be `https://`. |
+| `redirect_port` | no | The loopback port of the login callback. Default: `17420`. |
+| `authorize_params` | no | A table of extra parameters appended to the authorize URL. |
+
+```toml
+[host.oauth]
+authorize_url = "https://provider.example/oauth/authorize"
+token_url = "https://provider.example/oauth/token"
+scopes = ["read"]
+client_id = "your-client-id"
+client_secret_env = "EXAMPLE_CLIENT_SECRET"                # optional; the value goes in .env
+revocation_url = "https://provider.example/oauth/revoke"   # optional
+redirect_port = 17420                                      # optional
+authorize_params = { duration = "permanent" }              # optional
+```
+
+- The three endpoints must be `https://` URLs with a host and no user name or
+  password. Only the loopback callback is plain http. The host calls them with
+  its own TLS-validating client, outside the plugin's fetch allowlist, so the
+  allowlist does not need to list them.
+- `client_secret_env` follows the rules in [Plugin secrets](#plugin-secrets):
+  the name is looked up in the process environment first and then in `.env`
+  beside `filimon.toml`, and the value is never written in the TOML. It is not
+  one of the plugin's `[host.secrets]` and is never given to the plugin.
+- `authorize_params` cannot repeat a parameter the host sets itself: `state`,
+  `code_challenge`, `code_challenge_method`, `redirect_uri`, `client_id`,
+  `response_type` and `scope` are a config error.
+- Register the redirect URI with the provider exactly as
+  `http://127.0.0.1:17420/callback`, or with the port you set in
+  `redirect_port`. Providers compare it exactly, so `localhost` or another port
+  fails the login at the provider.
+- A config error names the plugin and the field. Like any invalid plugin TOML,
+  an invalid `[host.oauth]` stops `fili run`; set `enabled = false` on the
+  source to skip it.
+
+### Logging in and out
+
+- `fili auth login <plugin> [--no-browser]` starts a listener on
+  `127.0.0.1:<redirect_port>`, prints the authorize URL and also tries to open
+  your browser. `--no-browser` only prints it, which suits a remote shell: open
+  the URL on any machine that can reach the loopback port (for example through
+  an SSH tunnel). It waits 5 minutes for the provider to call back and checks
+  the `state` it sent. A denied login, a wrong `state`, a timeout or a failed
+  code exchange exits 1 with a named error and stores nothing; an existing
+  login is left as it was. The code, the tokens and the PKCE verifier are never
+  printed or logged. On success it prints when the access token expires, and
+  warns when the provider gave no refresh token.
+- `fili auth status [--json]` prints one row per plugin that declares
+  `[host.oauth]` or has a stored login: `PLUGIN`, `STATE`, `EXPIRES` and
+  `REFRESH` (whether a refresh token is stored). `--json` prints one JSON array
+  with `plugin`, `state`, `expires_at`, `has_refresh_token` and `detail`. It
+  never prints a token value. The states are:
+  - `logged-in`: an access token that has not expired.
+  - `expired`: the access token has expired. With a refresh token the host
+    renews it before the next poll; without one, log in again.
+  - `needs-login`: the host could not renew the login for good (see
+    [Refresh and failures](#refresh-and-failures)). Run `fili auth login` again.
+  - `not-logged-in`: the plugin declares `[host.oauth]` and nothing is stored.
+  - `unreadable`: the token file cannot be used. The row names the plugin and
+    the path, and gives the reason in fixed words, never the file's content.
+- `fili auth logout <plugin>` deletes the token file first, and then, when the
+  plugin declares `revocation_url`, tries to revoke the login at the provider.
+  A failed revocation is a warning, and the logout still succeeds. A second
+  logout says there is no stored login. Later polls run with
+  `access-token = none`.
+
+`fili auth` prints no banner, and `status` never takes the state-directory lock
+and creates nothing, so these commands work while `fili run` is up. A running
+host picks up a login, a re-login or a logout at its next poll, with no
+restart. Exit codes are as in [Plugin CLI](#plugin-cli): `fili auth` with no
+subcommand is a usage error (2), and an unknown plugin, a fetcher, a disabled
+source or a plugin without `[host.oauth]` is refused with exit 1 before
+anything is created.
+
+### Where tokens live
+
+Each login is one file, `<state-dir>/auth/<alias>.json`, in the state directory
+described under [Cursor state](#cursor-state). The `auth` directory is created
+with mode 0700 and the file with mode 0600, from its first byte. The file is
+JSON with `version`, `plugin`, `access_token`, `refresh_token` (or null),
+`expires_at` (Unix seconds), `token_type`, `scope`, `needs_login` and
+`obtained_at`. It is written atomically (temporary file, then rename).
+`<alias>.lock` beside it serialises a login, a refresh and a logout of one
+plugin; it is a different file from the state directory's own `.lock`.
+
+Do not edit the file by hand. A file with any group or other permission bit, a
+file that is not valid JSON, a file that names another plugin and a file of a
+newer version each disable that plugin only, with an error that names the
+plugin and the path. The host never repairs, rewrites or deletes such a file:
+fix the permissions (`chmod 600`) or run `fili auth logout <plugin>` and log in
+again.
+
+### What a plugin receives
+
+Only the access token, as `poll`'s `access-token` argument (`none` when there is
+no login, or the login needs a new one). `init` receives the plugin's own
+`[host.secrets]` and settings as before. The refresh token, the client secret
+and every other host-side credential stay in the host; they are not in a
+plugin's arguments, settings, logs or items. The WIT contract is unchanged.
+`fili plugins run-once` reads, and when needed refreshes, the same login as
+`fili run`.
+
+### Refresh and failures
+
+- The refresh is lazy. Just before each poll the host re-reads the token file;
+  with at least 60 seconds of life left it hands that token over, otherwise it
+  refreshes first. There is no background timer, so a plugin with a long poll
+  interval gets a fresh token only when it is polled. One refresh runs at a
+  time per plugin, and the new tokens are saved before the new access token is
+  used.
+- A permanent refusal (the provider answers `invalid_grant`: the refresh token
+  is revoked or expired) keeps the file, sets `needs_login` and polls with
+  `access-token = none`. The plugin is expected to answer `auth-required`, and
+  the usual backoff applies. `fili auth status` shows `needs-login`.
+- A transient failure (no network, a timeout, a 5xx answer) marks nothing. The
+  host keeps using the old access token while it is still valid; once it has
+  expired, the poll is skipped and retried under the backoff.
+- A plugin with no refresh token whose access token has expired is treated as
+  needing a new login.
+- After `fili auth login` the plugin may still be waiting out its backoff, so
+  the new login is used at its next poll, which can be up to `backoff.max_secs`
+  away (`[host.backoff]`, 3600 s by default). The login message says the same.
+- When a plugin has no usable login the host logs one hint per change of state,
+  `run: fili auth login <plugin>`, rather than one line per poll.
+
+### Provider notes
+
+- Reddit issues a refresh token only when the authorize request carries
+  `duration=permanent`, so a Reddit plugin needs
+  `authorize_params = { duration = "permanent" }`. Without it the login cannot
+  be renewed and ends when its access token does (the login command warns).
+- Which providers need `client_secret_env` is the provider's rule: a public or
+  installed application type often has none.
+
+### Known limits
+
+- Some providers rotate the refresh token on every refresh. The host saves the
+  new one before it uses the new access token, but a crash between the
+  provider's answer and the file write loses it, and the next refresh then
+  fails with `invalid_grant`. Log in again.
+- Expiry is judged by the wall clock, using `expires_in` from the provider
+  (3600 s when it gives none). A large clock change makes a token look fresh or
+  stale until the next refresh or login.
+- Tokens are plain files protected by mode 0600. There is no keychain or
+  encryption, and the mode check is Unix only.
+- One login per plugin: there are no multiple accounts for one source.
+- Whether the Reddit plugin uses app-only credentials or this login is decided
+  in the Reddit plugin phase. The sample plugin TOMLs do not declare
+  `[host.oauth]` yet.
 
 ## Contract version
 
