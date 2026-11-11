@@ -22,7 +22,9 @@
     reason = "readers for the remaining items land in later plans of this phase"
 )]
 
+pub mod callback;
 pub mod error;
+pub mod pkce;
 pub mod provider;
 pub mod store;
 

@@ -248,6 +248,8 @@ pub struct OAuthConfig {
     pub token_url: url::Url,
     pub scopes: Vec<String>,
     pub client_id: String,
+    /// Extra authorize-URL parameters, in key order (D-14).
+    pub authorize_params: Vec<(String, String)>,
 }
 
 /// Host-enforced values for one plugin.
@@ -912,6 +914,7 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
             .map(|scope| scope.get_ref().clone())
             .collect(),
         client_id: section.client_id.get_ref().clone(),
+        authorize_params: Vec::new(),
     })
 }
 
