@@ -34,6 +34,7 @@ const FAILURE_TEXT_CLIP: usize = 512;
 #[derive(Debug, Clone, Default)]
 pub struct Allowlist {
     hosts: BTreeSet<String>,
+    rejected: Vec<String>,
 }
 
 impl Allowlist {
@@ -48,7 +49,17 @@ impl Allowlist {
             .map(|entry| entry.as_ref().trim().to_ascii_lowercase())
             .filter(|entry| !entry.is_empty())
             .collect();
-        Self { hosts }
+        Self {
+            hosts,
+            rejected: Vec::new(),
+        }
+    }
+
+    /// The non-blank configured entries that are not bare host names and so
+    /// never match.
+    #[must_use]
+    pub fn rejected(&self) -> &[String] {
+        &self.rejected
     }
 
     /// Whether `host` is allowed.
@@ -339,5 +350,175 @@ mod tests {
             assert_eq!(echoed, Some(url.as_str()), "answer for another request");
         }
         assert_eq!(route.calls(), 8);
+    }
+
+    // ── Policy Tests (no wasm) ────────────────────────────────────────────────
+
+    fn policy(consumer: &str, hosts: &[&str]) -> FetchPolicy {
+        FetchPolicy::new(consumer, Allowlist::new(hosts), Duration::from_secs(30))
+    }
+
+    fn denied(result: &Result<url::Url, types::FetchError>) -> bool {
+        matches!(result, Err(types::FetchError::Denied(_)))
+    }
+
+    fn invalid(result: &Result<url::Url, types::FetchError>) -> bool {
+        matches!(result, Err(types::FetchError::InvalidRequest(_)))
+    }
+
+    #[test]
+    fn allowlist_matches_the_exact_host_only() {
+        let policy = policy("p", &["reddit.com"]);
+        assert!(policy.check(&request("https://reddit.com/")).is_ok());
+        for url in [
+            "https://www.reddit.com/",
+            "https://evilreddit.com/",
+            "https://reddit.com.evil.com/",
+            "https://notreddit.com/",
+            "https://evil.com/reddit.com",
+            "https://evil.com/?h=reddit.com",
+        ] {
+            let result = policy.check(&request(url));
+            assert!(denied(&result), "{url}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn allowlist_ignores_case_and_one_trailing_dot() {
+        let policy = policy("p", &["reddit.com"]);
+        assert!(policy.check(&request("https://REDDIT.com/x")).is_ok());
+        assert!(policy.check(&request("https://reddit.com./")).is_ok());
+
+        let dotted = self::policy("p", &["Reddit.COM."]);
+        assert!(dotted.check(&request("https://reddit.com/")).is_ok());
+    }
+
+    #[test]
+    fn allowlist_entries_that_are_not_bare_hosts_never_match() {
+        let entries = [
+            "https://reddit.com",
+            "reddit.com:443",
+            "reddit.com/x",
+            "*.reddit.com",
+            "",
+            "   ",
+            "red dit.com",
+        ];
+        let allowlist = Allowlist::new(entries);
+        assert_eq!(
+            allowlist.rejected(),
+            [
+                "https://reddit.com",
+                "reddit.com:443",
+                "reddit.com/x",
+                "*.reddit.com",
+                "red dit.com"
+            ]
+        );
+
+        let policy = policy("p", &entries);
+        for url in [
+            "https://www.reddit.com/",
+            "https://reddit.com/",
+            "https://example.com/",
+        ] {
+            let result = policy.check(&request(url));
+            assert!(denied(&result), "{url}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_allowlist_denies_every_host() {
+        let policy = FetchPolicy::new(
+            "p",
+            Allowlist::new(Vec::<String>::new()),
+            Duration::from_secs(30),
+        );
+        for url in ["https://example.com/", "http://127.0.0.1/"] {
+            let result = policy.check(&request(url));
+            assert!(denied(&result), "{url}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn a_url_with_userinfo_is_judged_by_its_real_host() {
+        let policy = policy("p", &["reddit.com"]);
+        let result = policy.check(&request("https://reddit.com@evil.com/"));
+        assert!(denied(&result), "{result:?}");
+        assert!(policy.check(&request("https://evil.com@reddit.com/")).is_ok());
+    }
+
+    #[test]
+    fn any_port_on_an_allowed_host_is_allowed() {
+        let policy = policy("p", &["reddit.com"]);
+        assert!(policy.check(&request("https://reddit.com:8443/x")).is_ok());
+        assert!(policy.check(&request("http://reddit.com:80/")).is_ok());
+    }
+
+    #[test]
+    fn an_ip_literal_host_matches_an_ip_literal_entry() {
+        let policy = policy("p", &["127.0.0.1", "[::1]"]);
+        assert!(policy.check(&request("http://127.0.0.1:9/")).is_ok());
+        assert!(policy.check(&request("http://[::1]:9/")).is_ok());
+        let result = policy.check(&request("http://127.0.0.2/"));
+        assert!(denied(&result), "{result:?}");
+    }
+
+    #[test]
+    fn only_http_and_https_urls_pass_the_policy() {
+        let policy = policy("p", &["reddit.com", "etc"]);
+        for url in [
+            "file:///etc/passwd",
+            "ftp://reddit.com/",
+            "gopher://reddit.com/",
+            "data:text/plain,hi",
+        ] {
+            let result = policy.check(&request(url));
+            assert!(invalid(&result), "{url}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_unparsable_url_is_an_invalid_request() {
+        let policy = policy("p", &["reddit.com"]);
+        for url in ["", "   ", "not a url", "http://"] {
+            let result = policy.check(&request(url));
+            assert!(invalid(&result), "{url:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn a_denial_names_the_host_and_the_consumer_but_not_the_path_or_query() {
+        let policy = policy("reddit-src", &["reddit.com"]);
+        let result = policy.check(&request("https://evil.example/secret/path?token=SECRET123"));
+        let Err(types::FetchError::Denied(text)) = result else {
+            panic!("expected a denial, got {result:?}");
+        };
+        assert!(text.contains("evil.example"), "{text}");
+        assert!(text.contains("reddit-src"), "{text}");
+        assert!(!text.contains("SECRET123"), "{text}");
+        assert!(!text.contains("/secret/path"), "{text}");
+    }
+
+    #[test]
+    fn the_source_policy_reads_timeout_and_allowlist_from_the_host_config() {
+        use crate::plugins::config::BackoffConfig;
+
+        let host = HostConfig {
+            poll_interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(7),
+            allowlist: vec!["www.reddit.com".to_string()],
+            backoff: BackoffConfig {
+                initial: Duration::from_secs(1),
+                max: Duration::from_secs(60),
+                multiplier: 2.0,
+            },
+        };
+        let policy = FetchPolicy::for_source("reddit", &host);
+        assert_eq!(policy.timeout(), Duration::from_secs(7));
+        assert_eq!(policy.consumer(), "reddit");
+        assert!(policy.check(&request("https://www.reddit.com/")).is_ok());
+        let result = policy.check(&request("https://reddit.com/"));
+        assert!(denied(&result), "{result:?}");
     }
 }
