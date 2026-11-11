@@ -26,6 +26,22 @@
 //                                   else RefreshFailed; nothing is marked
 //   no refresh token, expired    -> NeedsLogin
 //
+// The `client_credentials` grant (D-03) has no login and no file. The host
+// fetches the app token itself, holds it in memory only and serves every poll
+// from that cache:
+//
+//   nothing cached               -> fetch first      (single flight)
+//   at least 60 s of life left   -> Token            (cached, no request)
+//   under 60 s of life left      -> fetch again first
+//   fetch ok                     -> Token           (cached; no expires_in
+//                                                    means 3600 s)
+//   fetch failed, cached token
+//   still valid                  -> Token(cached)   (a warning is logged)
+//   fetch failed, nothing valid  -> RefreshFailed   (a backed-off cycle)
+//
+// It never answers NotLoggedIn, NeedsLogin or FileProblem, and a stale login
+// file of the same alias is ignored. A new process fetches a fresh token.
+//
 // Expiry is judged by an injectable wall-clock function. Tokio's paused time
 // does not move the wall clock, so a test that pauses time can neither make a
 // token look fresh nor stale by accident.
@@ -37,7 +53,7 @@ use std::sync::{Arc, OnceLock};
 use super::client::{DEFAULT_EXPIRES_IN_SECS, RefreshFailure, TokenClient, TokenSet};
 use super::error::AuthError;
 use super::store::{AccessToken, AuthLock, RefreshToken, StoredTokens, TokenStore};
-use crate::plugins::config::OAuthConfig;
+use crate::plugins::config::{OAuthConfig, OAuthGrant};
 use crate::plugins::host::engine::clean_guest_text;
 
 /// Longest error text kept in an outcome, in characters.
@@ -81,6 +97,15 @@ pub struct TokenProvider {
     gate: tokio::sync::Mutex<()>,
     /// Built on first use; a build failure is kept as cleaned text.
     client: OnceLock<Result<TokenClient, String>>,
+    /// The app-only token of the `client_credentials` grant. Memory only: it
+    /// is never written to disk. Held across the request (single flight).
+    app_token: tokio::sync::Mutex<Option<AppToken>>,
+}
+
+/// A fetched app-only access token and when it expires (Unix seconds).
+struct AppToken {
+    token: AccessToken,
+    expires_at: i64,
 }
 
 impl std::fmt::Debug for TokenProvider {
@@ -103,6 +128,7 @@ impl TokenProvider {
             clock: system_clock(),
             gate: tokio::sync::Mutex::new(()),
             client: OnceLock::new(),
+            app_token: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -117,6 +143,12 @@ impl TokenProvider {
     /// Re-reads the token file and decides what the next poll receives,
     /// refreshing the token first when it is due.
     pub async fn access_token(&self) -> TokenOutcome {
+        // An app-only plugin has no login: its token is fetched by the host
+        // and held in memory, so the token file is never read, created or
+        // locked for this grant.
+        if self.oauth.grant == OAuthGrant::ClientCredentials {
+            return self.app_token().await;
+        }
         let tokens = match self.store.read() {
             Ok(Some(tokens)) => tokens,
             Ok(None) => return TokenOutcome::NotLoggedIn,
@@ -130,6 +162,57 @@ impl TokenProvider {
             return TokenOutcome::Token(tokens.access_token);
         }
         self.renew(tokens, now).await
+    }
+
+    /// The app-only token of the `client_credentials` grant (D-03): served
+    /// from memory while at least [`REFRESH_MARGIN_SECS`] seconds of life are
+    /// left, fetched otherwise. The tokio mutex is held across the request, so
+    /// a concurrent caller waits and then finds the fresh cache (single
+    /// flight). There is no retry here: one request per due poll, the
+    /// scheduler's backoff does the waiting.
+    async fn app_token(&self) -> TokenOutcome {
+        let mut cache = self.app_token.lock().await;
+        let now = (self.clock)();
+        if let Some(cached) = cache.as_ref()
+            && cached.expires_at.saturating_sub(now) >= REFRESH_MARGIN_SECS
+        {
+            return TokenOutcome::Token(cached.token.clone());
+        }
+        let fetched = match self.client() {
+            Ok(client) => client.client_credentials().await,
+            Err(text) => Err(RefreshFailure::Transient(format!(
+                "http client unavailable: {text}"
+            ))),
+        };
+        match fetched {
+            Ok(set) => {
+                let lifetime = i64::try_from(set.expires_in.unwrap_or(DEFAULT_EXPIRES_IN_SECS))
+                    .unwrap_or(i64::MAX);
+                let token = AccessToken::new(set.access_token);
+                *cache = Some(AppToken {
+                    token: token.clone(),
+                    expires_at: (self.clock)().saturating_add(lifetime),
+                });
+                TokenOutcome::Token(token)
+            }
+            Err(
+                RefreshFailure::Transient(text)
+                | RefreshFailure::Rejected(text)
+                | RefreshFailure::Permanent(text),
+            ) => {
+                let text = clean_guest_text(&text, ERROR_TEXT_CLIP);
+                if let Some(cached) = cache.as_ref()
+                    && cached.expires_at > (self.clock)()
+                {
+                    tracing::warn!(
+                        plugin = %self.plugin,
+                        "the app token request failed, using the current token: {text}"
+                    );
+                    return TokenOutcome::Token(cached.token.clone());
+                }
+                TokenOutcome::RefreshFailed(format!("the app token request failed: {text}"))
+            }
+        }
     }
 
     /// The token is under the margin. With no refresh token to use and some
