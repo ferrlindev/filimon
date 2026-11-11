@@ -11,6 +11,7 @@ pub mod backoff;
 pub mod cursor;
 pub mod engine;
 pub mod error;
+pub mod fetch;
 pub mod instance;
 pub mod loader;
 pub mod map;

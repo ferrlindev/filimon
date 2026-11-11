@@ -9,10 +9,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::future::Future;
+use std::sync::Arc;
 
 use wasmtime::Store;
 
-use super::engine::{HostState, PollError, PollResponse, Source, SourcePre, clean_guest_text};
+use super::engine::{
+    HostState, PollError, PollResponse, Source, SourcePre, clean_guest_text, new_guest_store,
+};
+use super::fetch::FetchRoute;
 
 /// Longest error text kept from a trap or build failure, in characters.
 const ERROR_TEXT_CLIP: usize = 512;
@@ -80,12 +84,25 @@ pub trait InstanceFactory: Send + Sync + 'static {
 pub struct WasmtimeFactory {
     engine: wasmtime::Engine,
     pre: SourcePre<HostState>,
+    route: Option<Arc<FetchRoute>>,
 }
 
 impl WasmtimeFactory {
     #[must_use]
     pub fn new(engine: wasmtime::Engine, pre: SourcePre<HostState>) -> Self {
-        Self { engine, pre }
+        Self {
+            engine,
+            pre,
+            route: None,
+        }
+    }
+
+    /// Answers the `fetch` calls of every instance this factory builds through
+    /// `route`. With `None` they answer `not-configured`.
+    #[must_use]
+    pub fn with_route(mut self, route: Option<Arc<FetchRoute>>) -> Self {
+        self.route = route;
+        self
     }
 }
 
@@ -93,13 +110,12 @@ impl InstanceFactory for WasmtimeFactory {
     type Instance = WasmtimeInstance;
 
     async fn instantiate(&self, plugin: &str) -> Result<WasmtimeInstance, InstanceBuildError> {
-        let mut store = Store::new(&self.engine, HostState::new(plugin));
-        // Fixed per-instance memory and table caps. A breach traps, which the
-        // scheduler handles as an instance fault (backoff, fresh instance).
-        store.limiter(HostState::limits_mut);
-        // Anti-wedge: yield to tokio each epoch tick instead of trapping.
-        store.set_epoch_deadline(1);
-        store.epoch_deadline_async_yield_and_update(1);
+        // A limit breach traps, which the scheduler handles as an instance
+        // fault (backoff, fresh instance).
+        let mut store = new_guest_store(
+            &self.engine,
+            HostState::new(plugin).with_route(self.route.clone()),
+        );
         let source = self
             .pre
             .instantiate_async(&mut store)

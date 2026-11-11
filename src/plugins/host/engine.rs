@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use wasmtime::component::{HasSelf, Linker};
-use wasmtime::{Config, Engine, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 /// Generated bindings for the `source` world.
 #[allow(clippy::all, clippy::pedantic)]
@@ -56,6 +56,7 @@ pub use source_world::{Source, SourcePre};
 
 use source_world::filimon::plugin::{fetch, log, types};
 
+use super::fetch::FetchRoute;
 use crate::output::sanitize_for_terminal;
 
 /// How often the epoch ticker advances the engine epoch.
@@ -115,11 +116,13 @@ pub fn clean_guest_text(text: &str, max_chars: usize) -> String {
 
 // ── Host State And Guest Imports ──────────────────────────────────────────────
 
-/// Per-instance host state: the plugin alias used to tag every guest log line
-/// and the instance's resource limits.
+/// Per-instance host state: the plugin alias used to tag every guest log line,
+/// the instance's resource limits and, for a source, the route that answers
+/// its `fetch` calls.
 pub struct HostState {
     plugin: Arc<str>,
     limits: StoreLimits,
+    route: Option<Arc<FetchRoute>>,
 }
 
 impl HostState {
@@ -128,22 +131,36 @@ impl HostState {
         Self {
             plugin: Arc::from(plugin),
             limits: store_limits(),
+            route: None,
         }
+    }
+
+    /// Sets the route that answers this instance's `fetch` calls. With none,
+    /// every `fetch` answers `not-configured`.
+    #[must_use]
+    pub fn with_route(mut self, route: Option<Arc<FetchRoute>>) -> Self {
+        self.route = route;
+        self
     }
 
     /// The limits `Store::limiter` points at.
     pub fn limits_mut(&mut self) -> &mut dyn wasmtime::ResourceLimiter {
         &mut self.limits
     }
+}
 
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "Phase 5: the HTTP import names the calling plugin for allowlist checks"
-    )]
-    pub fn plugin(&self) -> &str {
-        &self.plugin
-    }
+/// Builds the store every guest instance runs in, source or fetcher: the fixed
+/// per-instance limits and the anti-wedge epoch yield. A limit breach traps,
+/// which the caller treats as an instance fault.
+#[must_use]
+pub fn new_guest_store(engine: &Engine, state: HostState) -> Store<HostState> {
+    let mut store = Store::new(engine, state);
+    // Fixed per-instance memory and table caps.
+    store.limiter(HostState::limits_mut);
+    // Anti-wedge: yield to tokio each epoch tick instead of trapping.
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_async_yield_and_update(1);
+    store
 }
 
 impl types::Host for HostState {}
@@ -164,12 +181,18 @@ impl log::Host for HostState {
 }
 
 impl fetch::Host for HostState {
-    /// Interim answer until the Phase 5 fetcher layer exists.
+    /// Answers a source's `fetch` through the fetcher the registry assigned
+    /// to it, or `not-configured` when no fetcher is assigned.
     async fn fetch(
         &mut self,
-        _request: types::Request,
+        request: types::Request,
     ) -> wasmtime::Result<Result<types::Response, types::FetchError>> {
-        Ok(Err(types::FetchError::NotConfigured))
+        // Clone the route out of the state so the await below does not hold a
+        // borrow of the calling store.
+        let Some(route) = self.route.clone() else {
+            return Ok(Err(types::FetchError::NotConfigured));
+        };
+        Ok(route.fetch(request).await)
     }
 }
 
