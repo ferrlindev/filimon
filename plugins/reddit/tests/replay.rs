@@ -987,3 +987,116 @@ fn a_poll_after_a_rate_limit_succeeds_with_no_state_to_reset() {
     let outcome = run(&http, &rust_settings(), None).expect("the next poll succeeds");
     assert_eq!(outcome.items.len(), 3);
 }
+
+// ── Plan 07-06 Task 2: compliance sweep over every request (RDDT-03, D-14) ───
+
+/// A recording `Http` that checks every request as it arrives and panics on the
+/// first violation, so a scenario cannot pass with a non-compliant request.
+struct StrictHttp {
+    inner: ScriptedHttp,
+    expected_user_agent: String,
+    token: &'static str,
+}
+
+impl StrictHttp {
+    fn new(
+        responses: Vec<Result<HttpResponse, HttpError>>,
+        app_id: &str,
+        contact_name: &str,
+    ) -> Self {
+        StrictHttp {
+            inner: ScriptedHttp::new(responses),
+            expected_user_agent: format!(
+                "filimon:{app_id}:{} (by /u/{contact_name})",
+                env!("CARGO_PKG_VERSION")
+            ),
+            token: TOKEN,
+        }
+    }
+}
+
+impl Http for StrictHttp {
+    fn get(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let url = &request.url;
+        assert!(
+            url.starts_with("https://oauth.reddit.com/"),
+            "request to an unofficial host: {url}"
+        );
+        let header = |name: &str| reddit_source::http::header(&request.headers, name);
+        assert_eq!(
+            header("authorization"),
+            Some(format!("bearer {}", self.token).as_str()),
+            "{url}"
+        );
+        assert_eq!(header("accept"), Some("application/json"), "{url}");
+        assert_eq!(
+            header("user-agent"),
+            Some(self.expected_user_agent.as_str()),
+            "{url}"
+        );
+        self.inner.get(request)
+    }
+}
+
+fn sweep_settings(subreddits: &[&str], listings: &[&str], app_id: Option<&str>) -> Settings {
+    let quote = |items: &[&str]| {
+        items
+            .iter()
+            .map(|item| format!("\"{item}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let app_id_line = app_id
+        .map(|id| format!("app_id = \"{id}\"\n"))
+        .unwrap_or_default();
+    settings(&format!(
+        "subreddits = [{}]\nlistings = [{}]\nuser_agent_contact = \"u/sweeper\"\n{app_id_line}",
+        quote(subreddits),
+        quote(listings)
+    ))
+}
+
+#[test]
+fn every_request_is_official_authenticated_and_carries_the_enforced_user_agent() {
+    // One subreddit, `new`: a first poll then a later poll.
+    let one = sweep_settings(&["rust"], &["new"], None);
+    let http = StrictHttp::new(
+        vec![Ok(fixture("listing_new")), Ok(fixture("listing_newer"))],
+        "reddit",
+        "sweeper",
+    );
+    let first = poll(&http, &one, None, Some(TOKEN)).expect("first poll");
+    poll(&http, &one, first.next_cursor.as_deref(), Some(TOKEN)).expect("later poll");
+    assert_eq!(http.inner.requests().len(), 2);
+
+    // Several subreddits, `new` and `hot`: four feeds, first and later polls.
+    let many = sweep_settings(&["rust", "programming"], &["new", "hot"], None);
+    let responses = (0..8).map(|_| Ok(fixture("listing_hot"))).collect();
+    let http = StrictHttp::new(responses, "reddit", "sweeper");
+    let first = poll(&http, &many, None, Some(TOKEN)).expect("first poll");
+    poll(&http, &many, first.next_cursor.as_deref(), Some(TOKEN)).expect("later poll");
+    assert_eq!(http.inner.requests().len(), 8);
+
+    // A rate-limited poll still sends a compliant request.
+    let http = StrictHttp::new(vec![Ok(fixture("rate_limited_429"))], "reddit", "sweeper");
+    assert_eq!(
+        poll(&http, &one, None, Some(TOKEN)).unwrap_err(),
+        PollError::RateLimited(Some(37))
+    );
+    assert_eq!(http.inner.requests().len(), 1);
+
+    // An authorization failure and a server error also go out compliant.
+    for response in [fixture("unauthorized_401"), status_response(503, &[], "")] {
+        let http = StrictHttp::new(vec![Ok(response)], "reddit", "sweeper");
+        assert!(poll(&http, &one, None, Some(TOKEN)).is_err());
+        assert_eq!(http.inner.requests().len(), 1);
+    }
+
+    // A non-default app id flows into the user agent.
+    let custom = sweep_settings(&["rust"], &["new"], Some("my-app"));
+    let http = StrictHttp::new(vec![Ok(fixture("listing_new"))], "my-app", "sweeper");
+    poll(&http, &custom, None, Some(TOKEN)).expect("custom app id poll");
+    let requests = http.inner.requests();
+    let agent = reddit_source::http::header(&requests[0].headers, "user-agent").unwrap();
+    assert!(agent.starts_with("filimon:my-app:"), "{agent}");
+}
