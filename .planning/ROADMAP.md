@@ -213,7 +213,7 @@ Plans:
   3. `fili plugins run-once youtube` returns new uploads from the channels in its TOML, read from their uploads playlists. After `fili auth login youtube`, it also returns new uploads from the user's subscriptions.
   4. YouTube polls use only low-cost Data API endpoints (no 100-unit search calls). A quota-exceeded response shows up as a clear, named error, not a silently empty poll.
   5. Each plugin's unit tests pass against recorded API fixtures with no network access and no API keys.
-**Plans:** 5/12 plans executed
+**Plans:** 8/12 plans executed
 
 Plans:
 **Wave 1**
@@ -226,9 +226,9 @@ Plans:
 - [x] 07-05-PLAN.md — YouTube plugin crate: channel IDs to uploads playlists with an API key, per-playlist marks, placeholders, time edge cases (YTUB-01, TEST-01)
 
 **Wave 3** *(blocked on Wave 2)*
-- [ ] 07-06-PLAN.md — Reddit rate-limit headers, status classification, compliance sweep and fixture manifest (RDDT-03, TEST-01)
-- [ ] 07-08-PLAN.md — YouTube named quota error, status classification, credential modes, low-cost request sweep (YTUB-03, TEST-01)
-- [ ] 07-10-PLAN.md — `fili auth login` refusal and `app-only` status row for the app grant, plus OAuth documentation (RDDT-01, RDDT-03)
+- [x] 07-06-PLAN.md — Reddit rate-limit headers, status classification, compliance sweep and fixture manifest (RDDT-03, TEST-01)
+- [x] 07-08-PLAN.md — YouTube named quota error, status classification, credential modes, low-cost request sweep (YTUB-03, TEST-01)
+- [x] 07-10-PLAN.md — `fili auth login` refusal and `app-only` status row for the app grant, plus OAuth documentation (RDDT-01, RDDT-03)
 
 **Wave 4** *(blocked on Wave 3)*
 - [ ] 07-07-PLAN.md — Reddit logged-in home feed and saved posts (seen-fullname set, D-19) for `reddit-user` (RDDT-02, TEST-01)
@@ -265,5 +265,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
 | 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
-| 7. Reddit & YouTube Plugins | 5/12 | In Progress | - |
+| 7. Reddit & YouTube Plugins | 8/12 | In Progress | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
