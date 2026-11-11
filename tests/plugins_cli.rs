@@ -161,7 +161,15 @@ fn list_shows_the_sample_registry_plugins() {
         .collect();
     assert_eq!(
         names,
-        ["reddit", "stub", "youtube", "http", "stub-fetcher"],
+        [
+            "reddit",
+            "reddit-user",
+            "stub",
+            "youtube",
+            "youtube-user",
+            "http",
+            "stub-fetcher"
+        ],
         "{text}"
     );
 }

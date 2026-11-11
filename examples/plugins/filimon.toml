@@ -6,15 +6,30 @@ config = "stub.toml"
 enabled = true
 fetcher = "stub-fetcher"
 
+# `reddit` and `reddit-user` are two instances of one component: the instance name is
+# what you register, log in with and what keys the cursor and token files.
 [sources.reddit]
-component = "components/reddit.wasm"
+component = "../../plugins/reddit/target/wasm32-unknown-unknown/release/reddit_source.wasm"
 config = "reddit.toml"
 enabled = true
 fetcher = "http"
 
+[sources.reddit-user]
+component = "../../plugins/reddit/target/wasm32-unknown-unknown/release/reddit_source.wasm"
+config = "reddit-user.toml"
+enabled = true
+fetcher = "http"
+
+# Likewise `youtube` (API key) and `youtube-user` (login) share one component.
 [sources.youtube]
-component = "components/youtube.wasm"
+component = "../../plugins/youtube/target/wasm32-unknown-unknown/release/youtube_source.wasm"
 config = "youtube.toml"
+enabled = true
+fetcher = "http"
+
+[sources.youtube-user]
+component = "../../plugins/youtube/target/wasm32-unknown-unknown/release/youtube_source.wasm"
+config = "youtube-user.toml"
 enabled = true
 fetcher = "http"
 

@@ -1,0 +1,36 @@
+# Reddit source plugin config, user instance: polls the logged-in user's own feed
+# with a user token. It shares reddit_source.wasm with the `reddit` instance.
+#
+# Log in once with `fili auth login reddit-user`. Until then a poll answers
+# `auth-required`. The instance name is the cursor and token key: do not rename it.
+#
+# Read-only: the scopes below are the only ones requested.
+
+[host]
+poll_interval_secs = 300
+timeout_secs = 30
+allowlist = ["oauth.reddit.com"]
+
+[host.backoff]
+initial_secs = 60
+max_secs = 3600
+multiplier = 2.0
+
+[host.oauth]
+authorize_url = "https://www.reddit.com/api/v1/authorize"
+token_url = "https://www.reddit.com/api/v1/access_token"
+revocation_url = "https://www.reddit.com/api/v1/revoke_token"
+scopes = ["read", "history"]
+client_id = "your-reddit-web-app-client-id"
+client_secret_env = "REDDIT_CLIENT_SECRET"
+# Reddit issues a refresh token only when the login asks for a permanent grant.
+authorize_params = { duration = "permanent" }
+user_agent = "filimon:reddit:0.1.0 (by /u/yourname)"
+
+[settings]
+# The logged-in user's home feed. For the saved items use:
+#   feed = "saved"
+#   username = "yourname"
+# `saved` needs the `history` scope (already requested above).
+feed = "home"
+user_agent_contact = "u/yourname"

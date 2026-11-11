@@ -1,4 +1,9 @@
-# YouTube source plugin config: polls the listed channels through the http fetcher.
+# YouTube source plugin config, API-key instance: polls the uploads of the listed
+# channels through the YouTube Data API.
+#
+# Channels are 24-character channel IDs starting with UC; channel handles
+# (@name) are not supported. Every call costs one quota unit: see "Rate limits
+# and quota" in plugins/README.md before listing many channels.
 
 [host]
 poll_interval_secs = 900
