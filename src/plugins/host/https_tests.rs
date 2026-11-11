@@ -278,3 +278,66 @@ async fn tls_default_fetcher_component_rejects_a_self_signed_certificate() {
     certificate_error(result);
     assert_eq!(route.calls(), 1, "the request went through the fetcher");
 }
+
+// ── Source Guard (always on) ──────────────────────────────────────────────────
+
+/// The fetch path must never turn certificate or hostname validation off. This
+/// reads `fetch.rs` only (never the crawler, whose own client has the switch,
+/// and never this file, which names the settings on purpose).
+#[test]
+fn the_fetch_path_has_no_invalid_certificate_switch() {
+    let source = include_str!("fetch.rs");
+
+    // The file read must be the real client builder, not an empty or wrong file.
+    assert!(
+        source.contains("redirect::Policy::none()"),
+        "fetch.rs no longer shows the client builder"
+    );
+    for forbidden in [
+        "danger_accept_invalid_certs",
+        "danger_accept_invalid_hostnames",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "fetch.rs must not use `{forbidden}`: certificate validation stays on"
+        );
+    }
+}
+
+// ── Public Internet Proofs (group `net_`, never a gating command) ─────────────
+
+#[tokio::test]
+#[ignore = "needs internet access: see plugins/README.md"]
+async fn net_a_public_https_site_succeeds_with_validation() {
+    let policy = policy_for(&["example.com"]);
+
+    let response = Egress::new()
+        .execute(&policy, get("https://example.com/"), deadline())
+        .await
+        .expect("a real HTTPS site answers with validation on");
+
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains("Example Domain"), "{body}");
+}
+
+#[tokio::test]
+#[ignore = "needs internet access: see plugins/README.md"]
+async fn net_badssl_invalid_certificates_are_rejected() {
+    let hosts = [
+        "self-signed.badssl.com",
+        "expired.badssl.com",
+        "wrong.host.badssl.com",
+        "untrusted-root.badssl.com",
+    ];
+    let policy = policy_for(&hosts);
+    let egress = Egress::new();
+
+    for host in hosts {
+        let result = egress
+            .execute(&policy, get(&format!("https://{host}/")), deadline())
+            .await;
+        let text = certificate_error(result);
+        eprintln!("{host}: {text}");
+    }
+}
