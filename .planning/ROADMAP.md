@@ -17,7 +17,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Component Host Runtime** - `fili` loads registry-listed components, polls them on schedule, persists cursors, isolates failures, and produces `SourceItem`s to Fluvio (completed 2026-11-10)
 - [x] **Phase 4: Plugin CLI** - `fili plugins list | check | run-once` and a run command that polls all enabled sources (completed 2026-11-10)
 - [x] **Phase 5: Fetcher Layer** - Plugin HTTP routed through a configurable fetcher component, a host-enforced allowlist and timeout, a default TLS-validating fetcher, and an optional crawler hook (completed 2026-11-11)
-- [ ] **Phase 6: Host-Managed OAuth** - `fili auth login | status | logout` with PKCE, host-side token storage and refresh, and only access tokens passed to plugins
+- [x] **Phase 6: Host-Managed OAuth** - `fili auth login | status | logout` with PKCE, host-side token storage and refresh, and only access tokens passed to plugins (completed 2026-11-11)
 - [ ] **Phase 7: Reddit & YouTube Plugins** - Two separately built reference `.wasm` source components on the official APIs, each with offline fixture tests
 - [ ] **Phase 8: Integration, Live E2E & Authoring** - Compiled plugins tested in the host against replayed and live APIs, a live end-to-end run, and a guide that lets third parties build plugins outside the repo
 
@@ -179,7 +179,7 @@ Plans:
   2. The host refreshes an access token automatically before it expires, so the user does not have to log in again during normal polling.
   3. A logged-in plugin gets a current access token through the WIT token import and never sees the refresh token. A test component that records everything it receives can confirm this.
   4. `fili auth status` lists stored logins and their expiry state per plugin. `fili auth logout <plugin>` deletes that plugin's tokens, and later polls run without authentication.
-**Plans:** 9/9 plans executed
+**Plans:** 9/9 plans complete
 
 Plans:
 **Wave 1**
@@ -213,7 +213,32 @@ Plans:
   3. `fili plugins run-once youtube` returns new uploads from the channels in its TOML, read from their uploads playlists. After `fili auth login youtube`, it also returns new uploads from the user's subscriptions.
   4. YouTube polls use only low-cost Data API endpoints (no 100-unit search calls). A quota-exceeded response shows up as a clear, named error, not a silently empty poll.
   5. Each plugin's unit tests pass against recorded API fixtures with no network access and no API keys.
-**Plans**: TBD
+**Plans:** 12 plans
+
+Plans:
+**Wave 1**
+- [ ] 07-01-PLAN.md — Tracer: the Reddit plugin polls one subreddit's `new` listing from settings to a world-conformant `reddit_source.wasm` (Http seam, native fixture replay, per-feed cursor), then the full validated settings and User-Agent format (RDDT-01, RDDT-03, TEST-01)
+- [ ] 07-02-PLAN.md — Host config for `[host.oauth] grant = "client_credentials"` and the optional token-request `user_agent`, with the login-flow ripple (RDDT-01, RDDT-03)
+
+**Wave 2** *(blocked on Wave 1)*
+- [ ] 07-03-PLAN.md — Host token client request for the app grant and the in-memory single-flight token cache in the provider (RDDT-01, RDDT-03)
+- [ ] 07-04-PLAN.md — Reddit item mapping, `new` versus `hot` sticky rule, multi-feed `created_utc` marks, D-18 page fixtures (RDDT-01, TEST-01)
+- [ ] 07-05-PLAN.md — YouTube plugin crate: channel IDs to uploads playlists with an API key, per-playlist marks, placeholders, time edge cases (YTUB-01, TEST-01)
+
+**Wave 3** *(blocked on Wave 2)*
+- [ ] 07-06-PLAN.md — Reddit rate-limit headers, status classification, compliance sweep and fixture manifest (RDDT-03, TEST-01)
+- [ ] 07-08-PLAN.md — YouTube named quota error, status classification, credential modes, low-cost request sweep (YTUB-03, TEST-01)
+- [ ] 07-10-PLAN.md — `fili auth login` refusal and `app-only` status row for the app grant, plus OAuth documentation (RDDT-01, RDDT-03)
+
+**Wave 4** *(blocked on Wave 3)*
+- [ ] 07-07-PLAN.md — Reddit logged-in home feed and saved posts (seen-fullname set, D-19) for `reddit-user` (RDDT-02, TEST-01)
+- [ ] 07-09-PLAN.md — YouTube subscriptions for `youtube-user` with `subscriptions_limit` and the tested quota formula (YTUB-02, YTUB-03, TEST-01)
+
+**Wave 5** *(blocked on Wave 4)*
+- [ ] 07-11-PLAN.md — Sample registry of five instances over two components, host sample tests and the Reddit and YouTube operator documentation (RDDT-01 to RDDT-03, YTUB-01 to YTUB-03, TEST-01)
+
+**Wave 6** *(blocked on Wave 5; contains a human-action checkpoint)*
+- [ ] 07-12-PLAN.md — Optional real-fixture capture (synthetic fallback accepted, D-21), reconciliation and the offline phase gate (all Phase 7 requirements)
 
 ### Phase 8: Integration, Live E2E & Authoring
 **Goal**: The whole system is proven end to end. Compiled plugins run inside the host against replayed and live APIs into Fluvio, enriched social JSON comes out alongside news, and a third party can build and register a plugin from the guide alone
@@ -239,6 +264,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
-| 6. Host-Managed OAuth | 9/9 | In Progress | - |
+| 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
