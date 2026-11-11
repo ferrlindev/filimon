@@ -14,6 +14,7 @@
 // content: only the plugin name, counts, seconds and cleaned error text.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,8 @@ use super::engine::{PollError, PollResponse, clean_guest_text};
 use super::instance::{CallOutcome, InstanceFactory, PluginInstance};
 use super::map::map_items;
 use super::sink::{ItemSink, SinkRecord};
+use crate::plugins::auth::provider::{TokenOutcome, TokenProvider};
+use crate::plugins::auth::store::AccessToken;
 use crate::plugins::config::{HostConfig, LoadedSource};
 use crate::plugins::secrets::ResolvedSecrets;
 
@@ -32,28 +35,36 @@ use crate::plugins::secrets::ResolvedSecrets;
 const REPORT_TEXT_CLIP: usize = 512;
 
 /// Everything one plugin task needs. `ResolvedSecrets` redacts its values in
-/// Debug, and there is no hand-written Debug here.
+/// Debug, and so does `TokenProvider`; there is no hand-written Debug here.
 #[derive(Debug)]
 pub struct PluginSpec {
     pub name: String,
     pub host: HostConfig,
     pub settings_toml: String,
     pub secrets: ResolvedSecrets,
+    /// The plugin's login, when its TOML declares `[host.oauth]`.
+    pub auth: Option<Arc<TokenProvider>>,
 }
 
 impl PluginSpec {
-    /// `Some` only for an enabled source whose plugin file loaded.
+    /// `Some` only for an enabled source whose plugin file loaded. A plugin
+    /// with `[host.oauth]` gets a token provider over `<state_dir>/auth`.
     #[must_use]
-    pub fn from_loaded(source: &LoadedSource) -> Option<Self> {
+    pub fn from_loaded(source: &LoadedSource, state_dir: &Path) -> Option<Self> {
         if !source.enabled {
             return None;
         }
         let plugin = source.plugin.as_ref()?;
+        let auth = plugin
+            .oauth
+            .as_ref()
+            .map(|oauth| Arc::new(TokenProvider::new(&source.name, oauth.clone(), state_dir)));
         Some(Self {
             name: source.name.clone(),
             host: plugin.host.clone(),
             settings_toml: plugin.settings_toml.clone(),
             secrets: plugin.secrets.clone(),
+            auth,
         })
     }
 }
@@ -101,6 +112,12 @@ pub enum CycleOutcome {
     BuildFailed(String),
     /// The sink failed or timed out: a host-side failure, not the plugin's.
     SinkFailed(String),
+    /// The access token could not be refreshed for now (cleaned text): a
+    /// host-side, transient failure. The instance is kept.
+    TokenRefresh(String),
+    /// The plugin's token file cannot be used (cleaned text). It disables only
+    /// this plugin and the file is left as it was found (D-02).
+    TokenFile(String),
 }
 
 /// What the loop does next.
@@ -138,6 +155,8 @@ pub struct PluginState {
 ///   counts as a transient failure; a failed `init` also discards it, because
 ///   `init` runs once per instance. `SinkFailed` reuses the plugin's backoff
 ///   (RESEARCH A9) and keeps the instance.
+/// - Phase 6: `TokenRefresh` backs off like `SinkFailed` and keeps the
+///   instance; `TokenFile` disables the plugin (D-02).
 ///
 /// Literal D-02 note (RESEARCH A10): a backoff window can be shorter than
 /// `poll_interval_secs`. That is the locked decision and is not adjusted.
@@ -166,7 +185,12 @@ pub fn next_action(state: &mut PluginState, cfg: &HostConfig, outcome: &CycleOut
             }
         }
         CycleOutcome::InstanceFatal(_) | CycleOutcome::BuildFailed(_) => (step, true),
-        CycleOutcome::SinkFailed(_) => (step, false),
+        CycleOutcome::SinkFailed(_) | CycleOutcome::TokenRefresh(_) => (step, false),
+        CycleOutcome::TokenFile(_) => {
+            return Action::Disable {
+                reason: describe(outcome),
+            };
+        }
     };
     state.failures = state.failures.saturating_add(1);
     Action::Wait {
@@ -197,6 +221,8 @@ pub fn describe(outcome: &CycleOutcome) -> String {
         CycleOutcome::InstanceFatal(text) => format!("instance fault: {}", clean(text)),
         CycleOutcome::BuildFailed(text) => format!("instance build failed: {}", clean(text)),
         CycleOutcome::SinkFailed(text) => format!("item sink failed: {}", clean(text)),
+        CycleOutcome::TokenRefresh(text) => format!("token refresh failed: {}", clean(text)),
+        CycleOutcome::TokenFile(text) => format!("token file problem: {}", clean(text)),
     }
 }
 
@@ -252,6 +278,72 @@ pub(crate) fn expose_secrets(spec: &PluginSpec) -> Vec<(String, String)> {
         .iter()
         .map(|(alias, secret)| (alias.clone(), secret.expose().to_string()))
         .collect()
+}
+
+/// Why a poll goes out without a token, for the one-time login hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginHint {
+    /// The plugin has an OAuth config but no login on disk.
+    NotLoggedIn,
+    /// The stored login is flagged: the user must log in again.
+    NeedsLogin,
+}
+
+/// What a poll is handed: the access token, when there is one, and the reason
+/// there is none, when that is worth telling the user about.
+#[derive(Debug)]
+pub(crate) struct PollAuth {
+    pub(crate) token: Option<AccessToken>,
+    pub(crate) hint: Option<LoginHint>,
+}
+
+/// The one decision table between a plugin's stored login and its next `poll`,
+/// shared by the loop and `run-once`. Call it immediately before every poll:
+/// it re-reads the token file each time (D-08). A plugin without a token
+/// provider gets no token and no hint and never touches the auth directory.
+///
+/// An `Err` is the cycle's outcome: a refresh problem is transient, an unusable
+/// token file disables the plugin (D-02).
+pub(crate) async fn auth_for_poll(spec: &PluginSpec) -> Result<PollAuth, CycleOutcome> {
+    let Some(provider) = &spec.auth else {
+        return Ok(PollAuth {
+            token: None,
+            hint: None,
+        });
+    };
+    match provider.access_token().await {
+        TokenOutcome::Token(token) => Ok(PollAuth {
+            token: Some(token),
+            hint: None,
+        }),
+        TokenOutcome::NotLoggedIn => Ok(PollAuth {
+            token: None,
+            hint: Some(LoginHint::NotLoggedIn),
+        }),
+        TokenOutcome::NeedsLogin => Ok(PollAuth {
+            token: None,
+            hint: Some(LoginHint::NeedsLogin),
+        }),
+        TokenOutcome::RefreshDue => Err(CycleOutcome::TokenRefresh(
+            "access token is due for a refresh".to_string(),
+        )),
+        TokenOutcome::FileProblem(error) => Err(CycleOutcome::TokenFile(error.to_string())),
+    }
+}
+
+/// Logs the one line that tells the user how to log in. Only the plugin alias
+/// and fixed text: never a token or a path.
+pub(crate) fn warn_login_hint(plugin: &str, hint: LoginHint) {
+    match hint {
+        LoginHint::NotLoggedIn => tracing::warn!(
+            plugin = %plugin,
+            "not logged in; run: fili auth login {plugin}"
+        ),
+        LoginHint::NeedsLogin => tracing::warn!(
+            plugin = %plugin,
+            "the stored login needs to be renewed; run: fili auth login {plugin}"
+        ),
+    }
 }
 
 /// The plugin fault for a `next-cursor` over `MAX_CURSOR_BYTES`, as a poll
@@ -389,6 +481,10 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
     // The only place a secret value is read (shared with `run-once`).
     let secrets = expose_secrets(&spec);
 
+    // Whether the last poll already printed the "run: fili auth login" hint, so
+    // a plugin that stays logged out logs it once, not once per poll.
+    let mut hinted = false;
+
     'instances: loop {
         // A fresh instance.
         let mut instance = match factory.instantiate(&spec.name).await {
@@ -427,10 +523,37 @@ pub async fn run_plugin<F: InstanceFactory, S: ItemSink>(
 
         // The poll loop on this instance.
         loop {
+            // The token is decided immediately before every poll. Not raced
+            // against shutdown: a refresh in flight must not be cut between the
+            // provider's network answer and its file write.
+            let auth = match auth_for_poll(&spec).await {
+                Ok(auth) => auth,
+                Err(outcome) => {
+                    record_status(&cursors, &spec.name, &outcome, None);
+                    match settle(&spec, &mut state, &mut report, &shutdown, &outcome).await {
+                        Next::Stop => return report,
+                        Next::Rebuild => continue 'instances,
+                        Next::Same => continue,
+                    }
+                }
+            };
+            match auth.hint {
+                Some(hint) => {
+                    if !hinted {
+                        warn_login_hint(&spec.name, hint);
+                    }
+                    hinted = true;
+                }
+                None => hinted = false,
+            }
+
             let polled = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => return report,
-                polled = instance.poll(cursor.as_deref()) => polled,
+                polled = instance.poll(
+                    cursor.as_deref(),
+                    auth.token.as_ref().map(AccessToken::expose),
+                ) => polled,
             };
 
             // An oversize cursor is a plugin fault (the rule `run-once` shares):
@@ -745,6 +868,7 @@ mod tests {
             CycleOutcome::InstanceFatal("trap".to_string()),
             CycleOutcome::BuildFailed("nope".to_string()),
             CycleOutcome::SinkFailed("down".to_string()),
+            CycleOutcome::TokenRefresh("later".to_string()),
         ];
         for outcome in &outcomes {
             let mut state = PluginState::default();
@@ -754,6 +878,19 @@ mod tests {
                 }
                 other @ Action::Disable { .. } => panic!("{outcome:?} gave {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn token_file_problem_disables_the_plugin() {
+        let mut state = PluginState::default();
+        let outcome = CycleOutcome::TokenFile("plugin `p`: token file `/x` is corrupt".to_string());
+        match next_action(&mut state, &cfg(), &outcome) {
+            Action::Disable { reason } => {
+                assert!(reason.starts_with("token file problem:"), "{reason}");
+                assert!(reason.contains("`/x`"), "{reason}");
+            }
+            other @ Action::Wait { .. } => panic!("expected Disable, got {other:?}"),
         }
     }
 
@@ -1868,5 +2005,74 @@ mod tests {
             vec![Some(vec![2])],
             "a restart resumes from the last committed cursor"
         );
+    }
+}
+
+// ── Host-managed OAuth: the token reaches `poll` ─────────────────────────────
+
+#[cfg(test)]
+mod sched_auth {
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::plugins::auth::testing::{unix_now, write_tokens};
+    use crate::plugins::host::sink::VecSink;
+    use crate::plugins::host::testing::{FakeFactory, FakeStep, load_test_registry, run_for};
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// Writes `filimon.toml` and `stub.toml` (a source `stub` with
+    /// `[host.oauth]`) into `dir`. The component file need not exist because
+    /// loading never opens it.
+    fn oauth_registry(dir: &Path) -> PathBuf {
+        std::fs::write(
+            dir.join("filimon.toml"),
+            "[sources.stub]\ncomponent = \"stub.wasm\"\nconfig = \"stub.toml\"\n",
+        )
+        .expect("write registry");
+        std::fs::write(
+            dir.join("stub.toml"),
+            "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
+             authorize_url = \"https://auth.example/authorize\"\n\
+             token_url = \"https://auth.example/token\"\n\
+             scopes = [\"read\"]\nclient_id = \"client-1\"\n",
+        )
+        .expect("write plugin toml");
+        dir.join("filimon.toml")
+    }
+
+    /// A state directory under `dir` and a cursor store over it.
+    fn state(dir: &TempDir) -> (PathBuf, Arc<CursorStore>) {
+        let state_dir = dir.path().join("state");
+        let cursors = Arc::new(CursorStore::open(&state_dir).expect("cursor store"));
+        (state_dir, cursors)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracer_a_logged_in_plugin_gets_its_access_token_from_toml_to_poll() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = load_test_registry(&oauth_registry(dir.path()));
+        let (state_dir, cursors) = state(&dir);
+        let source = &registry.sources["stub"];
+        let spec = PluginSpec::from_loaded(source, &state_dir).expect("an enabled source");
+        // The wall clock, which paused tokio time does not move.
+        write_tokens(&state_dir, "stub", "AT-1", unix_now() + 3600);
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+
+        let report = run_for(
+            spec,
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(1),
+        )
+        .await;
+
+        assert_eq!(factory.poll_tokens(), vec![Some("AT-1".to_string())]);
+        assert_eq!(report.disabled, None);
     }
 }

@@ -119,6 +119,22 @@ struct HostSection {
     /// alias -> env var name
     #[serde(default)]
     secrets: BTreeMap<String, toml::Spanned<String>>,
+    /// The `[host.oauth]` table: host-managed OAuth for this plugin (D-11).
+    #[serde(default)]
+    oauth: Option<OAuthSection>,
+}
+
+/// The `[host.oauth]` table. It sits beside the other host-owned keys, never
+/// under `[settings]`, so the guest never sees it. Each value keeps its span so
+/// a diagnostic can label it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OAuthSection {
+    authorize_url: toml::Spanned<String>,
+    token_url: toml::Spanned<String>,
+    #[serde(default)]
+    scopes: Vec<toml::Spanned<String>>,
+    client_id: toml::Spanned<String>,
 }
 
 /// The `[host.backoff]` table. Each value keeps its span when it is given, so
@@ -213,6 +229,25 @@ pub struct PluginConfig {
     pub settings_toml: String,
     /// Only the aliases this plugin's `[host.secrets]` names.
     pub secrets: ResolvedSecrets,
+    /// The plugin's `[host.oauth]` table; `None` when it declares none.
+    pub oauth: Option<OAuthConfig>,
+}
+
+/// A plugin's host-managed OAuth configuration (D-11). Both endpoints are
+/// `https://` URLs with a host (D-13); nothing here is a secret.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the login flow and the token client read these fields in later plans of this phase"
+    )
+)]
+pub struct OAuthConfig {
+    pub authorize_url: url::Url,
+    pub token_url: url::Url,
+    pub scopes: Vec<String>,
+    pub client_id: String,
 }
 
 /// Host-enforced values for one plugin.
@@ -591,6 +626,7 @@ fn finish_plugin(
         host: parsed.host,
         settings_toml: parsed.settings_toml,
         secrets,
+        oauth: parsed.oauth,
     })
 }
 
@@ -626,7 +662,7 @@ impl RegistrySource<'_> {
 
 /// `true` when `name` is non-empty and uses only `[a-z0-9_-]`. Names become
 /// CLI arguments and per-plugin state keys, so nothing else is accepted.
-fn is_valid_name(name: &str) -> bool {
+pub(crate) fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -775,6 +811,8 @@ struct ParsedPlugin {
     host: HostConfig,
     settings_toml: String,
     aliases: BTreeMap<String, toml::Spanned<String>>,
+    /// The `[host.oauth]` table, when it had no problems.
+    oauth: Option<OAuthConfig>,
     /// `[host]` values that parsed but are out of range.
     invalid: Vec<ConfigError>,
 }
@@ -827,7 +865,11 @@ fn read_plugin(
         allowlist,
         backoff,
         secrets,
+        oauth,
     } = file.host;
+    // A table with problems is reported through `invalid`; it never builds a
+    // config, so nothing half-valid can reach the login flow.
+    let oauth = oauth.and_then(|section| build_oauth(&section));
     let host = HostConfig {
         poll_interval: Duration::from_secs(poll_interval_secs.get()),
         timeout: Duration::from_secs(timeout_secs.get()),
@@ -848,8 +890,74 @@ fn read_plugin(
         host,
         settings_toml,
         aliases: secrets,
+        oauth,
         invalid,
     })
+}
+
+/// `Some` only when both endpoints satisfy the https rule and `client_id` is
+/// not empty; the same rule `oauth_problems` reports against.
+fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
+    let authorize_url = https_endpoint(section.authorize_url.get_ref())?;
+    let token_url = https_endpoint(section.token_url.get_ref())?;
+    if section.client_id.get_ref().is_empty() {
+        return None;
+    }
+    Some(OAuthConfig {
+        authorize_url,
+        token_url,
+        scopes: section
+            .scopes
+            .iter()
+            .map(|scope| scope.get_ref().clone())
+            .collect(),
+        client_id: section.client_id.get_ref().clone(),
+    })
+}
+
+/// The parsed URL when `text` is an `https://` URL with a host (D-13).
+fn https_endpoint(text: &str) -> Option<url::Url> {
+    let url = url::Url::parse(text).ok()?;
+    (url.scheme() == "https" && url.host_str().is_some()).then_some(url)
+}
+
+/// `[host.oauth]` checks, in a fixed order: `authorize_url`, `token_url`, then
+/// `client_id`. A message never repeats the value it rejects.
+fn oauth_problems(
+    plugin: &str,
+    path: &str,
+    text: &str,
+    section: &OAuthSection,
+) -> Vec<ConfigError> {
+    let invalid = |field: &str, message: &str, span: SourceSpan| ConfigError::InvalidValue {
+        plugin: plugin.to_string(),
+        path: path.to_string(),
+        field: field.to_string(),
+        message: message.to_string(),
+        src: NamedSource::new(path, text.to_string()),
+        span: Some(span),
+    };
+    let mut problems = Vec::new();
+    for (field, value) in [
+        ("host.oauth.authorize_url", &section.authorize_url),
+        ("host.oauth.token_url", &section.token_url),
+    ] {
+        if https_endpoint(value.get_ref()).is_none() {
+            problems.push(invalid(
+                field,
+                "must be an https:// URL with a host",
+                value.span().into(),
+            ));
+        }
+    }
+    if section.client_id.get_ref().is_empty() {
+        problems.push(invalid(
+            "host.oauth.client_id",
+            "must not be empty",
+            section.client_id.span().into(),
+        ));
+    }
+    problems
 }
 
 /// Range checks on a parsed `[host]` table, in a fixed order: allowlist
@@ -905,6 +1013,10 @@ fn host_problems(plugin: &str, path: &str, text: &str, host: &HostSection) -> Ve
             format!("must be >= initial_secs ({initial})"),
             span,
         ));
+    }
+
+    if let Some(oauth) = &host.oauth {
+        problems.extend(oauth_problems(plugin, path, text, oauth));
     }
 
     problems
@@ -1599,6 +1711,95 @@ fetcher = "nope"
                 other => panic!("expected InvalidValue, got {other:?}"),
             })
             .collect()
+    }
+
+    // ── [host.oauth] (D-11, D-13) ─────────────────────────────────────────────
+
+    /// A plugin file with `[host.oauth]` built from the given endpoint values.
+    fn oauth_plugin(authorize_url: &str, token_url: &str) -> String {
+        format!(
+            "[host]\npoll_interval_secs = 60\n\n[host.oauth]\nauthorize_url = \"{authorize_url}\"\n\
+             token_url = \"{token_url}\"\nscopes = [\"read\"]\nclient_id = \"client-1\"\n"
+        )
+    }
+
+    #[test]
+    fn oauth_table_loads_into_the_plugin_config() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &format!(
+                "{}\n[settings]\ngreeting = \"hi\"\n",
+                oauth_plugin("https://auth.example/authorize", "https://auth.example/token")
+            ),
+        );
+
+        let registry = load(&dir).expect("a plugin with [host.oauth] loads");
+        let plugin = registry.sources["alpha"].plugin.as_ref().expect("loaded");
+        let oauth = plugin.oauth.as_ref().expect("the oauth table");
+        assert_eq!(oauth.authorize_url.as_str(), "https://auth.example/authorize");
+        assert_eq!(oauth.token_url.as_str(), "https://auth.example/token");
+        assert_eq!(oauth.scopes, ["read"]);
+        assert_eq!(oauth.client_id, "client-1");
+        // Nothing of the table is placed under [settings].
+        assert!(!plugin.settings_toml.contains("oauth"), "{}", plugin.settings_toml);
+        assert!(!plugin.settings_toml.contains("client-1"), "{}", plugin.settings_toml);
+
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, "[host]\npoll_interval_secs = 60\n");
+        let registry = load(&dir).expect("a plugin without [host.oauth] loads");
+        let plugin = registry.sources["alpha"].plugin.as_ref().expect("loaded");
+        assert!(plugin.oauth.is_none());
+    }
+
+    #[test]
+    fn oauth_endpoints_must_be_https_naming_plugin_and_field() {
+        let https = "https://auth.example/x";
+        let cases = [
+            ("http://auth.example/authorize", https, "host.oauth.authorize_url"),
+            ("not a url", https, "host.oauth.authorize_url"),
+            ("ftp://auth.example/authorize", https, "host.oauth.authorize_url"),
+            (https, "http://auth.example/token", "host.oauth.token_url"),
+            (https, "not a url", "host.oauth.token_url"),
+            (https, "ftp://auth.example/token", "host.oauth.token_url"),
+        ];
+        for (authorize, token, field) in cases {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(&dir, &oauth_plugin(authorize, token));
+
+            let errors = load(&dir).expect_err("a non-https endpoint is an error");
+
+            assert_eq!(errors.problems.len(), 1, "{authorize} {token}: {errors:?}");
+            let ConfigError::InvalidValue {
+                plugin,
+                field: got,
+                message,
+                span,
+                ..
+            } = &errors.problems[0]
+            else {
+                panic!("expected InvalidValue, got {:?}", errors.problems[0]);
+            };
+            assert_eq!(plugin, "alpha");
+            assert_eq!(got, field);
+            assert!(span.is_some(), "the value is labelled");
+            assert!(message.contains("https://"), "{message}");
+            assert!(!message.contains("auth.example"), "no value echo: {message}");
+        }
+
+        // An upper-case scheme is still https.
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &oauth_plugin("HTTPS://auth.example/authorize", "https://auth.example/token"),
+        );
+        let registry = load(&dir).expect("an upper-case HTTPS endpoint is accepted");
+        let oauth = registry.sources["alpha"]
+            .plugin
+            .as_ref()
+            .and_then(|p| p.oauth.as_ref())
+            .expect("oauth");
+        assert_eq!(oauth.authorize_url.scheme(), "https");
     }
 
     #[test]

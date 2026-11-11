@@ -64,9 +64,13 @@ pub trait PluginInstance: Send + 'static {
         secrets: &[(String, String)],
     ) -> impl Future<Output = CallOutcome<()>> + Send;
 
+    /// `access_token` is the one credential the host hands a guest: the
+    /// current OAuth access token for the plugin, or `None` when the plugin
+    /// has no login. No other secret has a path to the guest through `poll`.
     fn poll(
         &mut self,
         cursor: Option<&[u8]>,
+        access_token: Option<&str>,
     ) -> impl Future<Output = CallOutcome<PollResponse>> + Send;
 }
 
@@ -136,9 +140,12 @@ impl PluginInstance for WasmtimeInstance {
         classify(self.source.call_init(&mut self.store, settings, secrets).await)
     }
 
-    async fn poll(&mut self, cursor: Option<&[u8]>) -> CallOutcome<PollResponse> {
-        // The access token is always none until Phase 6.
-        classify(self.source.call_poll(&mut self.store, cursor, None).await)
+    async fn poll(
+        &mut self,
+        cursor: Option<&[u8]>,
+        access_token: Option<&str>,
+    ) -> CallOutcome<PollResponse> {
+        classify(self.source.call_poll(&mut self.store, cursor, access_token).await)
     }
 }
 
