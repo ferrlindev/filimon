@@ -38,6 +38,10 @@ Requirements: AUTH-01..AUTH-04.
 - **D-12:** `client_id` is public and lives in the TOML. `client_secret_env` **names a `.env` key** resolved with the existing Phase 1 secret rules (per-plugin only, redacted, never in Debug or logs) and **is never passed to the plugin**.
 - **D-13:** `authorize_url`, `token_url`, and `revocation_url` **must be `https://`**. Only the loopback callback may be plain http. Token and revoke calls use the host's own TLS-validating client, **outside the plugin fetch allowlist**, so plugin allowlists need not list login hosts. Config load errors name plugin + field (Phase 1 CONF-03 style).
 
+### Added during plan-phase (user-approved 2026-11-11, from 06-RESEARCH.md Open Questions 1 and A7)
+- **D-14:** `[host.oauth]` gains one more optional key, **`authorize_params`**: a table of string to string appended after the standard authorize-URL params (e.g. Reddit's `duration = "permanent"`, without which no refresh token is issued). Keys that collide with the standard ones (`state`, `code_challenge`, `code_challenge_method`, `redirect_uri`, `client_id`, `response_type`, `scope`) are a config error naming plugin + field. Extends D-11. — **Reversibility:** costly — published plugin TOML shape that authors write against.
+- **D-15:** `fili plugins run-once` **also uses the token provider**: it re-reads the token file and may refresh and persist tokens, same rules as the poll loop (D-07/D-08/D-09). Needed so Phase 7's `run-once reddit` check works after login.
+
 ### Claude's Discretion (not discussed)
 - PKCE details: S256 challenge, verifier length, `state` generation (use a CSPRNG).
 - Crate choices (HTTP callback server, base64/sha2, browser opener) and sync vs async.
