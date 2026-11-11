@@ -678,7 +678,11 @@ pub fn list_registry(path: &Path) -> Result<RegistryListing, ConfigErrors> {
 /// Whether a source's plugin file declares `[host.oauth]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OAuthDeclared {
+    /// The plugin file declares `[host.oauth]` for the user login (code flow).
     Yes,
+    /// The plugin file declares `[host.oauth]` with `grant = "client_credentials"`:
+    /// an app-only plugin with no login.
+    AppOnly,
     No,
     /// The plugin file could not be read or parsed; a fixed phrase that never
     /// echoes file content.
@@ -714,8 +718,18 @@ struct HostView {
     oauth: Option<toml::Value>,
 }
 
+/// `true` when the `[host.oauth]` table's `grant` key is the string
+/// `client_credentials`. Nothing else in the table is looked at.
+fn declares_client_credentials(oauth: &toml::Value) -> bool {
+    oauth
+        .get("grant")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|grant| grant == GRANT_CLIENT_CREDENTIALS)
+}
+
 /// Reports, for every source in the registry at `path` (enabled or not),
-/// whether its plugin file declares `[host.oauth]`.
+/// whether its plugin file declares `[host.oauth]`, and whether that table
+/// uses the `client_credentials` grant.
 ///
 /// The read is lenient on purpose: it parses only far enough to see whether
 /// the table is there, never validates it, and touches no environment or
@@ -737,13 +751,13 @@ pub fn probe_oauth_sources(path: &Path) -> Result<OAuthProbeReport, ConfigErrors
                     Err(_) => {
                         OAuthDeclared::Unknown("the plugin file is not valid TOML".to_string())
                     }
-                    Ok(view) => {
-                        if view.host.and_then(|host| host.oauth).is_some() {
-                            OAuthDeclared::Yes
-                        } else {
-                            OAuthDeclared::No
+                    Ok(view) => match view.host.and_then(|host| host.oauth) {
+                        None => OAuthDeclared::No,
+                        Some(oauth) if declares_client_credentials(&oauth) => {
+                            OAuthDeclared::AppOnly
                         }
-                    }
+                        Some(_) => OAuthDeclared::Yes,
+                    },
                 },
             };
             OAuthProbe {
@@ -3903,6 +3917,48 @@ component = "other-fetcher.wasm"
         };
         assert_eq!(broken, "the plugin file is not valid TOML");
         assert!(!broken.contains("SECRET-FILE-CONTENT"));
+    }
+
+    #[test]
+    fn probe_reports_an_app_only_plugin() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut registry = String::new();
+        for name in ["app", "code", "explicit", "invalid"] {
+            registry.push_str(&source(name, true));
+        }
+        write(&dir, "filimon.toml", &registry);
+        write(
+            &dir,
+            "app.toml",
+            "[host.oauth]\ngrant = \"client_credentials\"\ntoken_url = \"https://auth.example/token\"\nclient_id = \"c\"\nclient_secret_env = \"PROBE_SECRET_UNSET_EVERYWHERE\"\n",
+        );
+        write(&dir, "code.toml", OAUTH_PLUGIN);
+        write(
+            &dir,
+            "explicit.toml",
+            "[host.oauth]\ngrant = \"authorization_code\"\nauthorize_url = \"https://auth.example/authorize\"\n",
+        );
+        // An invalid table (no token_url, junk keys) is not validated by the probe.
+        write(
+            &dir,
+            "invalid.toml",
+            "[host.oauth]\ngrant = \"client_credentials\"\nredirect_port = \"not a port\"\n",
+        );
+
+        let report = probe_oauth_sources(&dir.path().join("filimon.toml")).expect("probe");
+
+        let find = |name: &str| {
+            report
+                .sources
+                .iter()
+                .find(|probe| probe.name == name)
+                .map(|probe| probe.declares.clone())
+        };
+        assert_eq!(find("app"), Some(OAuthDeclared::AppOnly));
+        assert_eq!(find("code"), Some(OAuthDeclared::Yes));
+        assert_eq!(find("explicit"), Some(OAuthDeclared::Yes));
+        assert_eq!(find("invalid"), Some(OAuthDeclared::AppOnly));
+        assert!(!dir.path().join(".env").exists());
     }
 
     #[test]
