@@ -149,12 +149,12 @@ Plans:
   2. The host rejects, with a clear error, any request to a domain outside the source's allowlist and any request that exceeds its timeout. This holds for both the default fetcher and a custom fetcher.
   3. The bundled default HTTP fetcher component makes real HTTPS requests with TLS certificate validation on: a request to a host with an invalid certificate fails. The crawler's disabled certificate validation is not carried over.
   4. With the crawler configured to use a fetcher component, `fili produce <url>` fetches pages through that component and articles still reach the consumer.
-**Plans:** 8 plans
+**Plans:** 2/8 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 05-01-PLAN.md — Tracer: a source's `fetch` is answered by a fresh instance of its registry-assigned fetcher under the source's allowlist and timeout; `Host::load` builds the routes and a source whose fetcher cannot load is not loaded; exact-host allowlist matrix (FETCH-01, FETCH-02)
-- [ ] 05-02-PLAN.md — Default HTTP fetcher component `plugins/http-fetcher` (forwards to the host's `send`), registered in the sample registry and checked through `fili plugins check http` (FETCH-03)
+- [x] 05-01-PLAN.md — Tracer: a source's `fetch` is answered by a fresh instance of its registry-assigned fetcher under the source's allowlist and timeout; `Host::load` builds the routes and a source whose fetcher cannot load is not loaded; exact-host allowlist matrix (FETCH-01, FETCH-02)
+- [x] 05-02-PLAN.md — Default HTTP fetcher component `plugins/http-fetcher` (forwards to the host's `send`), registered in the sample registry and checked through `fili plugins check http` (FETCH-03)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 05-03-PLAN.md — Host `outbound-http.send`: shared certificate-validating client, redirects re-checked on every hop, response cap, one deadline per call, loopback `TestHttpServer` (FETCH-02, FETCH-03)
@@ -216,7 +216,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 2. SourceItem Pipeline | 7/7 | Complete    | 2026-11-09 |
 | 3. Component Host Runtime | 10/10 | Complete    | 2026-11-10 |
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
-| 5. Fetcher Layer | 0/TBD | Not started | - |
+| 5. Fetcher Layer | 2/8 | In Progress | - |
 | 6. Host-Managed OAuth | 0/TBD | Not started | - |
 | 7. Reddit & YouTube Plugins | 0/TBD | Not started | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
