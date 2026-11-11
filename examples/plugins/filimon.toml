@@ -22,4 +22,4 @@ fetcher = "http"
 component = "../../plugins/stub-fetcher/target/wasm32-unknown-unknown/release/stub_fetcher.wasm"
 
 [fetchers.http]
-component = "components/http-fetcher.wasm"
+component = "../../plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm"

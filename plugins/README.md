@@ -12,6 +12,13 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
 - `stub-fetcher/`: a minimal plugin for the `fetcher` world. `fetch` logs the
   request URL and returns a canned `200` JSON response. It never calls
   `outbound-http`.
+- `http-fetcher/`: the default fetcher, a plugin for the `fetcher` world.
+  `fetch` forwards the request to the host's `outbound-http.send` and returns
+  the answer unchanged. It adds no header, follows no redirect and logs no url,
+  header or body. The host, not the component, enforces TLS validation, the
+  allowlist, the timeout, redirects and size limits. It is a normal registry
+  entry (`[fetchers.http]` in `examples/plugins/filimon.toml`), not part of the
+  `fili` binary.
 - `fault-source/`: a fault-injection plugin for the `source` world and a
   Phase 3 test fixture, not a registry example. Its `[settings]` `mode`
   selects `ok`, `rate-limited`, `transient`, `auth-required`, `fatal`,
@@ -22,6 +29,7 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
   never reference it from a plugin registry such as `examples/plugins/`.
 
 Both stubs and the fault source double as test fixtures for the Phase 3 host.
+The default fetcher is not a fixture: it is the fetcher that ships.
 
 These crates are not members of the root filimon workspace. Each has its own
 empty `[workspace]` table, its own `Cargo.lock`, and its own toolchain pin.
@@ -50,6 +58,7 @@ From the repository root:
 (cd plugins/stub-source && cargo component build --release)
 (cd plugins/stub-fetcher && cargo component build --release)
 (cd plugins/fault-source && cargo component build --release)
+(cd plugins/http-fetcher && cargo component build --release)
 ```
 
 The build must run from the crate directory, which the subshells handle:
@@ -60,6 +69,7 @@ components land at:
 - `plugins/stub-source/target/wasm32-unknown-unknown/release/stub_source.wasm`
 - `plugins/stub-fetcher/target/wasm32-unknown-unknown/release/stub_fetcher.wasm`
 - `plugins/fault-source/target/wasm32-unknown-unknown/release/fault_source.wasm`
+- `plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm`
 
 ## Conformance check
 
@@ -72,6 +82,9 @@ wasm-tools component targets ../../wit -w source target/wasm32-unknown-unknown/r
 
 # in plugins/stub-fetcher
 wasm-tools component targets ../../wit -w fetcher target/wasm32-unknown-unknown/release/stub_fetcher.wasm
+
+# in plugins/http-fetcher
+wasm-tools component targets ../../wit -w fetcher target/wasm32-unknown-unknown/release/http_fetcher.wasm
 ```
 
 Each command exits 0 on success. Checking a component against the wrong world
