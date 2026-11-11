@@ -4,9 +4,9 @@
 //! a silent gap. Nothing here logs or echoes a url, header, token or body.
 
 use crate::api::{self, Item};
-use crate::cursor::{self, Cursor, Mark};
+use crate::cursor::{self, Cursor, Mark, SeenSet};
 use crate::http::{Http, HttpError, header};
-use crate::settings::Settings;
+use crate::settings::{FeedKind, Settings};
 use std::collections::HashSet;
 
 /// What a successful poll returns.
@@ -77,6 +77,7 @@ fn classify_response(
     status: u16,
     headers: &[(String, String)],
     feed_key: &str,
+    user_feed: bool,
 ) -> Option<PollError> {
     // D-13: reactive and stateless. The host backoff does the waiting.
     let remaining_exhausted = parse_header_f64(headers, "x-ratelimit-remaining")
@@ -88,8 +89,18 @@ fn classify_response(
     match status {
         200..=299 => None,
         401 => Some(PollError::AuthRequired),
-        404 => Some(PollError::Config(format!(
-            "Reddit reports no such listing for {feed_key} (HTTP 404); check the subreddits setting"
+        404 => {
+            let hint = if user_feed {
+                "the feed and username settings"
+            } else {
+                "the subreddits setting"
+            };
+            Some(PollError::Config(format!(
+                "Reddit reports no such listing for {feed_key} (HTTP 404); check {hint}"
+            )))
+        }
+        403 if user_feed => Some(PollError::Transient(format!(
+            "Reddit refused access to {feed_key} (HTTP 403); the login may lack the history scope"
         ))),
         403 => Some(PollError::Transient(format!(
             "Reddit refused access to {feed_key} (HTTP 403); the subreddit may be private or banned, or the login lacks the history scope"
@@ -136,31 +147,93 @@ pub fn poll(
     let mut skipped = 0usize;
 
     for feed in &feeds {
+        let is_saved = matches!(feed.kind, FeedKind::Saved { .. });
         let mark = old.mark(&feed.key);
+        // A stored value of the other shape is no state for this feed (a
+        // changed `feed` setting self-heals, T-07-32): a first poll, and the
+        // stale value must not survive into the new cursor.
+        let has_state = if is_saved {
+            old.seen(&feed.key).is_some()
+        } else {
+            mark.is_some()
+        };
+        if !has_state {
+            next.clear(&feed.key);
+        }
         // D-10: the first poll of a feed is one page; later polls return only
         // newer items, so they take the largest page.
-        let limit = if mark.is_some() {
+        let limit = if has_state {
             settings.later_page_limit()
         } else {
             settings.first_page_limit()
         };
-        let request = api::listing_request(
-            &feed.subreddit,
-            feed.listing,
-            limit,
-            token,
-            settings.user_agent(),
-        );
+        let request = match &feed.kind {
+            FeedKind::Listing { sub, listing } => {
+                api::listing_request(sub, listing, limit, token, settings.user_agent())
+            }
+            FeedKind::Home => api::home_request(limit, token, settings.user_agent()),
+            FeedKind::Saved { username } => {
+                api::saved_request(username, limit, token, settings.user_agent())
+            }
+        };
         let response = http.get(&request).map_err(map_http_error)?;
-        if let Some(error) = classify_response(response.status, &response.headers, &feed.key) {
+        if let Some(error) = classify_response(
+            response.status,
+            &response.headers,
+            &feed.key,
+            feed.kind.is_user_feed(),
+        ) {
             return Err(error);
         }
-        // The feed's listing decides the sticky rule (D-12). Settings only
-        // produce `new` and `hot`, so the fallback is never taken.
-        let listing = api::Listing::from_name(feed.listing).unwrap_or(api::Listing::New);
-        let page = api::parse_listing(&response.body, listing).map_err(|_| {
-            PollError::Transient("Reddit answer is not a readable listing".to_string())
-        })?;
+        let unreadable =
+            || PollError::Transient("Reddit answer is not a readable listing".to_string());
+
+        if is_saved {
+            // D-19: `saved` is ordered by save time, so a `created_utc` mark
+            // would miss a post saved today that was created long ago. The
+            // stored state is the top of the previous page.
+            let children = api::parse_saved(&response.body).map_err(|_| unreadable())?;
+            let stored = old.seen(&feed.key);
+            let mut fresh: Vec<&api::Post> = Vec::new();
+            for child in &children {
+                let already_seen = match (stored, child.name.as_deref()) {
+                    (Some(stored), Some(name)) => stored.contains(name),
+                    _ => false,
+                };
+                if already_seen {
+                    break;
+                }
+                match &child.post {
+                    Some(post) => fresh.push(post),
+                    None => skipped += 1,
+                }
+            }
+            // Oldest saved first: the reverse of the listing order.
+            fresh.reverse();
+            next.set_seen(
+                feed.key.clone(),
+                SeenSet::from_names(children.iter().filter_map(|child| child.name.as_deref())),
+            );
+            for post in fresh {
+                if let Some(item) = api::post_to_item(post) {
+                    if seen.insert(item.id.clone()) {
+                        items.push(item);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // The feed's listing decides the sticky rule (D-12). `home` follows
+        // the `new` rule. Settings only produce `new` and `hot`, so the
+        // fallback is never taken.
+        let listing = match &feed.kind {
+            FeedKind::Listing { listing, .. } => {
+                api::Listing::from_name(listing).unwrap_or(api::Listing::New)
+            }
+            _ => api::Listing::New,
+        };
+        let page = api::parse_listing(&response.body, listing).map_err(|_| unreadable())?;
         skipped += page.skipped;
         let posts = page.posts;
 

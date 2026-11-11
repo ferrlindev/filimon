@@ -178,7 +178,7 @@ fn tracer_returns_a_cursor_marking_the_newest_post() {
         .unwrap();
     let (cursor, undecodable) = cursor::decode(Some(&bytes));
     assert!(!undecodable);
-    let mark = cursor.0.get("r/rust:new").expect("feed key r/rust:new");
+    let mark = cursor.mark("r/rust:new").expect("feed key r/rust:new");
     assert_eq!(mark.t, newest["created_utc"].as_f64().unwrap() as i64);
     assert_eq!(mark.n, newest["name"].as_str().unwrap());
 }
@@ -492,7 +492,7 @@ fn removed_and_deleted_posts_are_emitted_with_their_literal_markers() {
     assert_eq!(deleted.author.as_deref(), Some("[deleted]"));
     assert_eq!(deleted.text, "[deleted]");
     // The mark advances past them: the newest of the two is the removed post.
-    let mark = marks_of(&outcome).0.get("r/rust:new").cloned().unwrap();
+    let mark = marks_of(&outcome).mark("r/rust:new").cloned().unwrap();
     assert_eq!(mark.n, "t3_1kx9ca1");
 }
 
@@ -522,7 +522,7 @@ fn an_empty_page_yields_no_items_and_writes_no_mark() {
     let http = ScriptedHttp::new(vec![Ok(fixture("listing_empty"))]);
     let outcome = first_poll(&http);
     assert!(outcome.items.is_empty());
-    assert!(marks_of(&outcome).0.get("r/rust:new").is_none());
+    assert!(marks_of(&outcome).mark("r/rust:new").is_none());
 }
 
 #[test]
@@ -582,8 +582,7 @@ fn two_feed_settings() -> Settings {
 
 fn mark(cursor: &cursor::Cursor, key: &str) -> cursor::Mark {
     cursor
-        .0
-        .get(key)
+        .mark(key)
         .unwrap_or_else(|| panic!("no mark for {key}"))
         .clone()
 }
@@ -732,7 +731,7 @@ fn an_all_empty_first_poll_still_returns_a_cursor_not_none() {
 fn marks_for_feeds_no_longer_configured_are_dropped() {
     let mut stored = cursor::Cursor::default();
     for key in ["r/rust:new", "r/removed_sub:new"] {
-        stored.0.insert(
+        stored.set_mark(
             key.to_string(),
             cursor::Mark {
                 t: 1_700_000_300,
@@ -1099,4 +1098,463 @@ fn every_request_is_official_authenticated_and_carries_the_enforced_user_agent()
     let requests = http.inner.requests();
     let agent = reddit_source::http::header(&requests[0].headers, "user-agent").unwrap();
     assert!(agent.starts_with("filimon:my-app:"), "{agent}");
+
+    // The logged-in feeds (plan 07-07): `home` and `saved`, first poll then a
+    // later poll with the returned cursor, plus the failure statuses.
+    for (feed_line, page_name) in [
+        ("feed = \"home\"", "home_page"),
+        ("feed = \"saved\"\nusername = \"sweepuser\"", "saved_page"),
+    ] {
+        let user = settings(&format!(
+            "{feed_line}\nuser_agent_contact = \"u/sweeper\"\n"
+        ));
+        let http = StrictHttp::new(
+            vec![Ok(fixture(page_name)), Ok(fixture(page_name))],
+            "reddit",
+            "sweeper",
+        );
+        let first = poll(&http, &user, None, Some(TOKEN)).expect("first user-feed poll");
+        poll(&http, &user, first.next_cursor.as_deref(), Some(TOKEN))
+            .expect("later user-feed poll");
+        assert_eq!(http.inner.requests().len(), 2, "{page_name}");
+
+        for response in [
+            fixture("rate_limited_429"),
+            fixture("unauthorized_401"),
+            status_response(403, &[], ""),
+            status_response(404, &[], ""),
+            status_response(503, &[], ""),
+        ] {
+            let http = StrictHttp::new(vec![Ok(response)], "reddit", "sweeper");
+            assert!(poll(&http, &user, None, Some(TOKEN)).is_err());
+            assert_eq!(http.inner.requests().len(), 1);
+        }
+    }
+}
+
+// ── Plan 07-07 Task 2: private feed content never reaches a log or an error ──
+
+/// Every title, text, author and comment body of the two user-feed fixtures,
+/// read from the fixture JSON itself so the test cannot drift from the data.
+fn private_sentinels() -> Vec<String> {
+    let mut sentinels = Vec::new();
+    for name in ["home_page", "saved_page"] {
+        for child in fixture_children(name) {
+            for key in ["title", "selftext", "author", "body"] {
+                if let Some(text) = child["data"][key].as_str() {
+                    if !text.is_empty() {
+                        sentinels.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    sentinels
+}
+
+/// The texts one poll result can put on a log line or a status field.
+fn visible_texts(result: &Result<PollOutcome, PollError>, texts: &mut Vec<String>) {
+    match result {
+        Ok(outcome) => texts.extend(outcome.warnings.iter().cloned()),
+        Err(error) => {
+            texts.push(format!("{error:?}"));
+            if let PollError::Config(text)
+            | PollError::Transient(text)
+            | PollError::Fatal(text) = error
+            {
+                texts.push(text.clone());
+            }
+        }
+    }
+}
+
+#[test]
+fn user_feed_logs_and_errors_carry_no_private_content() {
+    let sentinels = private_sentinels();
+    // Two fixtures: 4 + 5 children, each with a title or a body at least.
+    assert!(sentinels.len() >= 12, "{} sentinels", sentinels.len());
+    assert!(sentinels.iter().all(|text| text.len() >= 8));
+
+    let mut texts: Vec<String> = Vec::new();
+    for feed in [home_settings(), saved_settings()] {
+        let bodies = [fixture("home_page").body, fixture("saved_page").body];
+        for body in &bodies {
+            // Success: a skipped comment, a normal page.
+            let http = ScriptedHttp::new(vec![Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: body.clone(),
+            })]);
+            let result = run(&http, &feed, None);
+            assert!(result.is_ok());
+            visible_texts(&result, &mut texts);
+
+            // Failure statuses that carry the private body.
+            for status in [401u16, 403, 404, 429, 500, 503] {
+                let http = ScriptedHttp::new(vec![Ok(HttpResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: body.clone(),
+                })]);
+                let result = run(&http, &feed, None);
+                assert!(result.is_err());
+                visible_texts(&result, &mut texts);
+            }
+        }
+
+        // An empty page, an undecodable stored cursor, a body that is not a
+        // listing, and transport errors that quote the request url.
+        for response in [
+            Ok(listing_of(Vec::new())),
+            Ok(fixture("malformed")),
+            Ok(text_response(r#"{"message":"private titles are not here"}"#)),
+            Err(HttpError::Transport(format!(
+                "https://oauth.reddit.com/user/{SAVED_USER}/saved failed"
+            ))),
+            Err(HttpError::Denied(format!("denied for {SAVED_USER}"))),
+        ] {
+            let http = ScriptedHttp::new(vec![response]);
+            visible_texts(&run(&http, &feed, None), &mut texts);
+        }
+        let http = ScriptedHttp::new(vec![Ok(fixture("saved_page"))]);
+        let result = run(&http, &feed, Some(b"not json"));
+        visible_texts(&result, &mut texts);
+    }
+    assert!(texts.len() >= 40, "only {} texts were collected", texts.len());
+
+    for text in &texts {
+        for sentinel in &sentinels {
+            assert!(!text.contains(sentinel.as_str()), "private text leaked: {text}");
+        }
+        assert!(!text.contains(SAVED_USER), "the username leaked: {text}");
+        assert!(!text.contains(TOKEN), "the token leaked: {text}");
+    }
+}
+
+// ── Plan 07-07 Task 1: the logged-in feeds, home and saved (D-05, D-19) ──────
+
+fn home_settings() -> Settings {
+    settings("feed = \"home\"\nuser_agent_contact = \"u/tester\"\n")
+}
+
+const SAVED_USER: &str = "snowfall77";
+
+fn saved_settings() -> Settings {
+    settings(&format!(
+        "feed = \"saved\"\nusername = \"{SAVED_USER}\"\nuser_agent_contact = \"u/tester\"\n"
+    ))
+}
+
+/// The children of a fixture listing, kinds included, in listing order.
+fn fixture_children(name: &str) -> Vec<Value> {
+    let root: Value = serde_json::from_slice(&fixture(name).body).unwrap();
+    root["data"]["children"].as_array().unwrap().clone()
+}
+
+/// A 200 listing response around raw children (any kind).
+fn listing_of(children: Vec<Value>) -> HttpResponse {
+    text_response(
+        &serde_json::json!({"kind": "Listing", "data": {"children": children}}).to_string(),
+    )
+}
+
+/// A saved `t3` child.
+fn saved_t3(name: &str, created_utc: f64) -> Value {
+    serde_json::json!({"kind": "t3", "data": post_data(name, created_utc)})
+}
+
+/// A saved `t1` comment child.
+fn saved_t1(name: &str) -> Value {
+    serde_json::json!({"kind": "t1", "data": {
+        "name": name,
+        "body": "a saved comment body",
+        "link_id": "t3_zzz",
+        "author": "commenter",
+        "created_utc": 1_699_999_000.0,
+    }})
+}
+
+fn child_name(child: &Value) -> String {
+    child["data"]["name"].as_str().unwrap().to_string()
+}
+
+fn stored_json(outcome: &PollOutcome) -> Value {
+    serde_json::from_slice(outcome.next_cursor.as_deref().expect("a cursor")).unwrap()
+}
+
+/// The seen fullnames the cursor stores for one feed key.
+fn seen_of(outcome: &PollOutcome, key: &str) -> Vec<String> {
+    stored_json(outcome)[key]["s"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no seen set for {key}: {}", stored_json(outcome)))
+        .iter()
+        .map(|name| name.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Poll `saved` once with the given children, optionally from a stored cursor.
+fn saved_poll(
+    children: Vec<Value>,
+    cursor: Option<&[u8]>,
+) -> (ScriptedHttp, Result<PollOutcome, PollError>) {
+    let http = ScriptedHttp::new(vec![Ok(listing_of(children))]);
+    let result = run(&http, &saved_settings(), cursor);
+    (http, result)
+}
+
+#[test]
+fn home_feed_requests_new_with_the_bearer_token() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("home_page"))]);
+    let outcome = run(&http, &home_settings(), None).expect("home poll");
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url,
+        "https://oauth.reddit.com/new?limit=25&raw_json=1"
+    );
+    let header = |name: &str| reddit_source::http::header(&requests[0].headers, name);
+    assert_eq!(header("authorization"), Some("bearer TOKEN-1"));
+    let json = stored_json(&outcome);
+    let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["home"]);
+}
+
+#[test]
+fn home_feed_uses_the_created_utc_mark_and_skips_stickied() {
+    let children = fixture_children("home_page");
+    assert_eq!(children.len(), 4);
+    let http = ScriptedHttp::new(vec![Ok(fixture("home_page"))]);
+    let first = run(&http, &home_settings(), None).expect("first poll");
+    assert_eq!(first.items.len(), children.len() - 1, "one stickied post");
+
+    let top = children
+        .iter()
+        .filter(|c| c["data"]["stickied"] == false)
+        .map(|c| c["data"]["created_utc"].as_f64().unwrap())
+        .fold(0.0, f64::max);
+    let http = ScriptedHttp::new(vec![Ok(listing_of(vec![
+        saved_t3("t3_hnew", top + 60.0),
+        saved_t3("t3_hsame", top),
+        saved_t3("t3_hold", top - 500.0),
+    ]))]);
+    let second = run(&http, &home_settings(), first.next_cursor.as_deref()).expect("second poll");
+    assert_eq!(ids(&second), ["t3_hnew"]);
+    assert_eq!(stored_json(&second)["home"]["t"], (top + 60.0) as i64);
+    assert_eq!(
+        http.requests()[0].url,
+        "https://oauth.reddit.com/new?limit=100&raw_json=1"
+    );
+}
+
+#[test]
+fn saved_feed_requests_the_users_saved_path_percent_encoded() {
+    let (http, result) = saved_poll(fixture_children("saved_page"), None);
+    let outcome = result.expect("saved poll");
+    assert_eq!(
+        http.requests()[0].url,
+        format!("https://oauth.reddit.com/user/{SAVED_USER}/saved?limit=25&raw_json=1")
+    );
+    let json = stored_json(&outcome);
+    let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["saved"]);
+
+    // A prefixed name with `_` and `-` goes into the path unencoded.
+    let prefixed = settings(
+        "feed = \"saved\"\nusername = \"u/Snow_fall-77\"\nuser_agent_contact = \"u/tester\"\n",
+    );
+    let http = ScriptedHttp::new(vec![Ok(listing_of(Vec::new()))]);
+    run(&http, &prefixed, None).expect("poll");
+    assert_eq!(
+        http.requests()[0].url,
+        "https://oauth.reddit.com/user/Snow_fall-77/saved?limit=25&raw_json=1"
+    );
+}
+
+#[test]
+fn saved_first_poll_emits_the_posts_and_stores_the_top_25_fullnames() {
+    let children = fixture_children("saved_page");
+    let (_, result) = saved_poll(children.clone(), None);
+    let outcome = result.expect("saved poll");
+    let t3_names: Vec<String> = children
+        .iter()
+        .filter(|c| c["kind"] == "t3")
+        .map(child_name)
+        .collect();
+    assert_eq!(t3_names.len(), 4);
+    let mut emitted: Vec<String> = ids(&outcome).iter().map(|id| id.to_string()).collect();
+    emitted.sort();
+    let mut expected = t3_names.clone();
+    expected.sort();
+    assert_eq!(emitted, expected, "the t3 posts only");
+    assert!(
+        outcome.warnings.iter().any(|w| w.contains('1')),
+        "the skipped comment is counted: {:?}",
+        outcome.warnings
+    );
+    let all: Vec<String> = children.iter().map(child_name).collect();
+    assert_eq!(seen_of(&outcome, "saved"), all, "comments included");
+    assert_eq!(all.len(), 5);
+}
+
+#[test]
+fn saved_later_poll_emits_entries_until_the_first_already_seen_fullname() {
+    let base = fixture_children("saved_page");
+    let (_, first) = saved_poll(base.clone(), None);
+    let first = first.expect("first poll");
+
+    let mut next_page = vec![
+        saved_t3("t3_snew1", 1_700_001_000.0),
+        saved_t3("t3_snew2", 1_700_001_100.0),
+    ];
+    next_page.extend(base.clone());
+    let (http, second) = saved_poll(next_page, first.next_cursor.as_deref());
+    let second = second.expect("second poll");
+    assert_eq!(ids(&second), ["t3_snew2", "t3_snew1"]);
+    let mut expected = vec!["t3_snew1".to_string(), "t3_snew2".to_string()];
+    expected.extend(base.iter().map(child_name));
+    assert_eq!(seen_of(&second, "saved"), expected);
+    assert_eq!(
+        http.requests()[0].url,
+        format!("https://oauth.reddit.com/user/{SAVED_USER}/saved?limit=100&raw_json=1")
+    );
+}
+
+#[test]
+fn saved_stops_at_the_first_seen_fullname_even_for_a_comment_entry() {
+    let (_, first) = saved_poll(
+        vec![saved_t3("t3_sa", 1_700_000_100.0), saved_t1("t1_sc")],
+        None,
+    );
+    let first = first.expect("first poll");
+    let (_, second) = saved_poll(
+        vec![
+            saved_t3("t3_sn", 1_700_000_900.0),
+            saved_t1("t1_sc"),
+            saved_t3("t3_below", 1_700_000_800.0),
+        ],
+        first.next_cursor.as_deref(),
+    );
+    let second = second.expect("second poll");
+    assert_eq!(ids(&second), ["t3_sn"], "nothing below the seen comment");
+}
+
+#[test]
+fn an_old_post_saved_later_is_emitted_even_though_created_utc_is_old() {
+    let (_, first) = saved_poll(vec![saved_t3("t3_sa", 1_700_000_000.0)], None);
+    let first = first.expect("first poll");
+    let (_, second) = saved_poll(
+        vec![
+            saved_t3("t3_old", 1_000_000_000.0),
+            saved_t3("t3_sa", 1_700_000_000.0),
+        ],
+        first.next_cursor.as_deref(),
+    );
+    let second = second.expect("second poll");
+    assert_eq!(ids(&second), ["t3_old"]);
+}
+
+#[test]
+fn saved_with_nothing_new_keeps_the_seen_set_and_emits_nothing() {
+    let page = fixture_children("saved_page");
+    let (_, first) = saved_poll(page.clone(), None);
+    let first = first.expect("first poll");
+    let (_, second) = saved_poll(page, first.next_cursor.as_deref());
+    let second = second.expect("second poll");
+    assert!(second.items.is_empty(), "{:?}", ids(&second));
+    assert_eq!(second.next_cursor, first.next_cursor);
+}
+
+#[test]
+fn an_empty_saved_page_emits_nothing_and_stores_an_empty_seen_set() {
+    let (_, result) = saved_poll(Vec::new(), None);
+    let outcome = result.expect("saved poll");
+    assert!(outcome.items.is_empty());
+    assert_eq!(
+        outcome.next_cursor.as_deref(),
+        Some(&br#"{"saved":{"s":[]}}"#[..])
+    );
+    // The empty set is state: a post saved afterwards is emitted.
+    let (_, later) = saved_poll(
+        vec![saved_t3("t3_first", 1_600_000_000.0)],
+        outcome.next_cursor.as_deref(),
+    );
+    assert_eq!(ids(&later.expect("later poll")), ["t3_first"]);
+}
+
+#[test]
+fn saved_output_is_oldest_saved_first() {
+    let (_, result) = saved_poll(
+        vec![
+            saved_t3("t3_third", 1_500_000_000.0),
+            saved_t3("t3_second", 1_700_000_000.0),
+            saved_t3("t3_first", 1_600_000_000.0),
+        ],
+        None,
+    );
+    assert_eq!(
+        ids(&result.expect("saved poll")),
+        ["t3_first", "t3_second", "t3_third"]
+    );
+}
+
+#[test]
+fn the_seen_set_is_capped_at_25_fullnames_and_the_cursor_fits() {
+    let children: Vec<Value> = (0..100)
+        .map(|i| saved_t3(&format!("t3_s{i:03}"), 1_700_000_000.0 + f64::from(i)))
+        .collect();
+    let (_, result) = saved_poll(children.clone(), None);
+    let outcome = result.expect("saved poll");
+    let seen = seen_of(&outcome, "saved");
+    assert_eq!(seen.len(), 25);
+    let expected: Vec<String> = children.iter().take(25).map(child_name).collect();
+    assert_eq!(seen, expected, "the top of the page, in listing order");
+    assert!(outcome.next_cursor.unwrap().len() <= MAX_CURSOR_BYTES);
+}
+
+#[test]
+fn time_mark_cursor_json_layout_is_stable() {
+    let http = ScriptedHttp::new(vec![Ok(page(vec![post_data("t3_a", 1_700_000_100.0)]))]);
+    let outcome = first_poll(&http);
+    assert_eq!(
+        std::str::from_utf8(outcome.next_cursor.as_deref().unwrap()).unwrap(),
+        r#"{"r/rust:new":{"t":1700000100,"n":"t3_a"}}"#
+    );
+    let http = ScriptedHttp::new(vec![Ok(page(vec![post_data("t3_h", 1_700_000_200.0)]))]);
+    let outcome = run(&http, &home_settings(), None).expect("home poll");
+    assert_eq!(
+        std::str::from_utf8(outcome.next_cursor.as_deref().unwrap()).unwrap(),
+        r#"{"home":{"t":1700000200,"n":"t3_h"}}"#
+    );
+}
+
+#[test]
+fn user_feed_without_a_token_is_auth_required_before_any_request() {
+    for feed in [home_settings(), saved_settings()] {
+        for token in [None, Some("")] {
+            let http = ScriptedHttp::new(vec![Ok(fixture("home_page"))]);
+            let result = poll(&http, &feed, None, token);
+            assert_eq!(result.unwrap_err(), PollError::AuthRequired);
+            assert!(http.requests().is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_stored_value_of_the_wrong_shape_is_a_first_poll_of_that_feed() {
+    // A seen set stored under a key the settings now read as a time mark, and
+    // the other way round: both are a first poll, and the stale value never
+    // survives into the new cursor.
+    let seen_cursor = br#"{"home":{"s":["t3_x"]}}"#;
+    let http = ScriptedHttp::new(vec![Ok(fixture("home_page"))]);
+    let outcome = run(&http, &home_settings(), Some(seen_cursor)).expect("home poll");
+    assert_eq!(outcome.items.len(), 3, "a first poll emits the page");
+    assert!(stored_json(&outcome)["home"]["t"].is_i64());
+    assert!(outcome.warnings.iter().all(|w| !w.contains("decode")));
+
+    let time_cursor = br#"{"saved":{"t":1700000000,"n":"t3_x"}}"#;
+    let (http, result) = saved_poll(fixture_children("saved_page"), Some(time_cursor));
+    let outcome = result.expect("saved poll");
+    assert_eq!(outcome.items.len(), 4, "a first poll emits every t3 entry");
+    assert!(stored_json(&outcome)["saved"]["s"].is_array());
+    assert!(http.requests()[0].url.contains("limit=25"));
 }

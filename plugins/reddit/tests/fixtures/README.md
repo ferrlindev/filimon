@@ -31,6 +31,8 @@ research assumptions A1 to A4 stay unconfirmed.
 | `rate_limited_429.json` + `rate_limited_429.meta.json` | `synthetic`: a 429 `Too Many Requests` answer whose meta carries `x-ratelimit-used`, `x-ratelimit-remaining` `0.0` and `x-ratelimit-reset` `37`; hand-authored in plan 07-06 from the documented header names |
 | `unauthorized_401.json` + `unauthorized_401.meta.json` | `synthetic`: a 401 `Unauthorized` answer (`{"message": "Unauthorized", "error": 401}`); hand-authored in plan 07-06 |
 | `malformed.json` | `synthetic`: a listing document cut off mid-string, with a recognisable sentinel word in its title, to prove an unreadable body is never echoed; hand-authored in plan 07-06 |
+| `home_page.json` | `synthetic`: `GET /new` on the logged-in home feed: four `t3` posts from different subreddits (`woodworking`, `astrophotography`, `sourdough`), newest first, one of them `stickied`; hand-authored in plan 07-07. Flagged assumption A1: the real endpoint and shape are confirmed at the plan 07-12 capture |
+| `saved_page.json` | `synthetic`: `GET /user/<name>/saved`: five children in saved order (most recently saved first): four `t3` posts with very different `created_utc` values and one `t1` comment child with its own `name`, `body` and `link_id`; hand-authored in plan 07-07. Flagged assumption A2: the real path, the `history` scope and the mixed `t3` and `t1` kinds are confirmed at the plan 07-12 capture |
 
 All of these are synthetic (see above); the equal-timestamp, unordered and
 tie pages are built inline in `tests/replay.rs` so their timestamps are explicit.

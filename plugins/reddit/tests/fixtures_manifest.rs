@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 /// (D-18 case, fixture file stem). The `quotaExceeded` case belongs to YouTube.
-const REQUIRED: [(&str, &str); 7] = [
+const REQUIRED: [(&str, &str); 9] = [
     ("normal page and self versus link post", "listing_new"),
     ("empty page", "listing_empty"),
     ("deleted or removed post", "listing_removed"),
@@ -15,6 +15,8 @@ const REQUIRED: [(&str, &str); 7] = [
     ("401 auth failure", "unauthorized_401"),
     ("malformed JSON", "malformed"),
     ("hot listing with a stickied post", "listing_hot"),
+    ("home feed page (user feed, stickied post)", "home_page"),
+    ("saved page (user feed, t3 posts and a t1 comment)", "saved_page"),
 ];
 
 fn fixtures_dir() -> PathBuf {

@@ -1,0 +1,132 @@
+{
+  "kind": "Listing",
+  "data": {
+    "after": "t3_1sv0e05",
+    "dist": 5,
+    "modhash": null,
+    "geo_filter": "",
+    "before": null,
+    "children": [
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "cooking",
+          "selftext": "A decade-old thread on cast iron seasoning that I keep coming back to.",
+          "author_fullname": "t2_syntheticsaved1",
+          "saved": true,
+          "title": "Seasoning cast iron with flaxseed oil, ten years on",
+          "name": "t3_1sv0a01",
+          "id": "1sv0a01",
+          "author": "skillet_historian",
+          "score": 4096,
+          "num_comments": 288,
+          "created_utc": 1500000000.0,
+          "created": 1500000000.0,
+          "permalink": "/r/cooking/comments/1sv0a01/seasoning_cast_iron_with_flaxseed_oil_ten_years/",
+          "url": "https://www.reddit.com/r/cooking/comments/1sv0a01/seasoning_cast_iron_with_flaxseed_oil_ten_years/",
+          "is_self": true,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/cooking"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "learnprogramming",
+          "selftext": "",
+          "author_fullname": "t2_syntheticsaved2",
+          "saved": true,
+          "title": "A free visual guide to how hash maps resize",
+          "name": "t3_1sv0b02",
+          "id": "1sv0b02",
+          "author": "bucket_brigade",
+          "score": 655,
+          "num_comments": 31,
+          "created_utc": 1700000400.0,
+          "created": 1700000400.0,
+          "permalink": "/r/learnprogramming/comments/1sv0b02/a_free_visual_guide_to_how_hash_maps_resize/",
+          "url": "https://guides.example.org/hash-map-resize",
+          "is_self": false,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/learnprogramming"
+        }
+      },
+      {
+        "kind": "t1",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "learnprogramming",
+          "link_id": "t3_1sv0z99",
+          "link_title": "Which language should a total beginner pick",
+          "body": "Pick the language whose error messages you can actually read, then stay with it for a year.",
+          "author_fullname": "t2_syntheticsaved3",
+          "saved": true,
+          "author": "patient_mentor_pat",
+          "name": "t1_1sv0c03",
+          "id": "1sv0c03",
+          "score": 233,
+          "created_utc": 1699999900.0,
+          "created": 1699999900.0,
+          "permalink": "/r/learnprogramming/comments/1sv0z99/which_language_should_a_total_beginner_pick/1sv0c03/",
+          "subreddit_name_prefixed": "r/learnprogramming"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "gardening",
+          "selftext": "Notes on starting tomato seeds indoors, with a week-by-week light schedule.",
+          "author_fullname": "t2_syntheticsaved4",
+          "saved": true,
+          "title": "Starting tomatoes indoors, a week-by-week light schedule",
+          "name": "t3_1sv0d04",
+          "id": "1sv0d04",
+          "author": "greenhouse_gus",
+          "score": 98,
+          "num_comments": 12,
+          "created_utc": 1690000000.0,
+          "created": 1690000000.0,
+          "permalink": "/r/gardening/comments/1sv0d04/starting_tomatoes_indoors_a_weekbyweek_light/",
+          "url": "https://www.reddit.com/r/gardening/comments/1sv0d04/starting_tomatoes_indoors_a_weekbyweek_light/",
+          "is_self": true,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/gardening"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "approved_at_utc": null,
+          "subreddit": "cycling",
+          "selftext": "",
+          "author_fullname": "t2_syntheticsaved5",
+          "saved": true,
+          "title": "Checklist for a first self-supported bikepacking weekend",
+          "name": "t3_1sv0e05",
+          "id": "1sv0e05",
+          "author": "gravel_gwen",
+          "score": 1520,
+          "num_comments": 77,
+          "created_utc": 1700000100.0,
+          "created": 1700000100.0,
+          "permalink": "/r/cycling/comments/1sv0e05/checklist_for_a_first_selfsupported_bikepacking/",
+          "url": "https://blog.example.org/bikepacking-checklist",
+          "is_self": false,
+          "stickied": false,
+          "over_18": false,
+          "removed_by_category": null,
+          "subreddit_name_prefixed": "r/cycling"
+        }
+      }
+    ]
+  }
+}
