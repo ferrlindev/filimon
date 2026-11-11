@@ -7,6 +7,11 @@ use serde::Deserialize;
 
 /// Page size of the first poll of a feed (D-10).
 pub const DEFAULT_FIRST_POLL_LIMIT: u32 = 25;
+/// Page size of a later poll of a feed: Reddit's page maximum.
+pub const LATER_POLL_LIMIT: u32 = 100;
+/// Mirror of the host cap `MAX_ITEMS_PER_POLL` in `src/plugins/host/map.rs`:
+/// the host keeps the first 1000 items of a poll and silently drops the rest.
+pub const MAX_ITEMS_PER_POLL: usize = 1000;
 
 /// The raw `[settings]` table. Unknown keys are rejected.
 #[derive(Deserialize)]
@@ -69,6 +74,11 @@ impl Settings {
     pub fn first_page_limit(&self) -> u32 {
         DEFAULT_FIRST_POLL_LIMIT
     }
+
+    /// Page size for a feed that already has a mark.
+    pub fn later_page_limit(&self) -> u32 {
+        LATER_POLL_LIMIT
+    }
 }
 
 /// Build `filimon:<app_id>:<crate version> (by /u/<name>)`.
@@ -96,4 +106,223 @@ pub fn user_agent(contact: &str, app_id: &str) -> Result<String, String> {
         "filimon:{app_id}:{} (by /u/{name})",
         env!("CARGO_PKG_VERSION")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::MAX_FEEDS;
+
+    const BASE: &str = "subreddits = [\"rust\"]\nuser_agent_contact = \"u/tester\"\n";
+
+    fn parse(text: &str) -> Result<Settings, String> {
+        Settings::parse(text)
+    }
+
+    fn with_contact(contact: &str) -> Result<Settings, String> {
+        parse(&format!(
+            "subreddits = [\"rust\"]\nuser_agent_contact = \"{contact}\"\n"
+        ))
+    }
+
+    fn keys(settings: &Settings) -> Vec<String> {
+        settings.feeds().into_iter().map(|feed| feed.key).collect()
+    }
+
+    #[test]
+    fn missing_user_agent_contact_is_a_config_error_naming_the_field() {
+        let err = parse("subreddits = [\"rust\"]\n").unwrap_err();
+        assert!(err.contains("user_agent_contact"), "{err}");
+    }
+
+    #[test]
+    fn user_agent_contact_accepts_three_spellings_and_enforces_3_to_20_chars() {
+        let a = with_contact("u/abc").unwrap();
+        let b = with_contact("/u/abc").unwrap();
+        let c = with_contact("abc").unwrap();
+        assert_eq!(a.user_agent(), b.user_agent());
+        assert_eq!(b.user_agent(), c.user_agent());
+        assert!(with_contact("ab").is_err());
+        assert!(with_contact("u/ab").is_err());
+        assert!(with_contact(&"a".repeat(3)).is_ok());
+        assert!(with_contact(&"a".repeat(20)).is_ok());
+        assert!(with_contact(&"a".repeat(21)).is_err());
+        assert!(with_contact("a_b-c9").is_ok());
+        assert!(with_contact("ab.c").is_err());
+        assert!(with_contact("ab/c").is_err());
+        assert!(with_contact("").is_err());
+    }
+
+    #[test]
+    fn user_agent_contact_with_control_or_separator_characters_is_rejected() {
+        // `\\r`, `\\n` and `\\t` are TOML escapes, so the parsed value holds the
+        // real control character.
+        for bad in ["abc\\rdef", "abc\\ndef", "abc def", "abc:def", "abc\\tdef"] {
+            let err = with_contact(bad).unwrap_err();
+            assert!(err.contains("user_agent_contact"), "{err}");
+            assert!(!err.contains("def"), "echoed the value: {err}");
+        }
+    }
+
+    #[test]
+    fn user_agent_has_the_documented_format_and_default_app_id() {
+        let settings = parse(BASE).unwrap();
+        assert_eq!(
+            settings.user_agent(),
+            format!("filimon:reddit:{} (by /u/tester)", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn app_id_override_replaces_only_the_app_id_and_is_validated() {
+        let settings = parse(&format!("{BASE}app_id = \"mybot\"\n")).unwrap();
+        assert_eq!(
+            settings.user_agent(),
+            format!("filimon:mybot:{} (by /u/tester)", env!("CARGO_PKG_VERSION"))
+        );
+        let too_long = "a".repeat(33);
+        for bad in ["", "My Bot", "my:bot", "MYBOT", too_long.as_str()] {
+            let err = parse(&format!("{BASE}app_id = \"{bad}\"\n")).unwrap_err();
+            assert!(err.contains("app_id"), "{err}");
+        }
+        assert!(parse(&format!("{BASE}app_id = \"{}\"\n", "a".repeat(32))).is_ok());
+    }
+
+    #[test]
+    fn listings_default_to_new_accept_new_and_hot_and_reject_others() {
+        assert_eq!(keys(&parse(BASE).unwrap()), ["r/rust:new"]);
+        let both = parse(&format!("{BASE}listings = [\"new\", \"hot\"]\n")).unwrap();
+        assert_eq!(keys(&both), ["r/rust:new", "r/rust:hot"]);
+        for bad in ["listings = [\"top\"]", "listings = []", "listings = \"new\""] {
+            let err = parse(&format!("{BASE}{bad}\n")).unwrap_err();
+            assert!(err.contains("listings"), "{err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_listings_and_subreddits_are_collapsed_keeping_order() {
+        let settings = parse(
+            "subreddits = [\"rust\", \"golang\", \"Rust\", \"rust\"]\n\
+             listings = [\"new\", \"hot\", \"new\"]\n\
+             user_agent_contact = \"u/tester\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&settings),
+            ["r/rust:new", "r/rust:hot", "r/golang:new", "r/golang:hot"]
+        );
+    }
+
+    #[test]
+    fn subreddits_must_be_present_and_valid_names() {
+        let contact = "user_agent_contact = \"u/tester\"\n";
+        let too_long = format!("subreddits = [\"{}\"]\n{contact}", "a".repeat(22));
+        let cases = [
+            contact.to_string(),
+            format!("subreddits = []\n{contact}"),
+            format!("subreddits = [\"bad-name\"]\n{contact}"),
+            format!("subreddits = [\"\"]\n{contact}"),
+            format!("subreddits = [\"r/rust\"]\n{contact}"),
+            format!("subreddits = [\"has space\"]\n{contact}"),
+            format!("subreddits = \"rust\"\n{contact}"),
+            too_long,
+        ];
+        for text in cases {
+            let err = parse(&text).unwrap_err();
+            assert!(err.contains("subreddits"), "{err}");
+        }
+        let longest = format!("subreddits = [\"{}\"]\n{contact}", "a".repeat(21));
+        assert!(parse(&longest).is_ok());
+        assert!(parse(&format!("subreddits = [\"_ok_9\"]\n{contact}")).is_ok());
+    }
+
+    #[test]
+    fn first_poll_limit_accepts_1_to_100_and_defaults_to_25() {
+        assert_eq!(parse(BASE).unwrap().first_page_limit(), 25);
+        for good in [1u32, 100] {
+            let settings = parse(&format!("{BASE}first_poll_limit = {good}\n")).unwrap();
+            assert_eq!(settings.first_page_limit(), good);
+        }
+        for bad in ["0", "101", "-1", "\"10\"", "2.5"] {
+            let err = parse(&format!("{BASE}first_poll_limit = {bad}\n")).unwrap_err();
+            assert!(err.contains("first_poll_limit"), "{err}");
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_naming_the_key() {
+        let err = parse(&format!("{BASE}feeed = \"home\"\n")).unwrap_err();
+        assert!(err.contains("feeed"), "{err}");
+    }
+
+    fn many(count: usize, extra: &str) -> String {
+        let names: Vec<String> = (0..count).map(|i| format!("\"sub{i}\"")).collect();
+        format!(
+            "subreddits = [{}]\nuser_agent_contact = \"u/tester\"\n{extra}",
+            names.join(", ")
+        )
+    }
+
+    #[test]
+    fn feed_count_over_the_cursor_capacity_is_rejected_naming_subreddits() {
+        let ok = parse(&many(MAX_FEEDS, "")).unwrap();
+        assert_eq!(ok.feeds().len(), MAX_FEEDS);
+        let err = parse(&many(MAX_FEEDS + 1, "")).unwrap_err();
+        assert!(err.contains("subreddits"), "{err}");
+
+        // The cap counts feeds (subreddits x listings), not subreddits.
+        let err = parse(&many(MAX_FEEDS / 2 + 1, "listings = [\"new\", \"hot\"]\n")).unwrap_err();
+        assert!(err.contains("subreddits"), "{err}");
+    }
+
+    #[test]
+    fn page_limit_shrinks_so_one_poll_never_exceeds_1000_items() {
+        let one = parse(&many(1, "")).unwrap();
+        assert_eq!(one.first_page_limit(), DEFAULT_FIRST_POLL_LIMIT);
+        assert_eq!(one.later_page_limit(), LATER_POLL_LIMIT);
+        assert_eq!(
+            parse(&many(1, "first_poll_limit = 100\n"))
+                .unwrap()
+                .first_page_limit(),
+            100
+        );
+
+        let twenty = parse(&many(20, "first_poll_limit = 100\n")).unwrap();
+        assert_eq!(twenty.first_page_limit(), 50);
+        assert_eq!(twenty.later_page_limit(), 50);
+
+        let most = parse(&many(MAX_FEEDS, "first_poll_limit = 100\n")).unwrap();
+        for settings in [&one, &twenty, &most] {
+            let feeds = settings.feeds().len() as u32;
+            assert!(settings.first_page_limit() >= 1 && settings.later_page_limit() >= 1);
+            assert!(feeds * settings.first_page_limit() <= MAX_ITEMS_PER_POLL as u32);
+            assert!(feeds * settings.later_page_limit() <= MAX_ITEMS_PER_POLL as u32);
+        }
+        assert_eq!(most.later_page_limit(), 1000 / MAX_FEEDS as u32);
+    }
+
+    #[test]
+    fn config_errors_never_echo_the_rejected_value() {
+        let contact = "user_agent_contact = \"u/tester\"\n";
+        let sub = "subreddits = [\"rust\"]\n";
+        let cases = [
+            format!("subreddits = [\"ZZQ bad ZZQ\"]\n{contact}"),
+            format!("subreddits = \"ZZQ\"\n{contact}"),
+            format!("subreddits = [1]\n{contact}"),
+            format!("{sub}{contact}listings = [\"ZZQ\"]\n"),
+            format!("{sub}{contact}listings = \"ZZQ\"\n"),
+            format!("{sub}user_agent_contact = \"ZZQ ZZQ\"\n"),
+            format!("{sub}user_agent_contact = 7\n"),
+            format!("{sub}{contact}app_id = \"ZZQ ZZQ\"\n"),
+            format!("{sub}{contact}app_id = 7\n"),
+            format!("{sub}{contact}first_poll_limit = \"ZZQ\"\n"),
+            format!("{sub}{contact}first_poll_limit = 99999\n"),
+        ];
+        for text in cases {
+            let err = parse(&text).unwrap_err();
+            assert!(!err.contains("ZZQ"), "echoed the value: {err}");
+            assert!(!err.contains("99999"), "echoed the value: {err}");
+            assert!(err.starts_with("settings"), "{err}");
+        }
+    }
 }

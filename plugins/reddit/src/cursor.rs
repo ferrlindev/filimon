@@ -11,6 +11,12 @@ use std::collections::BTreeMap;
 /// makes the host disable the plugin.
 pub const MAX_CURSOR_BYTES: usize = 4096;
 
+/// Bytes of the longest possible cursor entry plus its comma.
+pub const WORST_ENTRY_BYTES: usize = 1;
+
+/// Most feeds whose worst-case cursor still fits the host cap.
+pub const MAX_FEEDS: usize = 1;
+
 /// The newest post seen in one feed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mark {
@@ -76,5 +82,35 @@ mod tests {
     fn an_undecodable_cursor_is_flagged_and_treated_as_empty() {
         assert_eq!(decode(Some(b"\x00garbage")), (Cursor::default(), true));
         assert_eq!(decode(None), (Cursor::default(), false));
+    }
+
+    /// The longest possible entry: a 21-character subreddit, a 3-character
+    /// listing, a 10-digit time and a 13-character fullname.
+    fn worst_cursor(count: usize) -> Cursor {
+        let mut cursor = Cursor::default();
+        for i in 0..count {
+            cursor.0.insert(
+                format!("r/{i:0>21}:hot"),
+                Mark {
+                    t: 9_999_999_999,
+                    n: "t3_abcdefghij".to_string(),
+                },
+            );
+        }
+        cursor
+    }
+
+    #[test]
+    fn cursor_size_at_the_configured_cap_fits_the_host_limit() {
+        // One entry plus its comma, measured rather than assumed.
+        let one = encode(&worst_cursor(1)).unwrap().len();
+        assert_eq!(WORST_ENTRY_BYTES, one - 1);
+        assert_eq!(MAX_FEEDS, (MAX_CURSOR_BYTES - 2) / WORST_ENTRY_BYTES);
+
+        let at_cap = encode(&worst_cursor(MAX_FEEDS)).unwrap();
+        assert!(at_cap.len() <= MAX_CURSOR_BYTES, "{} bytes", at_cap.len());
+
+        let over = encode(&worst_cursor(MAX_FEEDS + 1));
+        assert!(over.is_err(), "one more worst-case entry must not fit");
     }
 }

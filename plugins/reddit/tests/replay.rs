@@ -240,6 +240,25 @@ fn a_failed_feed_fails_the_whole_poll_with_no_items_and_no_cursor() {
 }
 
 #[test]
+fn first_poll_limit_changes_the_requested_page_size() {
+    let ten = settings(
+        "subreddits = [\"rust\"]\nuser_agent_contact = \"u/tester\"\nfirst_poll_limit = 10\n",
+    );
+    let http = ScriptedHttp::new(vec![Ok(fixture("listing_new")), Ok(fixture("listing_new"))]);
+    let first = poll(&http, &ten, None, Some(TOKEN)).unwrap();
+    // A feed that has a mark requests the later page size.
+    poll(&http, &ten, first.next_cursor.as_deref(), Some(TOKEN)).unwrap();
+    let urls: Vec<String> = http.requests().into_iter().map(|r| r.url).collect();
+    assert_eq!(
+        urls,
+        [
+            "https://oauth.reddit.com/r/rust/new?limit=10&raw_json=1",
+            "https://oauth.reddit.com/r/rust/new?limit=100&raw_json=1",
+        ]
+    );
+}
+
+#[test]
 fn only_the_official_oauth_host_is_ever_requested() {
     let http = ScriptedHttp::new(vec![Ok(fixture("listing_new"))]);
     first_poll(&http);
