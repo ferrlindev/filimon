@@ -22,9 +22,7 @@
 
 use std::time::Duration;
 
-use super::callback::LOGIN_TIMEOUT;
-#[cfg(test)]
-use super::callback::CallbackListener;
+use super::callback::{CallbackListener, LOGIN_TIMEOUT};
 use super::client::{DEFAULT_EXPIRES_IN_SECS, TokenClient};
 use super::error::AuthError;
 use super::pkce::{build_authorize_url, generate_state, generate_verifier, s256_challenge};
@@ -91,10 +89,55 @@ pub async fn login(
     options: &LoginOptions,
     hooks: &mut dyn LoginHooks,
 ) -> Result<LoginSummary, AuthError> {
-    let _ = (oauth, store, options, hooks);
-    Err(AuthError::CallbackInvalid {
-        reason: "not implemented".to_string(),
-    })
+    // 1. A busy port fails here, before anything is shown.
+    let listener = CallbackListener::bind(oauth.redirect_port).await?;
+    let redirect_uri = listener.redirect_uri();
+
+    // 2. Fresh PKCE values and the authorize URL.
+    let verifier = generate_verifier()?;
+    let challenge = s256_challenge(verifier.expose());
+    let state = generate_state()?;
+    let url = build_authorize_url(oauth, &redirect_uri, &state, &challenge);
+
+    // 3. Show the URL; open the browser only when asked.
+    hooks.authorize_url(url.as_str());
+    if options.open_browser {
+        hooks.open_browser(url.as_str());
+    }
+
+    // 4. Wait for the callback. The listener is consumed: the port is free
+    // again when this returns.
+    let code = listener.wait_for_code(&state, options.timeout).await?;
+
+    // 5. Exchange the code with the verifier whose challenge was sent.
+    let answer = TokenClient::new(oauth)?
+        .exchange_code(&code, &verifier, &redirect_uri)
+        .await?;
+
+    // 6. Only now touch the filesystem. An older refresh token is never
+    // carried over: it belongs to another grant.
+    let now = chrono::Utc::now().timestamp();
+    let lifetime =
+        i64::try_from(answer.expires_in.unwrap_or(DEFAULT_EXPIRES_IN_SECS)).unwrap_or(i64::MAX);
+    let tokens = StoredTokens {
+        access_token: AccessToken::new(answer.access_token),
+        refresh_token: answer.refresh_token.map(RefreshToken::new),
+        expires_at: now.saturating_add(lifetime),
+        token_type: answer.token_type,
+        scope: answer.scope,
+        needs_login: false,
+        obtained_at: now,
+    };
+    let summary = LoginSummary {
+        expires_at: tokens.expires_at,
+        has_refresh_token: tokens.refresh_token.is_some(),
+        scope: tokens.scope.clone(),
+    };
+    let lock = store.lock().await?;
+    store.write(&tokens)?;
+    drop(lock);
+
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -312,15 +355,33 @@ mod tests {
         let state = TempDir::new().expect("tempdir");
         let before = existing_login(&state);
         let store = TokenStore::new(state.path(), ALIAS);
-        let result = login(&oauth, &store, &options(), &mut TestHooks::new(Visit::WrongState)).await;
-        assert!(matches!(result, Err(AuthError::StateMismatch)), "{result:?}");
+        let result = login(
+            &oauth,
+            &store,
+            &options(),
+            &mut TestHooks::new(Visit::WrongState),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AuthError::StateMismatch)),
+            "{result:?}"
+        );
         assert_eq!(std::fs::read(token_path(&state)).expect("read"), before);
 
         // Without one: no file and no `auth` directory.
         let empty = TempDir::new().expect("tempdir");
         let store = TokenStore::new(empty.path(), ALIAS);
-        let result = login(&oauth, &store, &options(), &mut TestHooks::new(Visit::WrongState)).await;
-        assert!(matches!(result, Err(AuthError::StateMismatch)), "{result:?}");
+        let result = login(
+            &oauth,
+            &store,
+            &options(),
+            &mut TestHooks::new(Visit::WrongState),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AuthError::StateMismatch)),
+            "{result:?}"
+        );
         assert!(!empty.path().join("auth").exists());
         assert_eq!(server.seen().len(), 0, "no token request was made");
     }
@@ -332,7 +393,13 @@ mod tests {
         let state = TempDir::new().expect("tempdir");
         let store = TokenStore::new(state.path(), ALIAS);
 
-        let result = login(&oauth, &store, &options(), &mut TestHooks::new(Visit::Denied)).await;
+        let result = login(
+            &oauth,
+            &store,
+            &options(),
+            &mut TestHooks::new(Visit::Denied),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(AuthError::CallbackDenied { .. })),
@@ -371,8 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_exchange_writes_nothing() {
-        let server =
-            token_endpoint(Reply::json(400, r#"{"error":"invalid_grant"}"#)).await;
+        let server = token_endpoint(Reply::json(400, r#"{"error":"invalid_grant"}"#)).await;
         let oauth = oauth_config_for(&server.url("/token"), None);
         let state = TempDir::new().expect("tempdir");
         let before = existing_login(&state);
@@ -433,7 +499,10 @@ mod tests {
         let Err(error @ AuthError::RedirectPortInUse { .. }) = result else {
             panic!("expected RedirectPortInUse, got {result:?}");
         };
-        let rendered = format!("{error} {}", error.help().map(|h| h.to_string()).unwrap_or_default());
+        let rendered = format!(
+            "{error} {}",
+            error.help().map(|h| h.to_string()).unwrap_or_default()
+        );
         assert!(rendered.contains("host.oauth.redirect_port"), "{rendered}");
         assert!(hooks.urls.is_empty(), "no URL was shown");
         assert_eq!(hooks.opener_calls, 0);
@@ -459,7 +528,8 @@ mod tests {
 
     #[tokio::test]
     async fn login_uses_the_default_lifetime_when_expires_in_is_absent() {
-        let server = token_endpoint(Reply::json(200, &token_body("AT-1", Some("RT-1"), None))).await;
+        let server =
+            token_endpoint(Reply::json(200, &token_body("AT-1", Some("RT-1"), None))).await;
         let oauth = oauth_config_for(&server.url("/token"), None);
         let state = TempDir::new().expect("tempdir");
         let store = TokenStore::new(state.path(), ALIAS);
