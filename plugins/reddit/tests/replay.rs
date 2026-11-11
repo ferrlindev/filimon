@@ -178,7 +178,7 @@ fn tracer_returns_a_cursor_marking_the_newest_post() {
         .unwrap();
     let (cursor, undecodable) = cursor::decode(Some(&bytes));
     assert!(!undecodable);
-    let mark = cursor.0.get("r/rust:new").expect("feed key r/rust:new");
+    let mark = cursor.mark("r/rust:new").expect("feed key r/rust:new");
     assert_eq!(mark.t, newest["created_utc"].as_f64().unwrap() as i64);
     assert_eq!(mark.n, newest["name"].as_str().unwrap());
 }
@@ -492,7 +492,7 @@ fn removed_and_deleted_posts_are_emitted_with_their_literal_markers() {
     assert_eq!(deleted.author.as_deref(), Some("[deleted]"));
     assert_eq!(deleted.text, "[deleted]");
     // The mark advances past them: the newest of the two is the removed post.
-    let mark = marks_of(&outcome).0.get("r/rust:new").cloned().unwrap();
+    let mark = marks_of(&outcome).mark("r/rust:new").cloned().unwrap();
     assert_eq!(mark.n, "t3_1kx9ca1");
 }
 
@@ -522,7 +522,7 @@ fn an_empty_page_yields_no_items_and_writes_no_mark() {
     let http = ScriptedHttp::new(vec![Ok(fixture("listing_empty"))]);
     let outcome = first_poll(&http);
     assert!(outcome.items.is_empty());
-    assert!(marks_of(&outcome).0.get("r/rust:new").is_none());
+    assert!(marks_of(&outcome).mark("r/rust:new").is_none());
 }
 
 #[test]
@@ -582,8 +582,7 @@ fn two_feed_settings() -> Settings {
 
 fn mark(cursor: &cursor::Cursor, key: &str) -> cursor::Mark {
     cursor
-        .0
-        .get(key)
+        .mark(key)
         .unwrap_or_else(|| panic!("no mark for {key}"))
         .clone()
 }
@@ -732,7 +731,7 @@ fn an_all_empty_first_poll_still_returns_a_cursor_not_none() {
 fn marks_for_feeds_no_longer_configured_are_dropped() {
     let mut stored = cursor::Cursor::default();
     for key in ["r/rust:new", "r/removed_sub:new"] {
-        stored.0.insert(
+        stored.set_mark(
             key.to_string(),
             cursor::Mark {
                 t: 1_700_000_300,
