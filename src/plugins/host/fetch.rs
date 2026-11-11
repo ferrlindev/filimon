@@ -23,8 +23,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::engine::source_world::filimon::plugin::types;
-use super::engine::{FetcherPre, HostState, clean_guest_text, new_guest_store};
-use crate::plugins::config::HostConfig;
+use super::engine::{FetcherPre, HostEngine, HostState, clean_guest_text, new_guest_store};
+use super::error::HostError;
+use super::loader::load_fetcher;
+use crate::models::RawPage;
+use crate::plugins::config::{HostConfig, LoadedCrawler};
 
 /// Longest text kept from a fetcher failure, in characters.
 const FAILURE_TEXT_CLIP: usize = 512;
@@ -659,6 +662,167 @@ impl FetchRoute {
         );
         tracing::warn!(fetcher = %self.fetcher, "{text}");
         types::FetchError::Transport(text)
+    }
+}
+
+// ── Crawler ───────────────────────────────────────────────────────────────────
+
+/// The hosts of the seed urls, as the url parser writes them, without
+/// duplicates and in order of first appearance. Only `http` and `https` urls
+/// with a host count; anything else is skipped.
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+#[must_use]
+pub fn seed_hosts(urls: &[String]) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for text in urls {
+        let Ok(url) = url::Url::parse(text.trim()) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = url.host() else {
+            continue;
+        };
+        let host = host.to_string();
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+/// The request for one crawled page: a plain GET carrying the crawler's
+/// User-Agent.
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+#[must_use]
+pub(crate) fn page_request(url: &str) -> types::Request {
+    types::Request {
+        method: types::Method::Get,
+        url: url.to_string(),
+        headers: vec![
+            (
+                "user-agent".to_string(),
+                crate::crawler::USER_AGENT.to_string(),
+            ),
+            (
+                "accept".to_string(),
+                "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8".to_string(),
+            ),
+        ],
+        body: None,
+    }
+}
+
+/// The page a response holds. The body is decoded as UTF-8, with replacement
+/// characters for invalid bytes.
+///
+/// # Errors
+/// `HTTP  <status>` for any status that is not 2xx (the built-in client's own
+/// wording).
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+pub(crate) fn page_from_response(
+    url: &str,
+    response: &types::Response,
+) -> Result<RawPage, String> {
+    if (200..300).contains(&response.status) {
+        Ok(RawPage {
+            url: url.to_string(),
+            html: String::from_utf8_lossy(&response.body).into_owned(),
+        })
+    } else {
+        Err(format!("HTTP  {}", response.status))
+    }
+}
+
+/// A fetch failure as one line of text. It never carries the url; the text a
+/// fetcher supplied is cleaned for the terminal first.
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+#[must_use]
+pub(crate) fn fetch_error_text(error: &types::FetchError) -> String {
+    let clean = |text: &str| clean_guest_text(text, FAILURE_TEXT_CLIP);
+    match error {
+        types::FetchError::Denied(text) => format!("fetch denied: {}", clean(text)),
+        types::FetchError::Timeout => "fetch timed out".to_string(),
+        types::FetchError::Transport(text) => format!("transport failure: {}", clean(text)),
+        types::FetchError::RateLimited(Some(seconds)) => {
+            format!("rate limited, retry after {seconds} s")
+        }
+        types::FetchError::RateLimited(None) => "rate limited".to_string(),
+        types::FetchError::NotConfigured => "no fetcher is configured".to_string(),
+        types::FetchError::InvalidRequest(text) => format!("invalid request: {}", clean(text)),
+    }
+}
+
+/// The news crawler's page fetcher: one fetcher component behind a route
+/// labelled `crawler`, under the same `FetchPolicy` a source gets. It owns the
+/// engine the route's fetcher was compiled for.
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+pub struct CrawlFetcher {
+    route: FetchRoute,
+    description: String,
+    // Declared last: the route is dropped before the engine's ticker stops.
+    _engine: HostEngine,
+}
+
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+impl CrawlFetcher {
+    /// Loads the crawler's fetcher component. The crawler may reach the hosts
+    /// of `seeds` and `crawler.extra_hosts`, and no others.
+    ///
+    /// # Errors
+    /// `HostError::Engine` when the engine cannot start, and the load error
+    /// of the component when it cannot be opened or does not fit the fetcher
+    /// world.
+    pub fn load(crawler: &LoadedCrawler, seeds: &[String]) -> Result<Self, HostError> {
+        let engine = HostEngine::new().map_err(|e| HostError::Engine {
+            reason: format!("{e:#}"),
+        })?;
+        let pre = load_fetcher(&crawler.fetcher, &crawler.fetcher_component, &engine)?;
+        let hosts = seed_hosts(seeds);
+        let description = format!(
+            "fetcher `{}`, timeout {} s, hosts: {}",
+            crawler.fetcher,
+            crawler.timeout.as_secs(),
+            hosts
+                .iter()
+                .chain(&crawler.extra_hosts)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let allowlist = Allowlist::new(hosts.iter().chain(&crawler.extra_hosts));
+        let policy = FetchPolicy::new("crawler", allowlist, crawler.timeout);
+        let route = FetchRoute::new(
+            &crawler.fetcher,
+            Arc::new(pre),
+            engine.engine().clone(),
+            Arc::new(policy),
+            engine.egress(),
+        );
+        Ok(Self {
+            route,
+            description,
+            _engine: engine,
+        })
+    }
+
+    /// Fetches one page through the fetcher component.
+    ///
+    /// # Errors
+    /// The failure as text: the policy's denial, a timeout, a transport
+    /// failure or a status that is not 2xx.
+    pub async fn get_page(&self, url: &str) -> Result<RawPage, String> {
+        match self.route.fetch(page_request(url)).await {
+            Ok(response) => page_from_response(url, &response),
+            Err(error) => Err(fetch_error_text(&error)),
+        }
+    }
+
+    /// What the crawl prints about this fetcher: its name, timeout and hosts.
+    #[must_use]
+    pub fn describe(&self) -> &str {
+        &self.description
     }
 }
 
@@ -1629,5 +1793,137 @@ mod tests {
         assert!(policy.check(&request("https://www.reddit.com/")).is_ok());
         let result = policy.check(&request("https://reddit.com/"));
         assert!(denied(&result), "{result:?}");
+    }
+
+    // ── Crawler fetch (FETCH-04) ──────────────────────────────────────────────
+
+    use crate::crawler::{PageFetcher, USER_AGENT};
+    use crate::models::CrawlTarget;
+    use crate::plugins::config::LoadedCrawler;
+
+    #[test]
+    fn seed_hosts_are_lowercased_deduplicated_and_skip_bad_urls() {
+        let urls: Vec<String> = [
+            "https://Example.com/a",
+            "http://example.com/b",
+            "not a url",
+            "ftp://x.test/",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        assert_eq!(seed_hosts(&urls), ["example.com"]);
+    }
+
+    #[test]
+    fn seed_hosts_keep_the_order_of_first_appearance() {
+        let urls: Vec<String> = ["http://b.test/", "http://a.test/", "http://b.test/x"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        assert_eq!(seed_hosts(&urls), ["b.test", "a.test"]);
+    }
+
+    #[test]
+    fn page_request_is_a_get_with_the_builtin_user_agent() {
+        let request = page_request("http://example.com/a");
+
+        assert!(matches!(request.method, types::Method::Get));
+        assert_eq!(request.url, "http://example.com/a");
+        assert!(request.body.is_none());
+        let header = |name: &str| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("user-agent"), Some(USER_AGENT));
+        assert!(header("accept").is_some_and(|accept| accept.contains("text/html")));
+    }
+
+    #[test]
+    fn page_from_response_decodes_a_2xx_body_and_reports_other_statuses() {
+        let response = |status: u16, body: &[u8]| types::Response {
+            status,
+            headers: vec![],
+            body: body.to_vec(),
+        };
+
+        let page = page_from_response("http://example.com/", &response(200, b"caf\xC3\xA9 \xFF"))
+            .expect("a 200 is a page");
+        assert_eq!(page.url, "http://example.com/");
+        assert_eq!(page.html, "caf\u{e9} \u{fffd}");
+
+        let error = page_from_response("http://example.com/", &response(404, b"nope"))
+            .expect_err("a 404 is not a page");
+        assert!(error.starts_with("HTTP  404"), "{error}");
+    }
+
+    #[test]
+    fn fetch_error_text_names_the_cause_without_a_url() {
+        let errors = [
+            types::FetchError::Denied("host `evil.test` is not allowed".to_string()),
+            types::FetchError::Timeout,
+            types::FetchError::Transport("connection refused".to_string()),
+            types::FetchError::RateLimited(Some(30)),
+            types::FetchError::RateLimited(None),
+            types::FetchError::NotConfigured,
+            types::FetchError::InvalidRequest("url is empty".to_string()),
+        ];
+        let texts: Vec<String> = errors.iter().map(fetch_error_text).collect();
+
+        assert!(texts.iter().all(|text| !text.is_empty()));
+        let distinct: BTreeSet<&String> = texts.iter().collect();
+        assert_eq!(distinct.len(), texts.len(), "{texts:?}");
+        assert!(texts[0].contains("evil.test"), "{texts:?}");
+        assert!(texts[1].contains("timed out"), "{texts:?}");
+        assert!(texts[2].contains("connection refused"), "{texts:?}");
+        assert!(texts.iter().all(|text| !text.contains("http://")), "{texts:?}");
+    }
+
+    fn crawler_over_http_fetcher(timeout: Duration, extra_hosts: &[&str]) -> LoadedCrawler {
+        LoadedCrawler {
+            fetcher: "http".to_string(),
+            fetcher_component: fixture_wasm("http-fetcher", "http_fetcher.wasm"),
+            timeout,
+            extra_hosts: extra_hosts.iter().map(|host| (*host).to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_tracer_crawler_page_is_fetched_through_the_component() {
+        let server =
+            TestHttpServer::start(|_| Reply::ok("<html><body><p>hello</p></body></html>")).await;
+        let crawler = crawler_over_http_fetcher(Duration::from_secs(5), &[]);
+        let seed = server.url("/");
+        let fetcher = PageFetcher::Component(Box::new(
+            CrawlFetcher::load(&crawler, std::slice::from_ref(&seed)).expect("the fetcher loads"),
+        ));
+
+        let page = fetcher
+            .fetch_page(&CrawlTarget {
+                url: seed.clone(),
+                priority: 1.0,
+                depth: 0,
+            })
+            .await
+            .expect("the page is fetched through the component");
+
+        assert_eq!(page.url, seed);
+        assert_eq!(page.html, "<html><body><p>hello</p></body></html>");
+        let requests = server.seen();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(
+            (requests[0].method.as_str(), requests[0].target.as_str()),
+            ("GET", "/")
+        );
+        assert_eq!(
+            requests[0].header("user-agent"),
+            Some("WISECrawler/1.0 (academic research)")
+        );
     }
 }

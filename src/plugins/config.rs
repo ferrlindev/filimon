@@ -27,6 +27,8 @@ const DEFAULT_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(30).unwrap();
 const DEFAULT_BACKOFF_INITIAL_SECS: NonZeroU64 = NonZeroU64::new(60).unwrap();
 const DEFAULT_BACKOFF_MAX_SECS: NonZeroU64 = NonZeroU64::new(3600).unwrap();
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
+/// The news crawler's fetch timeout: the built-in client's own timeout.
+const DEFAULT_CRAWLER_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(15).unwrap();
 
 fn default_true() -> bool {
     true
@@ -34,6 +36,10 @@ fn default_true() -> bool {
 
 fn default_timeout_secs() -> NonZeroU64 {
     DEFAULT_TIMEOUT_SECS
+}
+
+fn default_crawler_timeout_secs() -> NonZeroU64 {
+    DEFAULT_CRAWLER_TIMEOUT_SECS
 }
 
 // ── File Shapes (private) ─────────────────────────────────────────────────────
@@ -44,6 +50,29 @@ fn default_timeout_secs() -> NonZeroU64 {
 struct Registry {
     #[serde(default)]
     sources: BTreeMap<String, SourceEntry>,
+    #[serde(default)]
+    fetchers: BTreeMap<String, FetcherEntry>,
+    crawler: Option<CrawlerEntry>,
+}
+
+/// The `[crawler]` table: how `fili produce` fetches its pages.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrawlerEntry {
+    fetcher: toml::Spanned<String>,
+    #[serde(default = "default_crawler_timeout_secs")]
+    timeout_secs: NonZeroU64,
+    /// Hosts the crawler may reach besides its seed urls' hosts.
+    #[serde(default)]
+    allowlist: Vec<String>,
+}
+
+/// The two tables `load_crawler` reads. Unlike `Registry` it ignores every
+/// other key, so a broken source entry cannot stop `fili produce`.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+struct CrawlerView {
+    crawler: Option<CrawlerEntry>,
     #[serde(default)]
     fetchers: BTreeMap<String, FetcherEntry>,
 }
@@ -134,6 +163,29 @@ pub struct LoadedRegistry {
     pub base_dir: PathBuf,
     pub sources: BTreeMap<String, LoadedSource>,
     pub fetchers: BTreeMap<String, LoadedFetcher>,
+    /// The `[crawler]` table, when the registry has one and it is valid.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "`fili produce` reads the crawler through `load_crawler`; only tests read it here"
+        )
+    )]
+    pub crawler: Option<LoadedCrawler>,
+}
+
+/// The news crawler's fetch configuration, validated and typed.
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+#[derive(Debug, Clone)]
+pub struct LoadedCrawler {
+    /// The fetcher's registry name.
+    pub fetcher: String,
+    /// The fetcher's component, resolved against the registry directory.
+    pub fetcher_component: PathBuf,
+    /// The deadline of one page fetch.
+    pub timeout: Duration,
+    /// Hosts the crawler may reach besides its seed urls' hosts.
+    pub extra_hosts: Vec<String>,
 }
 
 /// One source plugin. `plugin` is `Some` exactly when the source is enabled.
@@ -265,6 +317,16 @@ fn load_registry_inner(
     // Problems are reported in a fixed order: registry-level problems first,
     // then each enabled, validly named source's problems in name order.
     let mut registry_problems = registry_level_problems(&registry);
+    // The crawler's problem is judged here, before the `wanted` filter, so a
+    // scoped plugin load drops it (`ConfigError::plugin` names `crawler`).
+    let crawler = registry.crawler.as_ref().and_then(|entry| {
+        if let Some(problem) = crawler_problem(entry, &registry.fetchers, registry_src) {
+            registry_problems.push(problem);
+            None
+        } else {
+            Some(loaded_crawler(entry, &registry.fetchers, &base_dir))
+        }
+    });
     registry_problems.retain(|problem| problem.plugin().is_none_or(&wanted));
     let mut source_problems: BTreeMap<&str, Vec<ConfigError>> = BTreeMap::new();
 
@@ -354,12 +416,21 @@ fn load_registry_inner(
         base_dir,
         sources,
         fetchers,
+        crawler,
     })
 }
 
 /// Reads and parses `filimon.toml`. Returns the parsed registry plus its
 /// display name and text, which the diagnostics of later passes need.
 fn read_registry(path: &Path) -> Result<(Registry, String, String), ConfigErrors> {
+    read_toml(path)
+}
+
+/// Reads `path` once and parses it as `T`; a failure of either step is one
+/// registry-level problem.
+fn read_toml<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<(T, String, String), ConfigErrors> {
     let registry_name = path.display().to_string();
     let registry_text = std::fs::read_to_string(path).map_err(|e| {
         single(ConfigError::RegistryUnreadable {
@@ -367,7 +438,7 @@ fn read_registry(path: &Path) -> Result<(Registry, String, String), ConfigErrors
             reason: e.to_string(),
         })
     })?;
-    let registry: Registry = toml::from_str(&registry_text).map_err(|e| {
+    let parsed: T = toml::from_str(&registry_text).map_err(|e| {
         single(ConfigError::RegistryMalformed {
             path: registry_name.clone(),
             message: e.message().to_string(),
@@ -375,7 +446,34 @@ fn read_registry(path: &Path) -> Result<(Registry, String, String), ConfigErrors
             span: e.span().map(Into::into),
         })
     })?;
-    Ok((registry, registry_name, registry_text))
+    Ok((parsed, registry_name, registry_text))
+}
+
+/// Loads only the `[crawler]` table of the registry at `path`.
+///
+/// Reads nothing but `[crawler]` and `[fetchers]`: no source's plugin file, no
+/// `.env` and no secret, so a broken source entry cannot stop `fili produce`
+/// (WD-23). `Ok(None)` when the registry has no `[crawler]` table.
+///
+/// # Errors
+/// `RegistryUnreadable` or `RegistryMalformed` when the file cannot be read
+/// or parsed, and the unknown or disabled fetcher problem when `[crawler]`
+/// names a fetcher that cannot be used.
+#[allow(dead_code, reason = "`fili produce` is wired to the crawler by the next task")]
+pub fn load_crawler(path: &Path) -> Result<Option<LoadedCrawler>, ConfigErrors> {
+    let (view, name, text): (CrawlerView, _, _) = read_toml(path)?;
+    let Some(entry) = view.crawler else {
+        return Ok(None);
+    };
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let src = RegistrySource {
+        name: &name,
+        text: &text,
+    };
+    if let Some(problem) = crawler_problem(&entry, &view.fetchers, src) {
+        return Err(single(problem));
+    }
+    Ok(Some(loaded_crawler(&entry, &view.fetchers, &base_dir)))
 }
 
 // ── Listing ───────────────────────────────────────────────────────────────────
@@ -609,6 +707,61 @@ fn fetcher_problem(
                 span: fetcher.span().into(),
             })
         }
+    }
+}
+
+/// Checks the `[crawler]` table's `fetcher` reference the way
+/// `fetcher_problem` checks a source's: it must name a fetcher defined under
+/// `[fetchers]`, and that fetcher must be enabled.
+fn crawler_problem(
+    entry: &CrawlerEntry,
+    fetchers: &BTreeMap<String, FetcherEntry>,
+    registry: RegistrySource<'_>,
+) -> Option<ConfigError> {
+    let fetcher = &entry.fetcher;
+    match fetchers.get(fetcher.get_ref()) {
+        Some(defined) if defined.enabled => None,
+        Some(_) => Some(ConfigError::DisabledCrawlerFetcher {
+            fetcher: fetcher.get_ref().clone(),
+            src: registry.named(),
+            span: fetcher.span().into(),
+        }),
+        None => {
+            let defined = if fetchers.is_empty() {
+                "none".to_string()
+            } else {
+                fetchers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Some(ConfigError::UnknownCrawlerFetcher {
+                fetcher: fetcher.get_ref().clone(),
+                defined,
+                src: registry.named(),
+                span: fetcher.span().into(),
+            })
+        }
+    }
+}
+
+/// Builds the typed crawler from a table `crawler_problem` accepted.
+fn loaded_crawler(
+    entry: &CrawlerEntry,
+    fetchers: &BTreeMap<String, FetcherEntry>,
+    base_dir: &Path,
+) -> LoadedCrawler {
+    let fetcher = entry.fetcher.get_ref().clone();
+    let component = fetchers
+        .get(&fetcher)
+        .map(|defined| base_dir.join(defined.component.get_ref()))
+        .unwrap_or_default();
+    LoadedCrawler {
+        fetcher,
+        fetcher_component: component,
+        timeout: Duration::from_secs(entry.timeout_secs.get()),
+        extra_hosts: entry.allowlist.clone(),
     }
 }
 
@@ -1813,6 +1966,7 @@ config = "x.toml"
 
     #[test]
     fn config_error_plugin_names_every_per_plugin_variant() {
+        // The crawler's two variants answer `crawler` (checked below).
         let src = || NamedSource::new("x.toml", String::new());
         let span = || SourceSpan::from(0..0);
         let per_plugin = [
@@ -1876,6 +2030,23 @@ config = "x.toml"
         ];
         for problem in &per_plugin {
             assert_eq!(problem.plugin(), Some("p"), "{problem:?}");
+        }
+
+        let crawler = [
+            ConfigError::UnknownCrawlerFetcher {
+                fetcher: "f".into(),
+                defined: "none".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::DisabledCrawlerFetcher {
+                fetcher: "f".into(),
+                src: src(),
+                span: span(),
+            },
+        ];
+        for problem in &crawler {
+            assert_eq!(problem.plugin(), Some("crawler"), "{problem:?}");
         }
 
         let registry_level = [
@@ -1993,5 +2164,187 @@ component = "other-fetcher.wasm"
             ),
             "{errors:?}"
         );
+    }
+
+    // ── [crawler] table (FETCH-04) ────────────────────────────────────────────
+
+    const HTTP_FETCHER: &str = "[fetchers.http]\ncomponent = \"http.wasm\"\n";
+
+    fn crawler_registry(dir: &TempDir, text: &str) {
+        write(dir, "filimon.toml", text);
+    }
+
+    #[test]
+    fn crawler_table_loads_with_the_default_timeout_and_no_extra_hosts() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            &format!("{HTTP_FETCHER}\n[crawler]\nfetcher = \"http\"\n"),
+        );
+
+        let registry = load(&dir).expect("registry loads");
+
+        let crawler = registry.crawler.as_ref().expect("the crawler is loaded");
+        assert_eq!(crawler.fetcher, "http");
+        assert_eq!(crawler.timeout, Duration::from_secs(15));
+        assert!(crawler.extra_hosts.is_empty());
+        assert_eq!(crawler.fetcher_component, dir.path().join("http.wasm"));
+    }
+
+    #[test]
+    fn crawler_table_reads_timeout_and_extra_hosts() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            &format!(
+                "{HTTP_FETCHER}\n[crawler]\nfetcher = \"http\"\ntimeout_secs = 3\nallowlist = [\"www.example.com\"]\n"
+            ),
+        );
+
+        let registry = load(&dir).expect("registry loads");
+
+        let crawler = registry.crawler.as_ref().expect("the crawler is loaded");
+        assert_eq!(crawler.timeout, Duration::from_secs(3));
+        assert_eq!(crawler.extra_hosts, vec!["www.example.com".to_string()]);
+    }
+
+    #[test]
+    fn a_registry_without_a_crawler_table_has_none() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(&dir, HTTP_FETCHER);
+
+        let registry = load(&dir).expect("registry loads");
+
+        assert!(registry.crawler.is_none());
+        let crawler = load_crawler(&dir.path().join("filimon.toml")).expect("crawler loads");
+        assert!(crawler.is_none());
+    }
+
+    #[test]
+    fn a_crawler_naming_an_unknown_fetcher_is_reported_with_the_defined_names() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            &format!("{HTTP_FETCHER}\n[crawler]\nfetcher = \"htp\"\n"),
+        );
+
+        let errors = load(&dir).expect_err("an unknown crawler fetcher is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::UnknownCrawlerFetcher {
+            fetcher, defined, ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected UnknownCrawlerFetcher, got {errors:?}");
+        };
+        assert_eq!(fetcher, "htp");
+        assert_eq!(defined, "http");
+        assert_contains(&render(&errors), &["crawler.fetcher", "htp", "http"]);
+
+        // With no fetcher defined at all the help says `none`.
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(&dir, "[crawler]\nfetcher = \"http\"\n");
+        let errors = load(&dir).expect_err("an unknown crawler fetcher is an error");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::UnknownCrawlerFetcher { defined, .. } if defined == "none"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_crawler_naming_a_disabled_fetcher_is_reported() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            "[fetchers.http]\ncomponent = \"http.wasm\"\nenabled = false\n\n[crawler]\nfetcher = \"http\"\n",
+        );
+
+        let errors = load(&dir).expect_err("a disabled crawler fetcher is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DisabledCrawlerFetcher { fetcher, .. } if fetcher == "http"
+            ),
+            "{errors:?}"
+        );
+        assert_contains(&render(&errors), &["crawler.fetcher", "disabled"]);
+    }
+
+    #[test]
+    fn a_crawler_zero_timeout_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            &format!("{HTTP_FETCHER}\n[crawler]\nfetcher = \"http\"\ntimeout_secs = 0\n"),
+        );
+
+        let errors = load(&dir).expect_err("a zero timeout is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors.problems[0], ConfigError::RegistryMalformed { message, .. } if message.contains("nonzero")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_crawler_unknown_key_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            &format!("{HTTP_FETCHER}\n[crawler]\nfetcher = \"http\"\ntimeout = 3\n"),
+        );
+
+        let errors = load(&dir).expect_err("an unknown crawler key is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors.problems[0], ConfigError::RegistryMalformed { message, .. } if message.contains("timeout")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn load_crawler_ignores_sources_and_secrets() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            &format!(
+                "{HTTP_FETCHER}\n[sources.gone]\ncomponent = \"gone.wasm\"\nconfig = \"gone.toml\"\n\n[sources.needy]\ncomponent = \"needy.wasm\"\nconfig = \"needy.toml\"\n\n[crawler]\nfetcher = \"http\"\n"
+            ),
+        );
+        write(
+            &dir,
+            "needy.toml",
+            "[host]\npoll_interval_secs = 60\n\n[host.secrets]\ntoken = \"NEEDY_TOKEN_UNSET\"\n",
+        );
+
+        let crawler = load_crawler(&dir.path().join("filimon.toml"))
+            .expect("sources do not stop the crawler")
+            .expect("the crawler is configured");
+
+        assert_eq!(crawler.fetcher, "http");
+        assert!(load(&dir).is_err(), "the strict loader still sees them");
+    }
+
+    #[test]
+    fn a_scoped_plugin_load_does_not_report_crawler_problems() {
+        let dir = TempDir::new().expect("tempdir");
+        crawler_registry(
+            &dir,
+            "[sources.good]\ncomponent = \"good.wasm\"\nconfig = \"good.toml\"\n\n[crawler]\nfetcher = \"nope\"\n",
+        );
+        write(&dir, "good.toml", "[host]\npoll_interval_secs = 60\n");
+
+        let registry = scoped(&dir, "good").expect("the crawler's problem is not good's");
+
+        assert!(registry.sources["good"].plugin.is_some());
+        assert!(registry.crawler.is_none());
+        assert!(load(&dir).is_err(), "the strict loader reports it");
     }
 }
