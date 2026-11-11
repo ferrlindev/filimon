@@ -141,6 +141,7 @@ pub async fn commit_once<S: ItemSink>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::*;
@@ -350,6 +351,100 @@ mod tests {
             b"NOT-JSON-SENTINEL",
             "the file is left as found"
         );
+    }
+
+    // ── Refresh before the poll (D-07, D-09, D-15) ────────────────────────────
+
+    use crate::plugins::auth::provider::TokenProvider;
+    use crate::plugins::auth::store::{RefreshToken, StoredTokens, TokenStore};
+    use crate::plugins::auth::testing::{oauth_config_for, token_body};
+    use crate::plugins::host::testing::{LogCapture, Reply, TestHttpServer};
+
+    /// Stores an already expired login with a refresh token for `fake`.
+    fn store_expired_login(state_dir: &std::path::Path) {
+        TokenStore::new(state_dir, "fake")
+            .write(&StoredTokens {
+                access_token: AccessToken::new("AT-OLD".to_string()),
+                refresh_token: Some(RefreshToken::new("RT-OLD".to_string())),
+                expires_at: unix_now() - 10,
+                token_type: None,
+                scope: None,
+                needs_login: false,
+                obtained_at: unix_now() - 3600,
+            })
+            .expect("write the login");
+    }
+
+    /// A spec whose provider refreshes against `server`.
+    fn refreshing_spec(state_dir: &std::path::Path, server: &TestHttpServer) -> PluginSpec {
+        let mut spec = once_spec();
+        spec.auth = Some(Arc::new(TokenProvider::new(
+            "fake",
+            oauth_config_for(&server.url("/token"), None),
+            state_dir,
+        )));
+        spec
+    }
+
+    #[tokio::test]
+    async fn once_refreshes_and_persists_the_token_like_the_poll_loop() {
+        let dir = TempDir::new().expect("tempdir");
+        store_expired_login(dir.path());
+        let server =
+            TestHttpServer::start(|_| Reply::json(200, &token_body("AT-NEW", None, Some(3600))))
+                .await;
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_ok(vec![], None)]);
+
+        poll_once(&refreshing_spec(dir.path(), &server), &factory, None)
+            .await
+            .expect("one cycle");
+
+        assert_eq!(factory.poll_tokens(), vec![Some("AT-NEW".to_string())]);
+        let stored = TokenStore::new(dir.path(), "fake")
+            .read()
+            .expect("read")
+            .expect("a login");
+        assert_eq!(stored.access_token.expose(), "AT-NEW");
+        assert_eq!(stored.refresh_token.expect("kept").expose(), "RT-OLD");
+    }
+
+    #[tokio::test]
+    async fn once_reports_a_failed_refresh_as_a_token_refresh_outcome() {
+        let dir = TempDir::new().expect("tempdir");
+        store_expired_login(dir.path());
+        let server = TestHttpServer::start(|_| Reply::status(503)).await;
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_ok(vec![], None)]);
+
+        let outcome = poll_once(&refreshing_spec(dir.path(), &server), &factory, None)
+            .await
+            .expect_err("the refresh fails");
+
+        let CycleOutcome::TokenRefresh(text) = &outcome else {
+            panic!("expected a token refresh outcome, got {outcome:?}");
+        };
+        assert!(text.contains("HTTP 503"), "{text}");
+        assert!(!text.contains("AT-OLD") && !text.contains("RT-OLD"), "{text}");
+        assert!(factory.poll_tokens().is_empty(), "the guest was never polled");
+        assert!(describe(&outcome).starts_with("token refresh failed:"));
+    }
+
+    #[tokio::test]
+    async fn once_polls_with_none_and_logs_the_login_hint_when_not_logged_in() {
+        let (logs, _guard) = LogCapture::start();
+        let dir = TempDir::new().expect("tempdir");
+        let mut spec = once_spec();
+        spec.auth = Some(provider_for(dir.path(), "fake"));
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_ok(vec![], None)]);
+
+        poll_once(&spec, &factory, None).await.expect("one cycle");
+
+        assert_eq!(factory.poll_tokens(), vec![None]);
+        let text = logs.text();
+        let hints = text
+            .lines()
+            .filter(|line| line.contains("run: fili auth login"))
+            .count();
+        assert_eq!(hints, 1, "{text}");
     }
 
     // ── commit_once (D-07) ────────────────────────────────────────────────────

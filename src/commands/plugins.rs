@@ -2354,6 +2354,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_once_hands_the_stored_login_to_the_guest_and_prints_no_token() {
+        use crate::plugins::auth::provider::TokenProvider;
+        use crate::plugins::auth::store::{AccessToken, RefreshToken, StoredTokens, TokenStore};
+        use crate::plugins::auth::testing::oauth_config;
+
+        let dir = TempDir::new().expect("tempdir");
+        let now = chrono::Utc::now().timestamp();
+        TokenStore::new(dir.path(), "fake")
+            .write(&StoredTokens {
+                access_token: AccessToken::new("AT-SENTINEL-1".to_string()),
+                refresh_token: Some(RefreshToken::new("RT-SENTINEL-1".to_string())),
+                expires_at: now + 3600,
+                token_type: None,
+                scope: None,
+                needs_login: false,
+                obtained_at: now,
+            })
+            .expect("write the login");
+        let mut plugin = spec("fake", 60, 60, 3600, 2.0);
+        plugin.auth = Some(Arc::new(TokenProvider::new(
+            "fake",
+            oauth_config(),
+            dir.path(),
+        )));
+        let factory = FakeFactory::new(vec![
+            FakeStep::InitOk,
+            poll_step(vec![wit_item("a")], Some(vec![1])),
+        ]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let result = execute_run_once(
+            &plugin,
+            &factory,
+            None,
+            Produce::<VecSink>::No,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .await;
+
+        let mut everything = String::from_utf8(out).expect("utf8 stdout");
+        everything.push_str(&String::from_utf8(err).expect("utf8 stderr"));
+        if let Err(error) = &result {
+            write!(everything, "{error} {error:?}").expect("write to a string");
+        }
+        result.expect("the cycle succeeds");
+        assert!(everything.contains("fake:a"), "{everything}");
+        assert_eq!(
+            factory.poll_tokens(),
+            vec![Some("AT-SENTINEL-1".to_string())],
+            "the guest received the stored token"
+        );
+        for leaked in ["AT-SENTINEL-1", "RT-SENTINEL-1"] {
+            assert!(!everything.contains(leaked), "leaked {leaked}: {everything}");
+        }
+    }
+
+    #[tokio::test]
     async fn run_once_never_prints_secret_values() {
         let dir = TempDir::new().expect("tempdir");
         let registry = stub_registry(
