@@ -35,8 +35,17 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
   `ok`) refine it. The `trap` and `spin` modes deliberately misbehave, so
   never reference it from a plugin registry such as `examples/plugins/`.
 
+- `reddit/` and `youtube/`: the reference source plugins for the `source`
+  world. Each crate builds one component that the sample registry uses for two
+  instances (`reddit` and `reddit-user`, `youtube` and `youtube-user`). Their
+  logic is plain Rust behind an `Http` trait and is tested natively against
+  fixtures, with no network and no keys. They are real plugins, not test
+  fixtures of the host (see
+  [Reddit and YouTube source plugins](#reddit-and-youtube-source-plugins)).
+
 Both stubs and the fault source double as test fixtures for the Phase 3 host.
-The default fetcher is not a fixture: it is the fetcher that ships.
+The default fetcher and the Reddit and YouTube plugins are not fixtures: they
+are what ships.
 
 These crates are not members of the root filimon workspace. Each has its own
 empty `[workspace]` table, its own `Cargo.lock`, and its own toolchain pin.
@@ -66,6 +75,8 @@ From the repository root:
 (cd plugins/stub-fetcher && cargo component build --release)
 (cd plugins/fault-source && cargo component build --release)
 (cd plugins/http-fetcher && cargo component build --release)
+(cd plugins/reddit && cargo component build --release)
+(cd plugins/youtube && cargo component build --release)
 ```
 
 The build must run from the crate directory, which the subshells handle:
@@ -77,6 +88,19 @@ components land at:
 - `plugins/stub-fetcher/target/wasm32-unknown-unknown/release/stub_fetcher.wasm`
 - `plugins/fault-source/target/wasm32-unknown-unknown/release/fault_source.wasm`
 - `plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm`
+- `plugins/reddit/target/wasm32-unknown-unknown/release/reddit_source.wasm`
+- `plugins/youtube/target/wasm32-unknown-unknown/release/youtube_source.wasm`
+
+### Native tests of the Reddit and YouTube plugins
+
+The two crates carry unit and replay tests that run on the host machine. A bare
+`cargo test` fails there, because each crate's `.cargo/config.toml` forces the
+`wasm32-unknown-unknown` target; pass the host triple explicitly:
+
+```sh
+(cd plugins/reddit && cargo test --target "$(rustc -vV | sed -n 's/^host: //p')")
+(cd plugins/youtube && cargo test --target "$(rustc -vV | sed -n 's/^host: //p')")
+```
 
 ## Conformance check
 
@@ -92,6 +116,12 @@ wasm-tools component targets ../../wit -w fetcher target/wasm32-unknown-unknown/
 
 # in plugins/http-fetcher
 wasm-tools component targets ../../wit -w fetcher target/wasm32-unknown-unknown/release/http_fetcher.wasm
+
+# in plugins/reddit
+wasm-tools component targets ../../wit -w source target/wasm32-unknown-unknown/release/reddit_source.wasm
+
+# in plugins/youtube
+wasm-tools component targets ../../wit -w source target/wasm32-unknown-unknown/release/youtube_source.wasm
 ```
 
 Each command exits 0 on success. Checking a component against the wrong world
@@ -127,7 +157,7 @@ gitignored, along with `target/`.
 ## Plugin secrets
 
 Each source's plugin TOML has a `[host.secrets]` table that maps an alias to
-an env var name, for example `client_id = "REDDIT_CLIENT_ID"`. The plugin's
+an env var name, for example `api_key = "YOUTUBE_API_KEY"`. The plugin's
 `init` receives only its own aliases, keyed by alias, never the env var names
 and never another plugin's secrets.
 
@@ -757,6 +787,167 @@ plugin's arguments, settings, logs or items. The WIT contract is unchanged.
 - One login per plugin: there are no multiple accounts for one source.
 - The app-only token is memory-only, so it is fetched again at every start, and
   one grant applies per plugin instance.
+
+## Reddit and YouTube source plugins
+
+`plugins/reddit` and `plugins/youtube` are the two reference source plugins.
+Each is one component that the sample registry
+([`examples/plugins/filimon.toml`](../examples/plugins/filimon.toml)) registers
+twice, so one `.wasm` backs two instances with their own config, cursor and
+token. The plugins only read: no sample requests a write scope, and every
+allowlist names only the official API host.
+
+### Instances
+
+| Instance | Component | Mode | Allowlist | Config |
+|----------|-----------|------|-----------|--------|
+| `reddit` | `reddit_source.wasm` | app-only (`grant = "client_credentials"`), `subreddits` and `listings` | `oauth.reddit.com` | [`reddit.toml`](../examples/plugins/reddit.toml) |
+| `reddit-user` | `reddit_source.wasm` | PKCE login, scopes `read` and `history`, `feed = "home"` or `"saved"` | `oauth.reddit.com` | [`reddit-user.toml`](../examples/plugins/reddit-user.toml) |
+| `youtube` | `youtube_source.wasm` | API key (`[host.secrets] api_key`), `channels` | `www.googleapis.com` | [`youtube.toml`](../examples/plugins/youtube.toml) |
+| `youtube-user` | `youtube_source.wasm` | PKCE login, scope `youtube.readonly`, `subscriptions = true` | `www.googleapis.com` | [`youtube-user.toml`](../examples/plugins/youtube-user.toml) |
+
+The instance name is what you register, log in with, and what keys the cursor
+and token files (`<alias>.json`, `auth/<alias>.json`): renaming an instance
+starts it from a first poll and drops its login.
+
+To log in:
+
+```sh
+fili auth login reddit-user
+fili auth login youtube-user
+```
+
+The roadmap and requirements wording `fili auth login reddit` and
+`fili auth login youtube` means these two `-user` instances: the plain `reddit`
+instance is app-only and the plain `youtube` instance uses an API key, so
+neither has a login. Neither plugin changes the WIT contract; each instance
+receives one access token (or the API key alias) and nothing else. The Reddit
+client secret and the YouTube OAuth client secret are host-only credentials
+named by `[host.oauth] client_secret_env`, never given to a plugin.
+
+### Reddit settings
+
+Both Reddit instances take `[settings]`; unknown keys are rejected at start-up.
+
+| Key | Meaning |
+|-----|---------|
+| `subreddits` | A non-empty list of subreddit names (1 to 21 letters, digits or `_`, no `r/` prefix). Required unless `feed` is set. |
+| `listings` | A non-empty list of `new` or `hot`. Default `["new"]`. |
+| `feed` | `home` or `saved`: the logged-in user's own feed, for the `reddit-user` instance. Exactly one of `subreddits` and `feed`. |
+| `username` | Your Reddit username; required with `feed = "saved"` and not allowed otherwise. |
+| `user_agent_contact` | Required. A contact such as `u/yourname`, used in the User-Agent. |
+| `app_id` | The app part of the User-Agent. Default `reddit`. |
+| `first_poll_limit` | Posts read per feed on the first poll, 1 to 100. Default 25. |
+
+The plugin's own requests carry `filimon:<app_id>:<version> (by /u/<contact>)`
+as User-Agent, the format Reddit asks for. Set the same shape in
+`[host.oauth] user_agent` for the host's token calls. A `reddit-user` instance
+with no stored login answers `auth-required` until you run
+`fili auth login reddit-user`.
+
+### YouTube settings
+
+| Key | Meaning |
+|-----|---------|
+| `channels` | Channel IDs only: 24 characters starting with `UC`. Handles (`@name`) are not supported. Required unless `subscriptions` is true. |
+| `subscriptions` | `true` follows the channels the logged-in user subscribes to (the `youtube-user` instance). |
+| `subscriptions_limit` | How many subscribed channels one poll follows. Default 50. Only with `subscriptions = true`; together with `channels` it may not exceed the cursor limit (71 playlists). |
+
+Each channel is read through its uploads playlist, derived by swapping the `UC`
+prefix for `UU`. That is an undocumented community convention rather than a
+documented API, so it needs no lookup call but could stop working. The `youtube`
+instance authenticates with the `api_key` secret (`YOUTUBE_API_KEY`).
+
+### Items
+
+- Reddit: `id` is the post fullname (`t3_...`), `url` is always the Reddit
+  permalink (never the external link of a link post), `title` is the post
+  title, `text` is the self text (the title when there is none), `author` is
+  the poster (absent for a deleted account), `published` is `created_utc` in
+  epoch milliseconds, `platform` is `reddit` and `raw` is the post object
+  (absent when it is larger than the cap). Posts without a name, title or
+  permalink are skipped.
+- YouTube: `id` is the video id, `url` is the watch URL, `title` and `text` are
+  the video title and description, `author` is the owner channel title (else
+  the channel title), `published` is the video publication time in epoch
+  milliseconds (`videoPublishedAt` when present, else the playlist entry's
+  `publishedAt`), `platform` is `youtube` and `raw` is the playlist item
+  snippet. `Private video` and `Deleted video` placeholders are skipped.
+
+### Cursor and first poll
+
+Each plugin keeps one cursor, a compact JSON map with one entry per feed (a
+subreddit and listing, `home`, `saved`, or a playlist). A first poll of a feed
+reads one small page only, so enabling a busy feed does not flood the topic.
+Later polls emit only items strictly newer than the stored mark (the `saved`
+feed keeps a set of seen fullnames instead of a time mark). The cursor is
+capped at 4096 bytes, which limits the number of feeds (61 for Reddit, 71 for
+YouTube); a settings list that cannot fit is rejected at start-up.
+
+Documented limits:
+
+- Overflow beyond one page is lost, oldest first: when more new items arrive
+  between two polls than one page holds, the oldest of them are never emitted.
+  Shorten `poll_interval_secs` for busy feeds.
+- A same-second (Reddit) or same-instant (YouTube) item that appears after the
+  mark was set is not emitted, because only strictly newer items count.
+- `hot` is not a ranked re-poll: the plugin emits a hot post once, when it is
+  newer than the mark, and never again when it moves up or down the ranking.
+- A saved post that is un-saved and re-saved while it is still in the seen set
+  may not be re-emitted.
+- A subscribed channel that leaves and re-enters the `subscriptions_limit`
+  window is treated as a first poll for that channel.
+
+### Rate limits and quota
+
+Reddit is handled reactively. On a `429`, or when `x-ratelimit-remaining` drops
+below 1, the plugin answers `rate-limited` with the delay from
+`x-ratelimit-reset`, and the host backoff waits at least that long (see
+[Polling and backoff](#polling-and-backoff)).
+
+YouTube makes only 1-unit calls. A `quotaExceeded` answer is a named transient
+error, `YouTube quota exceeded (quotaExceeded): daily Data API quota exhausted;
+resets at midnight Pacific`. The host backoff retries it and polling recovers
+after the reset with no restart. The default quota is 10,000 units a day:
+
+```text
+units per poll = ceil(subscribed channels fetched / 50) + playlists polled
+units per day  = units per poll * (86400 / poll_interval_secs)
+```
+
+Worked examples with `N` playlists polled, as a channel list (`youtube`, no
+subscription pages) and from `N` subscriptions (`youtube-user`):
+
+| Playlists `N` | Interval | Polls per day | Units per day, channel list (`N` per poll) | Units per day, subscriptions (`ceil(N/50) + N` per poll) |
+|---------------|----------|---------------|---------------------------------------------|----------------------------------------------------------|
+| 20 | 600 s | 144 | 2,880 | 3,024 |
+| 20 | 900 s | 96 | 1,920 | 2,016 |
+| 20 | 1800 s | 48 | 960 | 1,008 |
+| 50 | 600 s | 144 | 7,200 | 7,344 |
+| 50 | 900 s | 96 | 4,800 | 4,896 |
+| 50 | 1800 s | 48 | 2,400 | 2,448 |
+| 71 | 600 s | 144 | 10,224 (over) | 10,512 (over) |
+| 71 | 900 s | 96 | 6,816 | 7,008 |
+| 71 | 1800 s | 48 | 3,408 | 3,504 |
+
+71 is the most playlists the cursor holds. Two instances of one Google project
+share its quota, so add their units before comparing against 10,000.
+
+### Access notes
+
+- Reddit may require approval for new API access, so credentials can need
+  Reddit's approval before they work.
+- A Google consent screen left in Testing mode expires refresh tokens after
+  about 7 days: log in again, or publish the app.
+
+Both are described under [Provider notes](#provider-notes).
+
+### Fixtures
+
+The committed fixtures in `plugins/reddit/tests/fixtures/` and
+`plugins/youtube/tests/fixtures/` are labelled `synthetic` or `real` in each
+crate's `tests/fixtures/README.md`. The test suites replay them: they need no
+network and no keys.
 
 ## Contract version
 

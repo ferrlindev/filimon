@@ -1,19 +1,35 @@
-# Reddit source plugin config: polls the listed subreddits through the http fetcher.
+# Reddit source plugin config, app-only instance: polls the listed subreddits
+# with an app-only (client_credentials) token the host obtains and refreshes.
+#
+# Register a Reddit "web app" at https://www.reddit.com/prefs/apps, put its client
+# id below and its secret in REDDIT_CLIENT_SECRET (.env). The plugin never sees
+# either: the host exchanges them for the access token (see plugins/README.md).
+#
+# The first poll reads one small page per subreddit; later polls read up to 100
+# posts and emit only posts newer than the last one seen. `hot` is not a ranked
+# re-poll: see "Cursor and first poll" in plugins/README.md for the limits.
 
 [host]
 poll_interval_secs = 300
 timeout_secs = 30
-allowlist = ["oauth.reddit.com", "www.reddit.com"]
+# The token host (www.reddit.com) is outside this list by design: the host
+# reaches it for the token exchange, the plugin never does.
+allowlist = ["oauth.reddit.com"]
 
 [host.backoff]
 initial_secs = 60
 max_secs = 3600
 multiplier = 2.0
 
-[host.secrets]
-client_id = "REDDIT_CLIENT_ID"
-client_secret = "REDDIT_CLIENT_SECRET"
+[host.oauth]
+grant = "client_credentials"
+token_url = "https://www.reddit.com/api/v1/access_token"
+client_id = "your-reddit-web-app-client-id"
+client_secret_env = "REDDIT_CLIENT_SECRET"
+user_agent = "filimon:reddit:0.1.0 (by /u/yourname)"
 
 [settings]
 subreddits = ["rust", "programming"]
-listing = "new"
+listings = ["new"]
+# Required: Reddit asks every client to identify a contact in its User-Agent.
+user_agent_contact = "u/yourname"

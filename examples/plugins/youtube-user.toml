@@ -1,0 +1,31 @@
+# YouTube source plugin config, user instance: polls the uploads of the channels
+# the logged-in user subscribes to. It shares youtube_source.wasm with the
+# `youtube` instance.
+#
+# Log in once with `fili auth login youtube-user`. The instance name is the
+# cursor and token key: do not rename it.
+#
+# Read-only: the single scope below is the only one requested.
+#
+# Quota: units per poll = ceil(subscribed channels fetched / 50) + playlists polled.
+# 50 subscriptions every 900 s is 51 units per poll, about 4,900 units a day
+# of the default 10,000 (see plugins/README.md). A Google consent screen in
+# Testing mode expires the refresh token after about 7 days: log in again then.
+
+[host]
+poll_interval_secs = 900
+allowlist = ["www.googleapis.com"]
+
+[host.oauth]
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+revocation_url = "https://oauth2.googleapis.com/revoke"
+scopes = ["https://www.googleapis.com/auth/youtube.readonly"]
+client_id = "your-google-desktop-client-id.apps.googleusercontent.com"
+client_secret_env = "YOUTUBE_OAUTH_CLIENT_SECRET"
+# Google issues a refresh token only for an offline login.
+authorize_params = { access_type = "offline", prompt = "consent" }
+
+[settings]
+subscriptions = true
+subscriptions_limit = 50
