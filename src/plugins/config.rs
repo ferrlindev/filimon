@@ -19,7 +19,7 @@ use miette::{NamedSource, SourceSpan};
 use serde::Deserialize;
 
 use super::error::{ConfigError, ConfigErrors};
-use super::secrets::{self, ResolvedSecrets};
+use super::secrets::{self, ResolvedSecrets, Secret};
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -29,6 +29,24 @@ const DEFAULT_BACKOFF_MAX_SECS: NonZeroU64 = NonZeroU64::new(3600).unwrap();
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// The news crawler's fetch timeout: the built-in client's own timeout.
 const DEFAULT_CRAWLER_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(15).unwrap();
+
+/// The loopback port of the login callback when a plugin sets no
+/// `redirect_port` (D-04). A provider app registers the exact redirect URI
+/// `http://127.0.0.1:17420/callback`, so changing this default breaks every app
+/// registered with it; `[host.oauth] redirect_port` overrides it per plugin.
+pub const DEFAULT_REDIRECT_PORT: u16 = 17420;
+
+/// Authorize-request parameters the host sets itself; `authorize_params` may
+/// not name one of them, compared ignoring ASCII case (D-14).
+const STANDARD_AUTHORIZE_PARAMS: [&str; 7] = [
+    "state",
+    "code_challenge",
+    "code_challenge_method",
+    "redirect_uri",
+    "client_id",
+    "response_type",
+    "scope",
+];
 
 fn default_true() -> bool {
     true
@@ -135,6 +153,14 @@ struct OAuthSection {
     #[serde(default)]
     scopes: Vec<toml::Spanned<String>>,
     client_id: toml::Spanned<String>,
+    /// Name of the env var (process environment or `.env`) holding the client
+    /// secret. The secret itself is never written in the file (D-12).
+    client_secret_env: Option<toml::Spanned<String>>,
+    revocation_url: Option<toml::Spanned<String>>,
+    redirect_port: Option<toml::Spanned<u16>>,
+    /// Extra authorize-request parameters (D-14), iterated in key order.
+    #[serde(default)]
+    authorize_params: BTreeMap<String, toml::Spanned<String>>,
 }
 
 /// The `[host.backoff]` table. Each value keeps its span when it is given, so
@@ -233,8 +259,9 @@ pub struct PluginConfig {
     pub oauth: Option<OAuthConfig>,
 }
 
-/// A plugin's host-managed OAuth configuration (D-11). Both endpoints are
-/// `https://` URLs with a host (D-13); nothing here is a secret.
+/// A plugin's host-managed OAuth configuration (D-11). Every endpoint is an
+/// `https://` URL with a host and no user-info (D-13). `client_secret` is the
+/// only secret; it is never part of `PluginConfig::secrets` (D-12).
 #[derive(Debug, Clone)]
 #[cfg_attr(
     not(test),
@@ -248,7 +275,13 @@ pub struct OAuthConfig {
     pub token_url: url::Url,
     pub scopes: Vec<String>,
     pub client_id: String,
-    /// Extra authorize-URL parameters, in key order (D-14).
+    /// The client secret, when `client_secret_env` is set. It stays here: the
+    /// plugin's `init` receives only `PluginConfig::secrets`.
+    pub client_secret: Option<Secret>,
+    pub revocation_url: Option<url::Url>,
+    /// The loopback callback port; [`DEFAULT_REDIRECT_PORT`] when not set.
+    pub redirect_port: u16,
+    /// Extra authorize parameters, in key order.
     pub authorize_params: Vec<(String, String)>,
 }
 
@@ -385,23 +418,26 @@ fn load_registry_inner(
         }
     }
 
-    // Pass 2: `.env` is read only when some enabled source declares secrets,
-    // so a `.env` shared with other tools cannot break plugin-free registries.
+    // Pass 2: `.env` is read only when some enabled source declares secrets
+    // (`[host.secrets]` aliases or an OAuth `client_secret_env`), so a `.env`
+    // shared with other tools cannot break plugin-free registries.
     // `None` means the file is unusable: its DotenvInvalid problems are
     // recorded here in line order, and pass 3 reports no MissingSecret.
     let dotenv_path = base_dir.join(".env");
-    let dotenv: Option<HashMap<String, String>> =
-        if parsed.values().any(|plugin| !plugin.aliases.is_empty()) {
-            match secrets::read_dotenv(&dotenv_path) {
-                Ok(map) => Some(map),
-                Err(mut problems) => {
-                    registry_problems.append(&mut problems);
-                    None
-                }
+    let dotenv: Option<HashMap<String, String>> = if parsed
+        .values()
+        .any(|plugin| !plugin.aliases.is_empty() || plugin.client_secret_env.is_some())
+    {
+        match secrets::read_dotenv(&dotenv_path) {
+            Ok(map) => Some(map),
+            Err(mut problems) => {
+                registry_problems.append(&mut problems);
+                None
             }
-        } else {
-            Some(HashMap::new())
-        };
+        }
+    } else {
+        Some(HashMap::new())
+    };
 
     // Pass 3: resolve secrets per enabled source and assemble the output.
     let mut sources = BTreeMap::new();
@@ -616,7 +652,34 @@ fn finish_plugin(
         dotenv,
         dotenv_path,
         env,
-    )?;
+    );
+    // D-12: the client secret goes only into `OAuthConfig::client_secret`,
+    // never into `ResolvedSecrets`, which is what the plugin's `init` receives.
+    let client_secret = match &parsed.client_secret_env {
+        Some(env_var) => secrets::resolve_oauth_secret(
+            name,
+            &parsed.path,
+            &parsed.text,
+            env_var,
+            dotenv,
+            dotenv_path,
+            env,
+        )
+        .map_err(|problem| vec![problem]),
+        None => Ok(None),
+    };
+    let (secrets, client_secret) = match (secrets, client_secret) {
+        (Ok(secrets), Ok(client_secret)) => (secrets, client_secret),
+        (secrets, client_secret) => {
+            let mut problems = secrets.err().unwrap_or_default();
+            problems.extend(client_secret.err().unwrap_or_default());
+            return Err(problems);
+        }
+    };
+    let oauth = parsed.oauth.map(|mut oauth| {
+        oauth.client_secret = client_secret;
+        oauth
+    });
     // Names only, never values: makes alias mappings auditable.
     let env_vars: Vec<&str> = parsed
         .aliases
@@ -628,7 +691,7 @@ fn finish_plugin(
         host: parsed.host,
         settings_toml: parsed.settings_toml,
         secrets,
-        oauth: parsed.oauth,
+        oauth,
     })
 }
 
@@ -815,6 +878,8 @@ struct ParsedPlugin {
     aliases: BTreeMap<String, toml::Spanned<String>>,
     /// The `[host.oauth]` table, when it had no problems.
     oauth: Option<OAuthConfig>,
+    /// The `client_secret_env` of that table, resolved in pass 3.
+    client_secret_env: Option<toml::Spanned<String>>,
     /// `[host]` values that parsed but are out of range.
     invalid: Vec<ConfigError>,
 }
@@ -859,7 +924,16 @@ fn read_plugin(
             .map_err(|e| malformed(format!("cannot re-serialise [settings]: {e}"), None))?
     };
 
-    let invalid = host_problems(name, &display, &text, &file.host);
+    let mut invalid = host_problems(name, &display, &text, &file.host);
+    let oauth_valid = match &file.host.oauth {
+        Some(section) => {
+            let problems = oauth_problems(name, &display, &text, section);
+            let valid = problems.is_empty();
+            invalid.extend(problems);
+            valid
+        }
+        None => true,
+    };
 
     let HostSection {
         poll_interval_secs,
@@ -871,7 +945,14 @@ fn read_plugin(
     } = file.host;
     // A table with problems is reported through `invalid`; it never builds a
     // config, so nothing half-valid can reach the login flow.
-    let oauth = oauth.and_then(|section| build_oauth(&section));
+    let (oauth, client_secret_env) = match oauth {
+        Some(section) if oauth_valid => {
+            let config = build_oauth(&section);
+            let secret_env = config.as_ref().and(section.client_secret_env);
+            (config, secret_env)
+        }
+        _ => (None, None),
+    };
     let host = HostConfig {
         poll_interval: Duration::from_secs(poll_interval_secs.get()),
         timeout: Duration::from_secs(timeout_secs.get()),
@@ -893,16 +974,28 @@ fn read_plugin(
         settings_toml,
         aliases: secrets,
         oauth,
+        client_secret_env,
         invalid,
     })
 }
 
-/// `Some` only when both endpoints satisfy the https rule and `client_id` is
-/// not empty; the same rule `oauth_problems` reports against.
+/// `Some` only when the table satisfies every rule `oauth_problems` reports
+/// against; the client secret is resolved later, in pass 3.
 fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
     let authorize_url = https_endpoint(section.authorize_url.get_ref())?;
     let token_url = https_endpoint(section.token_url.get_ref())?;
+    let revocation_url = match &section.revocation_url {
+        Some(value) => Some(https_endpoint(value.get_ref())?),
+        None => None,
+    };
     if section.client_id.get_ref().is_empty() {
+        return None;
+    }
+    let redirect_port = section
+        .redirect_port
+        .as_ref()
+        .map_or(DEFAULT_REDIRECT_PORT, |port| *port.get_ref());
+    if redirect_port == 0 {
         return None;
     }
     Some(OAuthConfig {
@@ -914,51 +1007,115 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
             .map(|scope| scope.get_ref().clone())
             .collect(),
         client_id: section.client_id.get_ref().clone(),
-        authorize_params: Vec::new(),
+        client_secret: None,
+        revocation_url,
+        redirect_port,
+        authorize_params: section
+            .authorize_params
+            .iter()
+            .map(|(key, value)| (key.clone(), value.get_ref().clone()))
+            .collect(),
     })
 }
 
-/// The parsed URL when `text` is an `https://` URL with a host (D-13).
+/// The parsed URL when `text` is an `https://` URL with a host and no
+/// user-info (D-13).
 fn https_endpoint(text: &str) -> Option<url::Url> {
     let url = url::Url::parse(text).ok()?;
-    (url.scheme() == "https" && url.host_str().is_some()).then_some(url)
+    let plain = url.username().is_empty() && url.password().is_none();
+    (url.scheme() == "https" && url.host_str().is_some() && plain).then_some(url)
 }
 
-/// `[host.oauth]` checks, in a fixed order: `authorize_url`, `token_url`, then
-/// `client_id`. A message never repeats the value it rejects.
+/// `true` when `scope` is empty or contains whitespace: a joined scope list
+/// splits on spaces, so one entry must be one scope.
+fn scope_is_invalid(scope: &str) -> bool {
+    scope.is_empty() || scope.chars().any(char::is_whitespace)
+}
+
+/// `[host.oauth]` checks. Every problem of the table is collected, in a fixed
+/// order: the three endpoints, `client_id`, `redirect_port`, scopes by index,
+/// `client_secret_env`, then `authorize_params` in key order. A message states
+/// the rule and never repeats the value it rejects.
 fn oauth_problems(
     plugin: &str,
     path: &str,
     text: &str,
     section: &OAuthSection,
 ) -> Vec<ConfigError> {
-    let invalid = |field: &str, message: &str, span: SourceSpan| ConfigError::InvalidValue {
+    let invalid = |field: String, message: &str, span: SourceSpan| ConfigError::InvalidValue {
         plugin: plugin.to_string(),
         path: path.to_string(),
-        field: field.to_string(),
+        field,
         message: message.to_string(),
         src: NamedSource::new(path, text.to_string()),
         span: Some(span),
     };
     let mut problems = Vec::new();
     for (field, value) in [
-        ("host.oauth.authorize_url", &section.authorize_url),
-        ("host.oauth.token_url", &section.token_url),
+        ("host.oauth.authorize_url", Some(&section.authorize_url)),
+        ("host.oauth.token_url", Some(&section.token_url)),
+        ("host.oauth.revocation_url", section.revocation_url.as_ref()),
     ] {
+        let Some(value) = value else { continue };
         if https_endpoint(value.get_ref()).is_none() {
             problems.push(invalid(
-                field,
-                "must be an https:// URL with a host",
+                field.to_string(),
+                "must be an https:// URL with a host and no user-info",
                 value.span().into(),
             ));
         }
     }
     if section.client_id.get_ref().is_empty() {
         problems.push(invalid(
-            "host.oauth.client_id",
+            "host.oauth.client_id".to_string(),
             "must not be empty",
             section.client_id.span().into(),
         ));
+    }
+    if let Some(port) = &section.redirect_port
+        && *port.get_ref() == 0
+    {
+        problems.push(invalid(
+            "host.oauth.redirect_port".to_string(),
+            "must be between 1 and 65535",
+            port.span().into(),
+        ));
+    }
+    for (index, scope) in section.scopes.iter().enumerate() {
+        if scope_is_invalid(scope.get_ref()) {
+            problems.push(invalid(
+                format!("host.oauth.scopes[{index}]"),
+                "must be a non-empty scope without whitespace",
+                scope.span().into(),
+            ));
+        }
+    }
+    if let Some(env_var) = &section.client_secret_env
+        && env_var.get_ref().is_empty()
+    {
+        problems.push(invalid(
+            "host.oauth.client_secret_env".to_string(),
+            "must not be empty",
+            env_var.span().into(),
+        ));
+    }
+    for (key, value) in &section.authorize_params {
+        if key.is_empty() {
+            problems.push(invalid(
+                "host.oauth.authorize_params".to_string(),
+                "keys must not be empty",
+                value.span().into(),
+            ));
+        } else if STANDARD_AUTHORIZE_PARAMS
+            .iter()
+            .any(|standard| key.eq_ignore_ascii_case(standard))
+        {
+            problems.push(invalid(
+                format!("host.oauth.authorize_params.{key}"),
+                "is a standard authorize parameter that the host sets itself",
+                value.span().into(),
+            ));
+        }
     }
     problems
 }
@@ -1016,10 +1173,6 @@ fn host_problems(plugin: &str, path: &str, text: &str, host: &HostSection) -> Ve
             format!("must be >= initial_secs ({initial})"),
             span,
         ));
-    }
-
-    if let Some(oauth) = &host.oauth {
-        problems.extend(oauth_problems(plugin, path, text, oauth));
     }
 
     problems
@@ -1733,20 +1886,34 @@ fetcher = "nope"
             &dir,
             &format!(
                 "{}\n[settings]\ngreeting = \"hi\"\n",
-                oauth_plugin("https://auth.example/authorize", "https://auth.example/token")
+                oauth_plugin(
+                    "https://auth.example/authorize",
+                    "https://auth.example/token"
+                )
             ),
         );
 
         let registry = load(&dir).expect("a plugin with [host.oauth] loads");
         let plugin = registry.sources["alpha"].plugin.as_ref().expect("loaded");
         let oauth = plugin.oauth.as_ref().expect("the oauth table");
-        assert_eq!(oauth.authorize_url.as_str(), "https://auth.example/authorize");
+        assert_eq!(
+            oauth.authorize_url.as_str(),
+            "https://auth.example/authorize"
+        );
         assert_eq!(oauth.token_url.as_str(), "https://auth.example/token");
         assert_eq!(oauth.scopes, ["read"]);
         assert_eq!(oauth.client_id, "client-1");
         // Nothing of the table is placed under [settings].
-        assert!(!plugin.settings_toml.contains("oauth"), "{}", plugin.settings_toml);
-        assert!(!plugin.settings_toml.contains("client-1"), "{}", plugin.settings_toml);
+        assert!(
+            !plugin.settings_toml.contains("oauth"),
+            "{}",
+            plugin.settings_toml
+        );
+        assert!(
+            !plugin.settings_toml.contains("client-1"),
+            "{}",
+            plugin.settings_toml
+        );
 
         let dir = TempDir::new().expect("tempdir");
         alpha_with_plugin(&dir, "[host]\npoll_interval_secs = 60\n");
@@ -1759,9 +1926,17 @@ fetcher = "nope"
     fn oauth_endpoints_must_be_https_naming_plugin_and_field() {
         let https = "https://auth.example/x";
         let cases = [
-            ("http://auth.example/authorize", https, "host.oauth.authorize_url"),
+            (
+                "http://auth.example/authorize",
+                https,
+                "host.oauth.authorize_url",
+            ),
             ("not a url", https, "host.oauth.authorize_url"),
-            ("ftp://auth.example/authorize", https, "host.oauth.authorize_url"),
+            (
+                "ftp://auth.example/authorize",
+                https,
+                "host.oauth.authorize_url",
+            ),
             (https, "http://auth.example/token", "host.oauth.token_url"),
             (https, "not a url", "host.oauth.token_url"),
             (https, "ftp://auth.example/token", "host.oauth.token_url"),
@@ -1787,14 +1962,20 @@ fetcher = "nope"
             assert_eq!(got, field);
             assert!(span.is_some(), "the value is labelled");
             assert!(message.contains("https://"), "{message}");
-            assert!(!message.contains("auth.example"), "no value echo: {message}");
+            assert!(
+                !message.contains("auth.example"),
+                "no value echo: {message}"
+            );
         }
 
         // An upper-case scheme is still https.
         let dir = TempDir::new().expect("tempdir");
         alpha_with_plugin(
             &dir,
-            &oauth_plugin("HTTPS://auth.example/authorize", "https://auth.example/token"),
+            &oauth_plugin(
+                "HTTPS://auth.example/authorize",
+                "https://auth.example/token",
+            ),
         );
         let registry = load(&dir).expect("an upper-case HTTPS endpoint is accepted");
         let oauth = registry.sources["alpha"]
@@ -1803,6 +1984,548 @@ fetcher = "nope"
             .and_then(|p| p.oauth.as_ref())
             .expect("oauth");
         assert_eq!(oauth.authorize_url.scheme(), "https");
+    }
+
+    // ── [host.oauth] remaining keys (D-04, D-11, D-13, D-14) ──────────────────
+
+    /// A plugin file whose `[host.oauth]` has https endpoints, the given
+    /// `scopes` array text and `client_id`, followed by `extra` lines (which
+    /// must stay inside the table, so they come last).
+    fn oauth_file(scopes: &str, extra: &str) -> String {
+        format!(
+            "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
+             authorize_url = \"https://auth.example/authorize\"\n\
+             token_url = \"https://auth.example/token\"\nscopes = {scopes}\n\
+             client_id = \"client-1\"\n{extra}"
+        )
+    }
+
+    /// Loads `alpha` and returns its `[host.oauth]` config.
+    fn loaded_oauth(dir: &TempDir) -> OAuthConfig {
+        load(dir).expect("the plugin loads").sources["alpha"]
+            .plugin
+            .as_ref()
+            .expect("loaded")
+            .oauth
+            .clone()
+            .expect("the oauth table")
+    }
+
+    /// Loads `alpha` and returns `(field, message)` of every problem, each of
+    /// which must be an `InvalidValue` naming `alpha` with a labelled span.
+    fn invalid_problems(dir: &TempDir) -> Vec<(String, String)> {
+        let errors = load(dir).expect_err("an invalid [host.oauth] is an error");
+        errors
+            .problems
+            .iter()
+            .map(|problem| match problem {
+                ConfigError::InvalidValue {
+                    plugin,
+                    field,
+                    message,
+                    span,
+                    ..
+                } => {
+                    assert_eq!(plugin, "alpha");
+                    assert!(span.is_some(), "{field} is labelled");
+                    (field.clone(), message.clone())
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn oauth_optional_keys_load_with_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", ""));
+
+        let oauth = loaded_oauth(&dir);
+
+        assert_eq!(oauth.redirect_port, DEFAULT_REDIRECT_PORT);
+        assert_eq!(oauth.redirect_port, 17420);
+        assert!(oauth.revocation_url.is_none());
+        assert!(oauth.client_secret.is_none());
+        assert!(oauth.authorize_params.is_empty());
+    }
+
+    #[test]
+    fn oauth_all_keys_load() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &oauth_file(
+                "[\"read\", \"write\"]",
+                "revocation_url = \"https://auth.example/revoke\"\nredirect_port = 8123\n\
+                 authorize_params = { prompt = \"consent\", duration = \"permanent\" }\n",
+            ),
+        );
+
+        let oauth = loaded_oauth(&dir);
+
+        assert_eq!(oauth.scopes, ["read", "write"]);
+        assert_eq!(
+            oauth.revocation_url.as_ref().map(url::Url::as_str),
+            Some("https://auth.example/revoke")
+        );
+        assert_eq!(oauth.redirect_port, 8123);
+        assert_eq!(
+            oauth.authorize_params,
+            [
+                ("duration".to_string(), "permanent".to_string()),
+                ("prompt".to_string(), "consent".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_oauth_key_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", "client_secret = \"x\"\n"));
+
+        let message = malformed_message(&dir);
+
+        assert!(message.contains("client_secret"), "{message}");
+    }
+
+    #[test]
+    fn revocation_url_must_be_https_naming_plugin_and_field() {
+        for url in [
+            "http://auth.example/revoke",
+            "not a url",
+            "ftp://auth.example/r",
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(
+                &dir,
+                &oauth_file("[\"read\"]", &format!("revocation_url = \"{url}\"\n")),
+            );
+
+            let problems = invalid_problems(&dir);
+
+            assert_eq!(problems.len(), 1, "{url}: {problems:?}");
+            assert_eq!(problems[0].0, "host.oauth.revocation_url");
+            assert!(problems[0].1.contains("https://"), "{}", problems[0].1);
+            assert!(!problems[0].1.contains("auth.example"), "{}", problems[0].1);
+        }
+    }
+
+    #[test]
+    fn oauth_endpoints_reject_userinfo_naming_plugin_and_field() {
+        let clean = "https://auth.example/x";
+        for bad in [
+            "https://user:pw@auth.example/x",
+            "https://user@auth.example/x",
+        ] {
+            for field in ["authorize_url", "token_url", "revocation_url"] {
+                let authorize = if field == "authorize_url" { bad } else { clean };
+                let token = if field == "token_url" { bad } else { clean };
+                let extra = if field == "revocation_url" {
+                    format!("revocation_url = \"{bad}\"\n")
+                } else {
+                    String::new()
+                };
+                let dir = TempDir::new().expect("tempdir");
+                alpha_with_plugin(&dir, &format!("{}{extra}", oauth_plugin(authorize, token)));
+
+                let errors = load(&dir).expect_err("user-info in an endpoint is an error");
+
+                assert_eq!(errors.problems.len(), 1, "{bad} {field}: {errors:?}");
+                let ConfigError::InvalidValue {
+                    plugin,
+                    field: got,
+                    message,
+                    ..
+                } = &errors.problems[0]
+                else {
+                    panic!("expected InvalidValue, got {:?}", errors.problems[0]);
+                };
+                assert_eq!(plugin, "alpha");
+                assert_eq!(got, &format!("host.oauth.{field}"));
+                assert!(!message.contains("pw"), "{message}");
+                assert!(!message.contains("user@"), "{message}");
+                assert!(!message.contains("user:"), "{message}");
+                assert!(!message.contains("auth.example"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_port_zero_is_rejected_naming_plugin_and_field() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", "redirect_port = 0\n"));
+
+        let problems = invalid_problems(&dir);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].0, "host.oauth.redirect_port");
+        assert!(problems[0].1.contains("1 and 65535"), "{}", problems[0].1);
+    }
+
+    #[test]
+    fn a_scope_with_whitespace_or_empty_is_rejected_naming_its_index() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\", \"two words\", \"\"]", ""));
+
+        let problems = invalid_problems(&dir);
+
+        let fields: Vec<&str> = problems.iter().map(|(field, _)| field.as_str()).collect();
+        assert_eq!(fields, ["host.oauth.scopes[1]", "host.oauth.scopes[2]"]);
+        assert!(
+            problems
+                .iter()
+                .all(|(_, message)| !message.contains("two words"))
+        );
+    }
+
+    #[test]
+    fn authorize_params_colliding_with_a_standard_key_are_rejected_naming_plugin_and_field() {
+        for key in [
+            "state",
+            "code_challenge",
+            "code_challenge_method",
+            "redirect_uri",
+            "client_id",
+            "response_type",
+            "scope",
+            "State",
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(
+                &dir,
+                &oauth_file(
+                    "[\"read\"]",
+                    &format!("authorize_params = {{ \"{key}\" = \"v\" }}\n"),
+                ),
+            );
+
+            let problems = invalid_problems(&dir);
+
+            assert_eq!(problems.len(), 1, "{key}: {problems:?}");
+            assert_eq!(problems[0].0, format!("host.oauth.authorize_params.{key}"));
+            assert!(problems[0].1.contains("host"), "{}", problems[0].1);
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &oauth_file(
+                "[\"read\"]",
+                "authorize_params = { duration = \"permanent\" }\n",
+            ),
+        );
+        assert_eq!(loaded_oauth(&dir).authorize_params.len(), 1);
+    }
+
+    #[test]
+    fn oauth_problems_are_collected_not_first_only() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &format!(
+                "{}redirect_port = 0\n",
+                oauth_plugin("http://auth.example/a", "http://auth.example/t")
+            ),
+        );
+
+        let problems = invalid_problems(&dir);
+
+        let fields: Vec<&str> = problems.iter().map(|(field, _)| field.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                "host.oauth.authorize_url",
+                "host.oauth.token_url",
+                "host.oauth.redirect_port"
+            ]
+        );
+    }
+
+    // ── [host.oauth] client secret (D-12) ─────────────────────────────────────
+
+    /// The value every secret test plants; no output may ever contain it.
+    const SENTINEL: &str = "s3cret-sentinel";
+
+    /// `alpha` with `client_secret_env = "STUB_CLIENT_SECRET"` and, when
+    /// `with_token_alias` is set, `[host.secrets] token = "STUB_TOKEN"`.
+    fn alpha_with_client_secret(dir: &TempDir, with_token_alias: bool, dotenv: Option<&str>) {
+        let secrets = if with_token_alias {
+            "\n[host.secrets]\ntoken = \"STUB_TOKEN\"\n"
+        } else {
+            ""
+        };
+        alpha_with_plugin(
+            dir,
+            &format!(
+                "{}{secrets}",
+                oauth_file("[\"read\"]", "client_secret_env = \"STUB_CLIENT_SECRET\"\n")
+            ),
+        );
+        if let Some(text) = dotenv {
+            write(dir, ".env", text);
+        }
+    }
+
+    fn load_with(
+        dir: &TempDir,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<LoadedRegistry, ConfigErrors> {
+        load_registry_with_env(&dir.path().join("filimon.toml"), env)
+    }
+
+    fn plugin_of(registry: &LoadedRegistry) -> &PluginConfig {
+        registry.sources["alpha"].plugin.as_ref().expect("loaded")
+    }
+
+    #[test]
+    fn a_secret_only_plugin_reads_dotenv() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            false,
+            Some(&format!("STUB_CLIENT_SECRET={SENTINEL}\n")),
+        );
+
+        let registry = load(&dir).expect("the client secret comes from .env");
+
+        let plugin = plugin_of(&registry);
+        let secret = plugin
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.client_secret.as_ref())
+            .expect("a client secret");
+        assert_eq!(secret.expose(), SENTINEL);
+        assert!(plugin.secrets.is_empty(), "no [host.secrets] alias exists");
+    }
+
+    #[test]
+    fn client_secret_never_appears_in_resolved_secrets() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            true,
+            Some(&format!(
+                "STUB_TOKEN=tok-1\nSTUB_CLIENT_SECRET={SENTINEL}\n"
+            )),
+        );
+
+        let registry = load(&dir).expect("both secrets resolve");
+
+        let plugin = plugin_of(&registry);
+        let keys: Vec<&str> = plugin.secrets.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["token"]);
+        assert!(plugin.secrets.values().all(|s| s.expose() != SENTINEL));
+        assert_eq!(plugin.secrets["token"].expose(), "tok-1");
+        assert!(!plugin.settings_toml.contains(SENTINEL));
+        let oauth = plugin.oauth.as_ref().expect("oauth");
+        assert_eq!(
+            oauth.client_secret.as_ref().map(Secret::expose),
+            Some(SENTINEL)
+        );
+    }
+
+    #[test]
+    fn missing_client_secret_names_plugin_and_field() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(&dir, false, Some("UNRELATED=1\n"));
+
+        let errors = load(&dir).expect_err("a missing client secret is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::MissingOAuthSecret {
+            plugin, env_var, ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected MissingOAuthSecret, got {:?}", errors.problems[0]);
+        };
+        assert_eq!(plugin, "alpha");
+        assert_eq!(env_var, "STUB_CLIENT_SECRET");
+        let text = errors.problems[0].to_string();
+        for needle in [
+            "alpha",
+            "host.oauth.client_secret_env",
+            "STUB_CLIENT_SECRET",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        let report = render(&errors);
+        assert!(
+            report.contains("fili::config::missing_oauth_secret"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn empty_client_secret_names_the_origin() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(&dir, false, Some("STUB_CLIENT_SECRET=\n"));
+
+        let errors = load(&dir).expect_err("an empty .env value is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        let ConfigError::EmptyOAuthSecret {
+            plugin,
+            env_var,
+            origin,
+            ..
+        } = &errors.problems[0]
+        else {
+            panic!("expected EmptyOAuthSecret, got {:?}", errors.problems[0]);
+        };
+        assert_eq!(plugin, "alpha");
+        assert_eq!(env_var, "STUB_CLIENT_SECRET");
+        assert_eq!(origin, &dir.path().join(".env").display().to_string());
+        let text = errors.problems[0].to_string();
+        assert!(text.contains("host.oauth.client_secret_env"), "{text}");
+        let report = render(&errors);
+        assert!(
+            report.contains("fili::config::empty_oauth_secret"),
+            "{report}"
+        );
+
+        // An empty process value names the process environment.
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(String::new);
+        let errors = load_with(&dir, &env).expect_err("an empty process value is an error");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::EmptyOAuthSecret { origin, .. } if origin == "the process environment"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn process_env_wins_over_dotenv_even_when_empty() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            false,
+            Some(&format!("STUB_CLIENT_SECRET={SENTINEL}\n")),
+        );
+
+        let empty = |key: &str| (key == "STUB_CLIENT_SECRET").then(String::new);
+        let errors = load_with(&dir, &empty).expect_err("an empty process value wins");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::EmptyOAuthSecret { origin, .. } if origin == "the process environment"
+            ),
+            "{errors:?}"
+        );
+
+        let from_process =
+            |key: &str| (key == "STUB_CLIENT_SECRET").then(|| "from-env".to_string());
+        let registry = load_with(&dir, &from_process).expect("a non-empty process value wins");
+        let secret = plugin_of(&registry)
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.client_secret.as_ref())
+            .expect("a client secret");
+        assert_eq!(secret.expose(), "from-env");
+    }
+
+    #[test]
+    fn an_unusable_dotenv_does_not_add_a_missing_client_secret_problem() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(&dir, false, Some("STUB_CLIENT_SECRET=has a space\n"));
+
+        let errors = load(&dir).expect_err("an invalid .env is an error");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::DotenvInvalid { line: Some(1), .. }
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_load_plugin_keeps_oauth_secret_problems_for_that_plugin() {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            &dir,
+            "filimon.toml",
+            "[sources.a]\ncomponent = \"a.wasm\"\nconfig = \"a.toml\"\n\n\
+             [sources.b]\ncomponent = \"b.wasm\"\nconfig = \"b.toml\"\n",
+        );
+        for (name, var) in [("a", "A_CLIENT_SECRET"), ("b", "B_CLIENT_SECRET")] {
+            write(
+                &dir,
+                &format!("{name}.toml"),
+                &oauth_file("[\"read\"]", &format!("client_secret_env = \"{var}\"\n")),
+            );
+        }
+
+        let errors = load_plugin_with_env(&dir.path().join("filimon.toml"), "a", &no_env)
+            .expect_err("a lacks its client secret");
+
+        assert_eq!(errors.problems.len(), 1, "{errors:?}");
+        assert!(
+            matches!(
+                &errors.problems[0],
+                ConfigError::MissingOAuthSecret { plugin, env_var, .. }
+                    if plugin == "a" && env_var == "A_CLIENT_SECRET"
+            ),
+            "{errors:?}"
+        );
+        assert_eq!(errors.problems[0].plugin(), Some("a"));
+
+        // The unscoped load reports both plugins.
+        let all = load(&dir).expect_err("both lack their client secret");
+        assert_eq!(all.problems.len(), 2, "{all:?}");
+    }
+
+    #[test]
+    fn oauth_secret_value_never_in_debug_or_errors() {
+        // Success: the secret is held, but no Debug text carries it.
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_client_secret(
+            &dir,
+            true,
+            Some(&format!(
+                "STUB_TOKEN=tok-1\nSTUB_CLIENT_SECRET={SENTINEL}\n"
+            )),
+        );
+        let registry = load(&dir).expect("loads");
+        let debug = format!("{registry:?}");
+        assert!(!debug.contains(SENTINEL), "{debug}");
+        assert!(debug.contains("Secret(***)"), "{debug}");
+
+        // Failures that sit beside a present secret: a missing alias, an
+        // empty alias, and an invalid .env.
+        let cases = [
+            format!("STUB_CLIENT_SECRET={SENTINEL}\n"),
+            format!("STUB_TOKEN=\nSTUB_CLIENT_SECRET={SENTINEL}\n"),
+            format!("STUB_CLIENT_SECRET={SENTINEL}\nBROKEN=has a space\n"),
+        ];
+        for dotenv in cases {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_client_secret(&dir, true, Some(&dotenv));
+
+            let errors = load(&dir).expect_err("a problem sits beside the client secret");
+
+            let report = render(&errors);
+            for text in [
+                report,
+                format!("{errors:?}"),
+                errors.to_string(),
+                format!("{:?}", miette::Report::new(errors)),
+            ] {
+                assert!(!text.contains(SENTINEL), "leaked: {text}");
+            }
+        }
+
+        // The problems of the secret itself carry names only.
+        for dotenv in ["", "STUB_CLIENT_SECRET=\n"] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_client_secret(&dir, false, Some(dotenv));
+            let env = |key: &str| (key == "OTHER").then(|| SENTINEL.to_string());
+            let errors = load_with(&dir, &env).expect_err("a client secret problem");
+            assert!(!render(&errors).contains(SENTINEL));
+        }
     }
 
     #[test]
@@ -2269,6 +2992,32 @@ config = "x.toml"
         ];
         for problem in &registry_level {
             assert_eq!(problem.plugin(), None, "{problem:?}");
+        }
+    }
+
+    #[test]
+    fn config_error_plugin_names_the_oauth_secret_variants() {
+        let src = || NamedSource::new("x.toml", String::new());
+        let span = || SourceSpan::from(0..0);
+        let problems = [
+            ConfigError::MissingOAuthSecret {
+                plugin: "p".into(),
+                env_var: "E".into(),
+                dotenv: "d".into(),
+                src: src(),
+                span: span(),
+            },
+            ConfigError::EmptyOAuthSecret {
+                plugin: "p".into(),
+                env_var: "E".into(),
+                origin: "o".into(),
+                fix: "f".into(),
+                src: src(),
+                span: span(),
+            },
+        ];
+        for problem in &problems {
+            assert_eq!(problem.plugin(), Some("p"), "{problem:?}");
         }
     }
 

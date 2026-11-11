@@ -37,6 +37,14 @@ impl fmt::Debug for Secret {
     }
 }
 
+#[cfg(test)]
+impl Secret {
+    /// A secret holding `value`, for tests of code that carries one.
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
 /// One plugin's secrets, keyed by alias and iterated in alias order.
 pub type ResolvedSecrets = BTreeMap<String, Secret>;
 
@@ -308,6 +316,65 @@ pub fn resolve_secrets(
         Ok(resolved)
     } else {
         Err(problems)
+    }
+}
+
+/// Resolves a plugin's `[host.oauth] client_secret_env` to the client secret.
+///
+/// The lookup is exactly `resolve_secrets`': a value from `env` wins even when
+/// empty, then the `.env` map; exact and case-sensitive. The result is meant
+/// for `OAuthConfig::client_secret` only; it is never put into
+/// `ResolvedSecrets`, so the plugin's `init` cannot receive it (D-12).
+///
+/// `dotenv` is `None` when the `.env` was unusable; its `DotenvInvalid`
+/// problems are already recorded, so a value found nowhere is `Ok(None)`
+/// rather than a misleading `MissingOAuthSecret`.
+///
+/// # Errors
+/// `EmptyOAuthSecret` for an empty effective value and `MissingOAuthSecret`
+/// when nothing is found in a usable `.env`, both labelled at the
+/// `client_secret_env` value in the plugin file and carrying names only.
+#[allow(
+    clippy::result_large_err,
+    reason = "cold one-shot config load; ConfigError carries its diagnostic source"
+)]
+pub(crate) fn resolve_oauth_secret(
+    plugin: &str,
+    plugin_path: &Path,
+    plugin_text: &str,
+    env_var: &toml::Spanned<String>,
+    dotenv: Option<&HashMap<String, String>>,
+    dotenv_path: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<Secret>, ConfigError> {
+    let name = env_var.get_ref();
+    let plugin_src =
+        || NamedSource::new(plugin_path.display().to_string(), plugin_text.to_string());
+    let (value, from_process) = match env(name) {
+        Some(value) => (Some(value), true),
+        None => (dotenv.and_then(|map| map.get(name).cloned()), false),
+    };
+    match value {
+        Some(value) if value.is_empty() => {
+            let (origin, fix) = empty_secret_source(name, from_process, dotenv_path);
+            Err(ConfigError::EmptyOAuthSecret {
+                plugin: plugin.to_string(),
+                env_var: name.clone(),
+                origin,
+                fix,
+                src: plugin_src(),
+                span: env_var.span().into(),
+            })
+        }
+        Some(value) => Ok(Some(Secret(value))),
+        None if dotenv.is_none() => Ok(None),
+        None => Err(ConfigError::MissingOAuthSecret {
+            plugin: plugin.to_string(),
+            env_var: name.clone(),
+            dotenv: dotenv_path.display().to_string(),
+            src: plugin_src(),
+            span: env_var.span().into(),
+        }),
     }
 }
 
@@ -625,6 +692,14 @@ lower_case=v
         assert!(help.contains("non-empty value in"), "{help}");
         assert!(help.contains(DOTENV_PATH), "{help}");
         assert!(!help.contains("unset"), "{help}");
+    }
+
+    #[test]
+    fn secret_for_test_exposes_its_value_and_stays_redacted() {
+        let secret = Secret::for_test("pa55word");
+
+        assert_eq!(secret.expose(), "pa55word");
+        assert_eq!(format!("{secret:?}"), "Secret(***)");
     }
 
     #[test]
