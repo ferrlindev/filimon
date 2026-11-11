@@ -39,4 +39,10 @@ pub enum AuthError {
     #[error("plugin name `{name}` may only contain a-z, 0-9, '_' and '-'")]
     #[diagnostic(code(fili::auth::invalid_name))]
     InvalidName { name: String },
+
+    /// The operating system could not supply random bytes for the PKCE
+    /// verifier or the `state` value.
+    #[error("cannot read secure random bytes: {reason}")]
+    #[diagnostic(code(fili::auth::random))]
+    Random { reason: String },
 }

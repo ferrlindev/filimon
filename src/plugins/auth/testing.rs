@@ -16,6 +16,7 @@ pub(crate) fn oauth_config() -> OAuthConfig {
         token_url: url::Url::parse("https://auth.example/token").expect("url"),
         scopes: vec!["read".to_string()],
         client_id: "client-1".to_string(),
+        authorize_params: vec![],
     }
 }
 
