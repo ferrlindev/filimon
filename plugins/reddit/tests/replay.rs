@@ -232,7 +232,10 @@ fn a_failed_feed_fails_the_whole_poll_with_no_items_and_no_cursor() {
         "subreddits = [\"rust\", \"programming\"]\nuser_agent_contact = \"u/tester\"\n",
     );
     let error = poll(&http, &two_feeds, None, Some(TOKEN)).unwrap_err();
-    assert_eq!(error, PollError::Transient("Reddit HTTP 500".to_string()));
+    assert_eq!(
+        error,
+        PollError::Transient("Reddit HTTP 500 for r/programming:new".to_string())
+    );
     let PollError::Transient(text) = error else {
         unreachable!()
     };
@@ -810,4 +813,177 @@ fn fetch_level_errors_map_to_the_poll_error_variants() {
         poll_with(HttpError::InvalidRequest("detail-zzz".to_string())),
         PollError::Fatal(text) if !text.contains("detail-zzz")
     ));
+}
+
+// ── Plan 07-06 Task 1: response classification (D-13, D-04, SC4) ─────────────
+
+/// A response with the given status and headers around a fixed opaque body.
+fn status_response(status: u16, headers: &[(&str, &str)], body: &str) -> HttpResponse {
+    HttpResponse {
+        status,
+        headers: headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+/// The `listing_new` body with the given status and headers.
+fn listing_with(status: u16, headers: &[(&str, &str)]) -> HttpResponse {
+    let mut response = fixture("listing_new");
+    response.status = status;
+    response.headers = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    response
+}
+
+fn poll_error_for(response: HttpResponse) -> PollError {
+    let http = ScriptedHttp::new(vec![Ok(response)]);
+    run(&http, &rust_settings(), None).unwrap_err()
+}
+
+#[test]
+fn http_429_is_rate_limited_with_the_reset_seconds() {
+    let response = fixture("rate_limited_429");
+    assert_eq!(response.status, 429);
+    let http = ScriptedHttp::new(vec![Ok(response)]);
+    let result = run(&http, &rust_settings(), None);
+    assert_eq!(result.unwrap_err(), PollError::RateLimited(Some(37)));
+}
+
+#[test]
+fn remaining_below_one_on_a_200_is_rate_limited_at_the_boundary() {
+    for remaining in ["1", "1.0", "59.0", "2"] {
+        let http = ScriptedHttp::new(vec![Ok(listing_with(
+            200,
+            &[("x-ratelimit-remaining", remaining), ("x-ratelimit-reset", "30")],
+        ))]);
+        let outcome = run(&http, &rust_settings(), None)
+            .unwrap_or_else(|e| panic!("remaining {remaining} must not be limited: {e:?}"));
+        assert_eq!(outcome.items.len(), 3, "remaining {remaining}");
+    }
+    for remaining in ["0.99", "0.5", "0", "0.0"] {
+        let http = ScriptedHttp::new(vec![Ok(listing_with(
+            200,
+            &[("x-ratelimit-remaining", remaining), ("x-ratelimit-reset", "30")],
+        ))]);
+        let error = run(&http, &rust_settings(), None).unwrap_err();
+        assert_eq!(
+            error,
+            PollError::RateLimited(Some(30)),
+            "remaining {remaining}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_reset_header_gives_rate_limited_none() {
+    let error = poll_error_for(status_response(
+        429,
+        &[("x-ratelimit-remaining", "0")],
+        "{}",
+    ));
+    assert_eq!(error, PollError::RateLimited(None));
+    let error = poll_error_for(status_response(
+        429,
+        &[("x-ratelimit-reset", "soon")],
+        "{}",
+    ));
+    assert_eq!(error, PollError::RateLimited(None));
+    let error = poll_error_for(status_response(429, &[], "{}"));
+    assert_eq!(error, PollError::RateLimited(None));
+}
+
+#[test]
+fn http_401_is_auth_required() {
+    let response = fixture("unauthorized_401");
+    assert_eq!(response.status, 401);
+    assert_eq!(poll_error_for(response), PollError::AuthRequired);
+}
+
+#[test]
+fn http_403_is_a_named_transient_and_404_is_a_named_config_error() {
+    match poll_error_for(status_response(403, &[], "forbidden-body-text")) {
+        PollError::Transient(text) => {
+            assert!(text.contains("r/rust:new"), "{text}");
+            assert!(text.contains("403"), "{text}");
+            assert!(!text.contains("forbidden-body-text"), "{text}");
+        }
+        other => panic!("403 must be transient, got {other:?}"),
+    }
+    match poll_error_for(status_response(404, &[], "missing-body-text")) {
+        PollError::Config(text) => {
+            assert!(text.contains("r/rust:new"), "{text}");
+            assert!(text.contains("404"), "{text}");
+            assert!(!text.contains("missing-body-text"), "{text}");
+        }
+        other => panic!("404 must be a config error, got {other:?}"),
+    }
+}
+
+#[test]
+fn http_5xx_is_transient() {
+    for status in [500u16, 502, 503] {
+        match poll_error_for(status_response(status, &[], "oops-body-text")) {
+            PollError::Transient(text) => {
+                assert!(text.contains(&status.to_string()), "{text}");
+                assert!(!text.contains("oops-body-text"), "{text}");
+            }
+            other => panic!("{status} must be transient, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn malformed_json_is_transient_without_echoing_the_body() {
+    let response = fixture("malformed");
+    assert_eq!(response.status, 200);
+    match poll_error_for(response) {
+        PollError::Transient(text) => {
+            assert!(!text.contains("SENTINEL_TRUNCATED_BODY_TEXT"), "{text}");
+        }
+        other => panic!("malformed JSON must be transient, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_error_status_maps_to_an_error_never_an_empty_success() {
+    for status in [301u16, 302, 400, 401, 403, 404, 408, 429, 500, 502, 503] {
+        // An empty-but-valid listing body: a naive implementation that ignored
+        // the status would turn it into a quiet empty success.
+        let body = serde_json::json!({"kind": "Listing", "data": {"children": []}}).to_string();
+        let http = ScriptedHttp::new(vec![Ok(status_response(status, &[], &body))]);
+        let result = run(&http, &rust_settings(), None);
+        assert!(result.is_err(), "status {status} returned {result:?}");
+    }
+}
+
+#[test]
+fn no_rate_limit_retry_inside_one_poll() {
+    let three = feed_settings(&["rust", "programming", "news"], &["new"]);
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("rate_limited_429")),
+        Ok(fixture("listing_new")),
+        Ok(fixture("listing_new")),
+    ]);
+    let error = run(&http, &three, None).unwrap_err();
+    assert_eq!(error, PollError::RateLimited(Some(37)));
+    assert_eq!(http.requests().len(), 1, "no second attempt was made");
+}
+
+#[test]
+fn a_poll_after_a_rate_limit_succeeds_with_no_state_to_reset() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("rate_limited_429")),
+        Ok(fixture("listing_new")),
+    ]);
+    assert!(matches!(
+        run(&http, &rust_settings(), None),
+        Err(PollError::RateLimited(Some(37)))
+    ));
+    let outcome = run(&http, &rust_settings(), None).expect("the next poll succeeds");
+    assert_eq!(outcome.items.len(), 3);
 }

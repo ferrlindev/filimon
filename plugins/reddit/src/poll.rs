@@ -47,6 +47,17 @@ fn map_http_error(error: HttpError) -> PollError {
     }
 }
 
+/// A response header parsed as a float (Reddit can send `59.0`).
+fn parse_header_f64(_headers: &[(String, String)], _name: &str) -> Option<f64> {
+    None
+}
+
+/// Whole seconds for a reset header: rounded up, negatives clamp to 0, huge
+/// values saturate at `u32::MAX`.
+fn reset_seconds(_value: f64) -> u32 {
+    0
+}
+
 /// Run one poll.
 ///
 /// Documented limits (for the plugin README, plan 07-11):
@@ -171,4 +182,38 @@ pub fn poll(
         next_cursor: Some(next_cursor),
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn reset_of(value: &str) -> Option<u32> {
+        parse_header_f64(&headers(&[("x-ratelimit-reset", value)]), "x-ratelimit-reset")
+            .map(reset_seconds)
+    }
+
+    #[test]
+    fn rate_limit_headers_parse_as_floats() {
+        assert_eq!(reset_of("59.0"), Some(59));
+        assert_eq!(reset_of("37"), Some(37));
+        assert_eq!(reset_of("37.2"), Some(38));
+        assert_eq!(reset_of("-5"), Some(0));
+        assert_eq!(reset_of("abc"), None);
+        assert_eq!(reset_of("1e12"), Some(u32::MAX));
+        assert_eq!(reset_of("NaN"), None);
+        assert_eq!(reset_of("inf"), None);
+        assert_eq!(parse_header_f64(&headers(&[]), "x-ratelimit-reset"), None);
+        assert_eq!(
+            parse_header_f64(&headers(&[("x-ratelimit-remaining", "0.99")]), "x-ratelimit-remaining"),
+            Some(0.99)
+        );
+    }
 }

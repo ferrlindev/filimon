@@ -29,5 +29,9 @@ research assumptions A1 to A4 stay unconfirmed.
 | `listing_newer.json` | `listing_new` plus two posts that are newer than all of them, placed first: the later-poll case |
 | `listing_marked_post_gone.json` | `listing_new` without its newest post: the previously marked post was deleted or removed from the page |
 
+| `rate_limited_429.json` + `rate_limited_429.meta.json` | `synthetic`: a 429 `Too Many Requests` answer whose meta carries `x-ratelimit-used`, `x-ratelimit-remaining` `0.0` and `x-ratelimit-reset` `37`; hand-authored in plan 07-06 from the documented header names |
+| `unauthorized_401.json` + `unauthorized_401.meta.json` | `synthetic`: a 401 `Unauthorized` answer (`{"message": "Unauthorized", "error": 401}`); hand-authored in plan 07-06 |
+| `malformed.json` | `synthetic`: a listing document cut off mid-string, with a recognisable sentinel word in its title, to prove an unreadable body is never echoed; hand-authored in plan 07-06 |
+
 All of these are synthetic (see above); the equal-timestamp, unordered and
 tie pages are built inline in `tests/replay.rs` so their timestamps are explicit.
