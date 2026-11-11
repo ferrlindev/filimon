@@ -41,7 +41,9 @@ use crate::plugins::host::cursor::{
 use crate::plugins::host::engine::{HostEngine, clean_guest_text};
 use crate::plugins::host::error::HostError;
 use crate::plugins::host::instance::{InstanceFactory, WasmtimeFactory};
-use crate::plugins::host::loader::{PluginKind, check_component, load_source};
+use crate::plugins::host::loader::{
+    PluginKind, check_component, load_route_for_source, load_source,
+};
 use crate::plugins::host::once::{CommitFailure, PolledOnce, commit_once, poll_once};
 use crate::plugins::host::scheduler::{
     CycleOutcome, PluginSpec, describe, record_status, record_status_text,
@@ -808,8 +810,12 @@ pub async fn run_once(
     let engine = HostEngine::new().map_err(|e| HostError::Engine {
         reason: clean_guest_text(&format!("{e:#}"), ENGINE_REASON_CLIP),
     })?;
+    // The fetcher first (WD-19): a source's requests go where the registry says,
+    // exactly as `fili run` sends them, and a fetcher that cannot load is
+    // reported by name before the source's own component is opened.
+    let route = load_route_for_source(&loaded, &spec.name, &spec.host, &engine)?;
     let pre = load_source(&spec.name, &planned.component, &engine)?;
-    let factory = WasmtimeFactory::new(engine.engine().clone(), pre);
+    let factory = WasmtimeFactory::new(engine.engine().clone(), pre).with_route(route);
 
     if let Some(store) = store {
         let sink = FluvioSink::connect_social().await?;
