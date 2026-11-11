@@ -163,6 +163,13 @@ pub enum AuthCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Delete a plugin's stored login and revoke it at the provider when the plugin declares a revocation_url.
+    Logout {
+        /// The registered source to log out of
+        #[arg(value_name = "NAME")]
+        plugin: String,
+    },
 }
 
 /// The `fili plugins` subcommands.
@@ -319,6 +326,22 @@ mod tests {
                 command: AuthCommand::Status { json: false }
             }
         ));
+    }
+
+    #[test]
+    fn auth_logout_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "logout", "reddit"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Logout { ref plugin }
+            } if plugin == "reddit"
+        ));
+    }
+
+    #[test]
+    fn auth_logout_requires_a_plugin_name() {
+        assert!(Cli::try_parse_from(["fili", "auth", "logout"]).is_err());
     }
 
     #[test]

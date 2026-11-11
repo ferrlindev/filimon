@@ -74,6 +74,13 @@ pub async fn dispatch(
             let mut err = stderr.lock();
             status(registry, state_dir_flag, *json, &mut out, &mut err)
         }
+        AuthCommand::Logout { plugin } => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
+            logout_command(registry, state_dir_flag, plugin, &mut out, &mut err).await
+        }
     }
 }
 
@@ -545,6 +552,40 @@ pub fn status(
         return Ok(());
     }
     render_status(&rows, now, out).into_diagnostic()
+}
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+
+/// `fili auth logout <name>`.
+///
+/// # Errors
+/// The registry's diagnostics, a refusal naming the plugin, a state directory
+/// error, or a failure to delete the local token file.
+pub async fn logout_command(
+    registry: &Path,
+    state_dir_flag: Option<&Path>,
+    name: &str,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> miette::Result<()> {
+    let _ = (registry, state_dir_flag, name, out, err);
+    todo!("RED stub")
+}
+
+/// The logout itself, over an already loaded `oauth`.
+///
+/// # Errors
+/// Only a failure to delete the local file.
+async fn perform_logout(
+    name: &str,
+    oauth: Option<&OAuthConfig>,
+    config_note: Option<&str>,
+    store: &TokenStore,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> miette::Result<()> {
+    let _ = (name, oauth, config_note, store, out, err);
+    todo!("RED stub")
 }
 
 #[cfg(test)]
@@ -1240,6 +1281,361 @@ mod tests {
         assert_eq!(describe_expiry(now + 90_000, now), "in 1d 1h");
         assert_eq!(describe_expiry(now, now), "now");
         assert_eq!(describe_expiry(now - 180, now), "3m 0s ago");
+    }
+
+    // ── logout ───────────────────────────────────────────────────────────────
+
+    const SENTINELS: [&str; 2] = ["AT-SENTINEL-L", "RT-SENTINEL-L"];
+
+    /// An `OAuthConfig` whose `revocation_url` is `/revoke` on `server`.
+    fn revoking_oauth(server: &TestHttpServer) -> OAuthConfig {
+        OAuthConfig {
+            revocation_url: Some(url::Url::parse(&server.url("/revoke")).expect("revoke url")),
+            ..oauth_config_for(&server.url("/token"), None)
+        }
+    }
+
+    /// The token file's path for `alias`.
+    fn token_file(state: &Path, alias: &str) -> PathBuf {
+        state.join("auth").join(format!("{alias}.json"))
+    }
+
+    /// Runs `perform_logout`, returning (result, stdout, stderr).
+    async fn run_logout(
+        name: &str,
+        oauth: Option<&OAuthConfig>,
+        note: Option<&str>,
+        state: &Path,
+    ) -> (miette::Result<()>, String, String) {
+        let store = TokenStore::new(state, name);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = perform_logout(name, oauth, note, &store, &mut out, &mut err).await;
+        (
+            result,
+            String::from_utf8(out).expect("utf8"),
+            String::from_utf8(err).expect("utf8"),
+        )
+    }
+
+    /// A fake endpoint that answers 200 to everything.
+    async fn quiet_server() -> TestHttpServer {
+        TestHttpServer::start(|_| Reply::json(200, "{}")).await
+    }
+
+    #[tokio::test]
+    async fn logout_deletes_the_token_file() {
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 3600, false);
+        let server = quiet_server().await;
+        let oauth = oauth_config_for(&server.url("/token"), None);
+
+        let (result, out, err) = run_logout("stub", Some(&oauth), None, state.path()).await;
+
+        result.expect("logout succeeds");
+        assert!(!token_file(state.path(), "stub").exists());
+        assert!(out.contains("Logged out of `stub`: the local login was deleted."), "{out}");
+        assert!(server.seen().is_empty(), "no request without a revocation_url");
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn logout_without_a_stored_login_succeeds_with_a_note_and_creates_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = dir.path().join("state");
+
+        let (result, out, err) = run_logout("stub", None, None, &state).await;
+
+        result.expect("logout succeeds");
+        assert!(out.contains("No stored login for `stub`; nothing to do."), "{out}");
+        assert!(err.is_empty(), "{err}");
+        assert!(!state.exists(), "logout created the state directory");
+    }
+
+    #[tokio::test]
+    async fn logout_posts_the_refresh_token_to_the_revocation_url_and_deletes_first() {
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 3600, false);
+        let file = token_file(state.path(), "stub");
+        let existed_at_request = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let server = {
+            let file = file.clone();
+            let flag = std::sync::Arc::clone(&existed_at_request);
+            TestHttpServer::start(move |_| {
+                flag.store(file.exists(), std::sync::atomic::Ordering::SeqCst);
+                Reply::json(200, "{}")
+            })
+            .await
+        };
+        let oauth = revoking_oauth(&server);
+
+        let (result, out, err) = run_logout("stub", Some(&oauth), None, state.path()).await;
+
+        result.expect("logout succeeds");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].method, "POST");
+        assert!(seen[0].target.starts_with("/revoke"), "{}", seen[0].target);
+        let form = crate::plugins::auth::testing::form_pairs(&seen[0].body);
+        let value = |key: &str| {
+            form.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(value("token"), Some("RT-SENTINEL-L"));
+        assert_eq!(value("token_type_hint"), Some("refresh_token"));
+        assert!(
+            !existed_at_request.load(std::sync::atomic::Ordering::SeqCst),
+            "the token file was still there when the revoke request arrived"
+        );
+        assert!(out.contains("The login was revoked at the provider."), "{out}");
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_the_access_token_when_there_is_no_refresh_token() {
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", None, unix_now() + 3600, false);
+        let server = quiet_server().await;
+        let oauth = revoking_oauth(&server);
+
+        let (result, _, _) = run_logout("stub", Some(&oauth), None, state.path()).await;
+
+        result.expect("logout succeeds");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let form = crate::plugins::auth::testing::form_pairs(&seen[0].body);
+        assert!(form.contains(&("token".to_string(), "AT-SENTINEL-L".to_string())), "{form:?}");
+        assert!(
+            form.contains(&("token_type_hint".to_string(), "access_token".to_string())),
+            "{form:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_revocation_warns_and_still_succeeds_with_the_file_gone() {
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 3600, false);
+        let server = TestHttpServer::start(|_| {
+            Reply::json(500, r#"{"error":"server_error","error_description":"RT-SENTINEL-L"}"#)
+        })
+        .await;
+        let oauth = revoking_oauth(&server);
+
+        let (result, out, err) = run_logout("stub", Some(&oauth), None, state.path()).await;
+
+        result.expect("a failed revocation is not an error");
+        assert!(!token_file(state.path(), "stub").exists());
+        assert!(err.contains("warning: revoking the login at the provider failed"), "{err}");
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(err.contains("may still be valid at the provider"), "{err}");
+        for sentinel in SENTINELS {
+            assert!(!out.contains(sentinel) && !err.contains(sentinel), "{out}{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_without_a_revocation_url_makes_no_network_call() {
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 3600, false);
+        let server = quiet_server().await;
+        let oauth = oauth_config_for(&server.url("/token"), None);
+
+        let (result, out, _) = run_logout("stub", Some(&oauth), None, state.path()).await;
+
+        result.expect("logout succeeds");
+        assert!(server.seen().is_empty());
+        assert!(out.contains("not revoked at the provider"), "{out}");
+        assert!(!token_file(state.path(), "stub").exists());
+    }
+
+    #[tokio::test]
+    async fn logout_without_a_loadable_config_says_why_and_deletes() {
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", None, unix_now() + 3600, false);
+
+        let (result, _, err) = run_logout(
+            "stub",
+            None,
+            Some("plugin `stub` is disabled, so the login was not revoked at the provider"),
+            state.path(),
+        )
+        .await;
+
+        result.expect("logout succeeds");
+        assert!(err.contains("plugin `stub` is disabled, so the login was not revoked"), "{err}");
+        assert!(!token_file(state.path(), "stub").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logout_with_a_loose_permission_file_deletes_it_without_revoking() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 3600, false);
+        let file = token_file(state.path(), "stub");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let server = quiet_server().await;
+        let oauth = revoking_oauth(&server);
+
+        let (result, out, err) = run_logout("stub", Some(&oauth), None, state.path()).await;
+
+        result.expect("logout succeeds");
+        assert!(!file.exists(), "the loose file is deleted");
+        assert!(err.contains("could not be read"), "{err}");
+        assert!(err.contains("without revoking"), "{err}");
+        assert!(server.seen().is_empty(), "nothing is revoked");
+        for sentinel in SENTINELS {
+            assert!(!out.contains(sentinel) && !err.contains(sentinel), "{out}{err}");
+        }
+    }
+
+    /// `logout_command` against `registry`, expecting a refusal; returns the
+    /// error text and whether the state directory exists afterwards.
+    async fn logout_refused(registry: &Path, state: &Path, name: &str) -> (String, bool) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let error = logout_command(registry, Some(state), name, &mut out, &mut err)
+            .await
+            .expect_err("logout is refused");
+        assert!(out.is_empty(), "nothing was printed on stdout");
+        (format!("{error} {error:?}"), state.exists())
+    }
+
+    #[tokio::test]
+    async fn logout_refuses_a_fetcher_and_an_unknown_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut text = source_table("a", true);
+        text.push_str(&source_table("b", true));
+        text.push_str("[fetchers.f]\ncomponent = \"f.wasm\"\n");
+        let registry = registry_with(dir.path(), &text, MINIMAL_TOML);
+        let state = dir.path().join("state");
+
+        let (fetcher, created) = logout_refused(&registry, &state, "f").await;
+        assert!(fetcher.contains("`f` is a fetcher"), "{fetcher}");
+        assert!(fetcher.contains("logout applies to sources"), "{fetcher}");
+        assert!(!created);
+
+        let (unknown, created) = logout_refused(&registry, &state, "nope").await;
+        assert!(unknown.contains("`nope`"), "{unknown}");
+        assert!(unknown.contains("registered sources: a, b"), "{unknown}");
+        assert!(!created);
+    }
+
+    #[tokio::test]
+    async fn logout_command_deletes_the_login_of_a_disabled_source() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = registry_with(dir.path(), &source_table("stub", false), MINIMAL_TOML);
+        let state = dir.path().join("state");
+        put_login(&state, "stub", "AT-SENTINEL-L", None, unix_now() + 3600, false);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        logout_command(&registry, Some(&state), "stub", &mut out, &mut err)
+            .await
+            .expect("a disabled source can still log out");
+
+        assert!(!token_file(&state, "stub").exists());
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(err.contains("plugin `stub` is disabled"), "{err}");
+        assert!(err.contains("not revoked at the provider"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn later_polls_run_without_a_token_after_logout() {
+        use crate::plugins::auth::provider::{TokenOutcome, TokenProvider};
+        let state = TempDir::new().expect("tempdir");
+        put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 3600, false);
+        let provider =
+            TokenProvider::new("stub", crate::plugins::auth::testing::oauth_config(), state.path());
+        assert!(matches!(provider.access_token().await, TokenOutcome::Token(_)));
+
+        let (result, _, _) = run_logout("stub", None, None, state.path()).await;
+
+        result.expect("logout succeeds");
+        assert!(matches!(provider.access_token().await, TokenOutcome::NotLoggedIn));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_never_resurrects_a_logged_out_plugin() {
+        use crate::plugins::auth::provider::{TokenOutcome, TokenProvider};
+        let state = TempDir::new().expect("tempdir");
+        // Due for a refresh: under the 60 s margin, with a refresh token.
+        put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 10, false);
+        let refresh_server = TestHttpServer::start(|_| {
+            Reply::json(200, &token_body("AT-NEW", Some("RT-NEW"), Some(3600)))
+        })
+        .await;
+        let provider = std::sync::Arc::new(TokenProvider::new(
+            "stub",
+            oauth_config_for(&refresh_server.url("/token"), None),
+            state.path(),
+        ));
+        let store = TokenStore::new(state.path(), "stub");
+
+        // The logout holds the lock; the poll starts and waits on it.
+        let lock = store.lock().await.expect("logout takes the lock");
+        let poll = {
+            let provider = std::sync::Arc::clone(&provider);
+            tokio::spawn(async move { provider.access_token().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!poll.is_finished(), "the refresh is waiting on the lock");
+        store.delete(&lock).expect("delete under the lock");
+        drop(lock);
+
+        let outcome = poll.await.expect("the poll finishes");
+
+        assert!(matches!(outcome, TokenOutcome::NotLoggedIn), "{outcome:?}");
+        assert!(!token_file(state.path(), "stub").exists(), "the login was resurrected");
+        assert!(refresh_server.seen().is_empty(), "the provider was contacted");
+    }
+
+    #[tokio::test]
+    async fn logout_leaves_other_plugins_logins_alone() {
+        let state = TempDir::new().expect("tempdir");
+        let now = unix_now();
+        put_login(state.path(), "a", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), now + 3600, false);
+        put_login(state.path(), "b", "AT-SENTINEL-L", None, now + 3600, false);
+        let before = std::fs::read(token_file(state.path(), "b")).expect("b's file");
+
+        let (result, _, _) = run_logout("a", None, None, state.path()).await;
+
+        result.expect("logout succeeds");
+        assert!(!token_file(state.path(), "a").exists());
+        assert_eq!(std::fs::read(token_file(state.path(), "b")).expect("b's file"), before);
+    }
+
+    #[tokio::test]
+    async fn logout_never_prints_the_tokens() {
+        let mut shown = String::new();
+
+        // A revocation that works, one the provider fails and one that finds
+        // a file it cannot read.
+        for status in [200, 500] {
+            let state = TempDir::new().expect("tempdir");
+            put_login(state.path(), "stub", "AT-SENTINEL-L", Some("RT-SENTINEL-L"), unix_now() + 3600, false);
+            let server = TestHttpServer::start(move |_| {
+                Reply::json(status, r#"{"error":"x","error_description":"AT-SENTINEL-L RT-SENTINEL-L"}"#)
+            })
+            .await;
+            let oauth = revoking_oauth(&server);
+            let (result, out, err) = run_logout("stub", Some(&oauth), None, state.path()).await;
+            shown.push_str(&format!("{result:?} {out} {err}"));
+        }
+        let state = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(state.path().join("auth")).expect("auth dir");
+        std::fs::write(
+            token_file(state.path(), "stub"),
+            b"{ not json AT-SENTINEL-L RT-SENTINEL-L",
+        )
+        .expect("corrupt file");
+        let (result, out, err) = run_logout("stub", None, None, state.path()).await;
+        shown.push_str(&format!("{result:?} {out} {err}"));
+
+        for sentinel in SENTINELS {
+            assert!(!shown.contains(sentinel), "{sentinel} leaked: {shown}");
+        }
     }
 
     /// A cloneable in-memory writer, for a test that reads the output while the
