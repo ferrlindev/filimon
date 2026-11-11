@@ -57,19 +57,19 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Reddit Plugin
 
-- [ ] **RDDT-01**: Reddit plugin polls new/hot posts from subreddits configured in its TOML via the official Reddit API
-- [ ] **RDDT-02**: With a logged-in user, Reddit plugin can poll that user's own home feed / saved posts
-- [ ] **RDDT-03**: Reddit plugin honours Reddit rate-limit headers and sends a compliant User-Agent
+- [x] **RDDT-01**: Reddit plugin polls new/hot posts from subreddits configured in its TOML via the official Reddit API
+- [x] **RDDT-02**: With a logged-in user, Reddit plugin can poll that user's own home feed / saved posts
+- [x] **RDDT-03**: Reddit plugin honours Reddit rate-limit headers and sends a compliant User-Agent
 
 ### YouTube Plugin
 
-- [ ] **YTUB-01**: YouTube plugin polls new uploads from channels configured in its TOML via the YouTube Data API (uploads playlists)
-- [ ] **YTUB-02**: With a logged-in user, YouTube plugin can poll new uploads from that user's subscriptions
-- [ ] **YTUB-03**: YouTube plugin stays within daily quota by using low-cost endpoints and surfaces quota errors clearly
+- [x] **YTUB-01**: YouTube plugin polls new uploads from channels configured in its TOML via the YouTube Data API (uploads playlists)
+- [x] **YTUB-02**: With a logged-in user, YouTube plugin can poll new uploads from that user's subscriptions
+- [x] **YTUB-03**: YouTube plugin stays within daily quota by using low-cost endpoints and surfaces quota errors clearly
 
 ### Testing
 
-- [ ] **TEST-01**: Each plugin has unit tests against recorded API fixtures — no network or keys required
+- [x] **TEST-01**: Each plugin has unit tests against recorded API fixtures — no network or keys required
 - [ ] **TEST-02**: Integration tests run the compiled Reddit and YouTube `.wasm` plugins inside the host against replayed fixtures and assert the expected `SourceItem`s reach a local Fluvio topic
 - [ ] **TEST-03**: Integration tests have a live mode that runs against real APIs only when credentials are present in `.env`
 - [ ] **TEST-04**: A live end-to-end run with real Reddit and YouTube data produces enriched JSON alongside news articles
@@ -153,13 +153,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLI-02 | Phase 4 | Complete |
 | CLI-03 | Phase 4 | Complete |
 | CLI-04 | Phase 4 | Complete |
-| RDDT-01 | Phase 7 | Pending |
-| RDDT-02 | Phase 7 | Pending |
-| RDDT-03 | Phase 7 | Pending |
-| YTUB-01 | Phase 7 | Pending |
-| YTUB-02 | Phase 7 | Pending |
-| YTUB-03 | Phase 7 | Pending |
-| TEST-01 | Phase 7 | Pending |
+| RDDT-01 | Phase 7 | Complete |
+| RDDT-02 | Phase 7 | Complete |
+| RDDT-03 | Phase 7 | Complete |
+| YTUB-01 | Phase 7 | Complete |
+| YTUB-02 | Phase 7 | Complete |
+| YTUB-03 | Phase 7 | Complete |
+| TEST-01 | Phase 7 | Complete |
 | TEST-02 | Phase 8 | Pending |
 | TEST-03 | Phase 8 | Pending |
 | TEST-04 | Phase 8 | Pending |
