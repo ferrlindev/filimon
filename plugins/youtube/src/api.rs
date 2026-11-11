@@ -4,6 +4,7 @@
 
 use crate::http::HttpRequest;
 use crate::poll::PollError;
+use crate::settings::valid_channel_id;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -197,24 +198,68 @@ pub struct SubscriptionsPage {
     pub skipped: usize,
 }
 
+/// Longest `nextPageToken` followed. A real token is a few characters; a longer
+/// one is treated as the end of the list so it cannot bloat the next url.
+const MAX_PAGE_TOKEN_LEN: usize = 512;
+
 /// `GET {API_BASE}/subscriptions?part=snippet&mine=true&maxResults=<n>&order=relevance`
-/// (plus `&pageToken=`) with the user's access token (D-07).
+/// (plus `&pageToken=`) with the user's access token (D-07). It takes a token
+/// and never an API key: a key cannot read `mine=true`.
 pub fn subscriptions_request(
     page_token: Option<&str>,
     max_results: u32,
     token: &str,
 ) -> HttpRequest {
-    let _ = (page_token, max_results, token);
+    let mut url = format!(
+        "{API_BASE}/subscriptions?part=snippet&mine=true&maxResults={max_results}&order=relevance"
+    );
+    if let Some(page_token) = page_token {
+        url.push_str("&pageToken=");
+        url.push_str(&enc(page_token));
+    }
     HttpRequest {
-        url: String::new(),
-        headers: Vec::new(),
+        url,
+        headers: vec![
+            ("authorization".to_string(), format!("Bearer {token}")),
+            ("accept".to_string(), "application/json".to_string()),
+        ],
     }
 }
 
-/// Parse a `subscriptions.list` page.
+/// Parse a `subscriptions.list` page. A body without an `items` array is an
+/// error, never an empty page. Channel ids are API data that flow into a later
+/// request, so each must pass the shared 24-character `UC` rule; the rest are
+/// skipped and counted. Nothing here echoes the body.
 pub fn parse_subscriptions_page(body: &[u8]) -> Result<SubscriptionsPage, ParseError> {
-    let _ = body;
-    Err(ParseError::Unreadable)
+    let root: Value = serde_json::from_slice(body).map_err(|_| ParseError::Unreadable)?;
+    let items = root
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or(ParseError::Unreadable)?;
+    let mut channel_ids = Vec::new();
+    let mut skipped = 0;
+    for item in items {
+        let id = item
+            .get("snippet")
+            .and_then(|snippet| snippet.get("resourceId"))
+            .and_then(|resource| resource.get("channelId"))
+            .and_then(Value::as_str)
+            .filter(|id| valid_channel_id(id));
+        match id {
+            Some(id) => channel_ids.push(id.to_string()),
+            None => skipped += 1,
+        }
+    }
+    let next_page_token = root
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty() && token.len() <= MAX_PAGE_TOKEN_LEN)
+        .map(str::to_string);
+    Ok(SubscriptionsPage {
+        channel_ids,
+        next_page_token,
+        skipped,
+    })
 }
 
 /// The D-15 quota text, verbatim. It is the same for `quotaExceeded` and
@@ -245,10 +290,9 @@ pub fn error_reason(body: &[u8]) -> Option<String> {
 
 /// Classify a response by status and Google error reason (D-15, research
 /// Pattern 4). `None` for 2xx. The texts are fixed phrases plus the status,
-/// the configured channel id and a safe reason; never a body, header,
-/// credential or url.
+/// the configured channel id (when the request was for one) and a safe reason;
+/// never a body, header, credential or url.
 pub fn classify_youtube(status: u16, body: &[u8], channel_id: Option<&str>) -> Option<PollError> {
-    let channel_id = channel_id.unwrap_or_default();
     if (200..300).contains(&status) {
         return None;
     }
@@ -272,9 +316,13 @@ pub fn classify_youtube(status: u16, body: &[u8], channel_id: Option<&str>) -> O
         (403, Some(reason @ ("insufficientPermissions" | "forbidden"))) => PollError::Config(format!(
             "YouTube refused access ({reason}); check the key restrictions or the login scope"
         )),
-        (404, _) => PollError::Config(format!(
-            "settings.channels: YouTube found no uploads playlist for channel {channel_id} (HTTP 404); check the channel ID"
-        )),
+        (404, _) => match channel_id {
+            Some(channel_id) => PollError::Config(format!(
+                "settings.channels: YouTube found no uploads playlist for channel {channel_id} (HTTP 404); check the channel ID"
+            )),
+            // A failed subscriptions call has no configured channel to name.
+            None => PollError::Transient("YouTube HTTP 404".to_string()),
+        },
         (status, Some(reason)) => PollError::Transient(format!("YouTube HTTP {status} ({reason})")),
         (status, None) => PollError::Transient(format!("YouTube HTTP {status}")),
     };

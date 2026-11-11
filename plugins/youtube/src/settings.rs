@@ -25,9 +25,13 @@ pub const MAX_SUBSCRIPTION_PAGES: u32 = 10;
 /// Quota units one poll costs. Every Data API call used here is one unit:
 /// `ceil(subscription_channels / 50)` `subscriptions.list` pages plus one
 /// `playlistItems.list` per polled playlist (research O4).
+///
+/// Subscription mode always makes at least one `subscriptions.list` call, even
+/// for an account with no subscriptions, which this formula counts as zero.
 pub fn quota_units_per_poll(subscription_channels: u32, playlists: u32) -> u32 {
-    let _ = (subscription_channels, playlists);
-    0
+    subscription_channels
+        .div_ceil(SUBSCRIPTIONS_PAGE_SIZE)
+        .saturating_add(playlists)
 }
 
 /// The raw `[settings]` table. Unknown keys are rejected. Values stay untyped
@@ -37,11 +41,13 @@ pub fn quota_units_per_poll(subscription_channels: u32, playlists: u32) -> u32 {
 #[serde(deny_unknown_fields)]
 struct Raw {
     channels: Option<Value>,
+    subscriptions: Option<Value>,
+    subscriptions_limit: Option<Value>,
 }
 
 /// A channel ID is `UC` followed by 22 characters from letters, digits, `_`
 /// and `-` (24 characters in total).
-fn valid_channel_id(id: &str) -> bool {
+pub(crate) fn valid_channel_id(id: &str) -> bool {
     id.len() == 24
         && id.starts_with("UC")
         && id
@@ -58,13 +64,24 @@ pub fn uploads_playlist(channel_id: &str) -> String {
     }
 }
 
-fn parse_channels(value: Option<Value>) -> Result<Vec<String>, String> {
-    const RULE: &str = "settings.channels: required, a non-empty list of channel IDs (24 characters starting with UC)";
-    let Some(Value::Array(entries)) = value else {
-        return Err(RULE.to_string());
+/// `channels` is a list of channel IDs. With `subscriptions = true` it may be
+/// absent or empty; otherwise it must be a non-empty list.
+fn parse_channels(value: Option<Value>, subscriptions: bool) -> Result<Vec<String>, String> {
+    const WRONG_TYPE: &str =
+        "settings.channels: expected a list of channel IDs (24 characters starting with UC)";
+    const REQUIRED: &str = "settings.channels: a non-empty list of channel IDs (24 characters starting with UC) is required unless settings.subscriptions is true; set channels or subscriptions = true";
+    let entries = match value {
+        None if subscriptions => return Ok(Vec::new()),
+        None => return Err(REQUIRED.to_string()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => return Err(WRONG_TYPE.to_string()),
     };
     if entries.is_empty() {
-        return Err(RULE.to_string());
+        return if subscriptions {
+            Ok(Vec::new())
+        } else {
+            Err(REQUIRED.to_string())
+        };
     }
     let mut ids: Vec<String> = Vec::new();
     for (index, entry) in entries.into_iter().enumerate() {
@@ -95,10 +112,34 @@ pub struct Playlist {
     pub playlist_id: String,
 }
 
+/// `subscriptions`: absent or `false` is off, `true` is on.
+fn parse_subscriptions(value: Option<Value>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(Value::Boolean(on)) => Ok(on),
+        Some(_) => Err("settings.subscriptions: expected true or false".to_string()),
+    }
+}
+
+/// `subscriptions_limit`: only with `subscriptions = true`, 1 through
+/// `MAX_FEEDS`, default 50.
+fn parse_subscriptions_limit(value: Option<Value>) -> Result<u32, String> {
+    let rule = format!("settings.subscriptions_limit: expected a whole number from 1 to {MAX_FEEDS}");
+    let Some(value) = value else {
+        return Ok(DEFAULT_SUBSCRIPTIONS_LIMIT);
+    };
+    match value {
+        Value::Integer(limit) if (1..=MAX_FEEDS as i64).contains(&limit) => Ok(limit as u32),
+        _ => Err(rule),
+    }
+}
+
 /// Validated settings.
 #[derive(Debug, Clone)]
 pub struct Settings {
     channels: Vec<String>,
+    /// The subscribed-channel limit, when `subscriptions = true`.
+    subscriptions: Option<u32>,
 }
 
 impl Settings {
@@ -111,14 +152,36 @@ impl Settings {
                 let message = error.message();
                 // serde's unknown-field text quotes the key: keep it out.
                 return Err(if message.contains("unknown field") {
-                    "settings: unknown key; the only supported key is `channels`".to_string()
+                    "settings: unknown key; the supported keys are `channels`, `subscriptions` and `subscriptions_limit`"
+                        .to_string()
                 } else {
                     format!("settings: {message}")
                 });
             }
         };
+        let subscriptions_on = parse_subscriptions(raw.subscriptions)?;
+        if raw.subscriptions_limit.is_some() && !subscriptions_on {
+            return Err(
+                "settings.subscriptions_limit: only allowed together with subscriptions = true"
+                    .to_string(),
+            );
+        }
+        let channels = parse_channels(raw.channels, subscriptions_on)?;
+        let subscriptions = if subscriptions_on {
+            let limit = parse_subscriptions_limit(raw.subscriptions_limit)?;
+            // Worst case before deduplication: every subscribed channel is new.
+            if channels.len() + limit as usize > MAX_FEEDS {
+                return Err(format!(
+                    "settings.subscriptions_limit: channels plus subscriptions_limit must not exceed {MAX_FEEDS}"
+                ));
+            }
+            Some(limit)
+        } else {
+            None
+        };
         Ok(Settings {
-            channels: parse_channels(raw.channels)?,
+            channels,
+            subscriptions,
         })
     }
 
@@ -135,7 +198,14 @@ impl Settings {
 
     /// The subscribed-channel limit when `subscriptions = true`, else `None`.
     pub fn subscriptions(&self) -> Option<u32> {
-        None
+        self.subscriptions
+    }
+
+    /// Most playlists one poll can follow: the explicit channels plus the
+    /// subscription limit. It sizes the later-poll page so the worst case
+    /// stays under the host's item cap.
+    pub fn max_playlists(&self) -> usize {
+        self.channels.len() + self.subscriptions.map_or(0, |limit| limit as usize)
     }
 
     /// Page size of a poll that has a mark: the largest page, shrunk so one
