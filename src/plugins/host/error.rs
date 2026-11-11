@@ -65,6 +65,21 @@ pub enum HostError {
         reason: String,
     },
 
+    /// A source is not loaded because the fetcher the registry assigns to it
+    /// could not be loaded.
+    #[error(
+        "plugin `{plugin}` is not loaded: its assigned fetcher `{fetcher}` could not be loaded: {reason}"
+    )]
+    #[diagnostic(
+        code(fili::host::fetcher_unavailable),
+        help("fix the fetcher component or assign another fetcher in filimon.toml")
+    )]
+    FetcherUnavailable {
+        plugin: String,
+        fetcher: String,
+        reason: String,
+    },
+
     /// A cursor state file exists but could not be read.
     #[error("plugin `{plugin}`: cannot read cursor file `{path}`: {reason}")]
     #[diagnostic(
