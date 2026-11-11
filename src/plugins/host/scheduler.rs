@@ -324,9 +324,7 @@ pub(crate) async fn auth_for_poll(spec: &PluginSpec) -> Result<PollAuth, CycleOu
             token: None,
             hint: Some(LoginHint::NeedsLogin),
         }),
-        TokenOutcome::RefreshDue => Err(CycleOutcome::TokenRefresh(
-            "access token is due for a refresh".to_string(),
-        )),
+        TokenOutcome::RefreshFailed(text) => Err(CycleOutcome::TokenRefresh(text)),
         TokenOutcome::FileProblem(error) => Err(CycleOutcome::TokenFile(error.to_string())),
     }
 }
