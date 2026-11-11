@@ -45,4 +45,36 @@ pub enum AuthError {
     #[error("cannot read secure random bytes: {reason}")]
     #[diagnostic(code(fili::auth::random))]
     Random { reason: String },
+
+    /// The loopback port for the login callback cannot be bound.
+    #[error("cannot listen on 127.0.0.1:{port} for the login callback: {reason}")]
+    #[diagnostic(
+        code(fili::auth::redirect_port_in_use),
+        help(
+            "another login or program is using the port; stop it, or set `host.oauth.redirect_port` in the plugin TOML to a free port and register the same redirect URI with the provider"
+        )
+    )]
+    RedirectPortInUse { port: u16, reason: String },
+
+    /// The provider answered the login with `error=`. Only the cleaned error
+    /// code is carried, never `error_description`.
+    #[error("the provider denied the login: {error}")]
+    #[diagnostic(code(fili::auth::callback_denied))]
+    CallbackDenied { error: String },
+
+    /// The callback's `state` was missing or different from the one sent.
+    /// Neither value is carried.
+    #[error("the login callback did not carry the expected state, so it was rejected")]
+    #[diagnostic(code(fili::auth::state_mismatch))]
+    StateMismatch,
+
+    /// Nothing reached the callback listener in time.
+    #[error("no login callback arrived within {secs} seconds")]
+    #[diagnostic(code(fili::auth::callback_timeout))]
+    CallbackTimeout { secs: u64 },
+
+    /// A callback with the right state that is not usable.
+    #[error("the login callback is not usable: {reason}")]
+    #[diagnostic(code(fili::auth::callback_invalid))]
+    CallbackInvalid { reason: String },
 }
