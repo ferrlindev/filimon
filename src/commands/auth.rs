@@ -140,7 +140,8 @@ fn find_source<'a>(
 ///
 /// # Errors
 /// Returns the registry's or the plugin's diagnostics, a refusal naming the
-/// plugin (unknown, a fetcher, disabled, or no `[host.oauth]`), a state
+/// plugin (unknown, a fetcher, disabled, no `[host.oauth]`, or the
+/// `client_credentials` grant, which has no login), a state
 /// directory error, the login flow's diagnostics, or an io error when `out`
 /// cannot be written.
 pub async fn login_command(
@@ -153,6 +154,21 @@ pub async fn login_command(
 ) -> miette::Result<()> {
     let listing = list_registry(registry)?;
     find_login_source(&listing, name)?;
+
+    // An app-only plugin has nothing to log in to. Say so before `load_plugin`
+    // resolves the client secret, so an operator who has not set it yet still
+    // gets the right explanation, and before any port, file or directory.
+    let probe = probe_oauth_sources(registry)?;
+    if probe
+        .sources
+        .iter()
+        .any(|source| source.name == name && source.declares == OAuthDeclared::AppOnly)
+    {
+        return Err(miette::miette!(
+            "plugin `{}` uses the client_credentials grant, so there is nothing to log in to; the host fetches its app token itself",
+            clean_guest_text(name, NAME_ECHO_CLIP)
+        ));
+    }
 
     // A scoped load: only this plugin's own `.env` secret is needed.
     let loaded = load_plugin(registry, name)?;
@@ -297,6 +313,9 @@ pub enum StatusState {
     Expired,
     NeedsLogin,
     NotLoggedIn,
+    /// The plugin uses the `client_credentials` grant: the host fetches its own
+    /// app token, so there is no login and no stored file to report.
+    AppOnly,
     /// The token file cannot be used; the cleaned text names the plugin, the
     /// path and a fixed reason, never the file's content (D-02).
     Unreadable(String),
@@ -321,6 +340,7 @@ impl StatusState {
             Self::Expired => "expired",
             Self::NeedsLogin => "needs-login",
             Self::NotLoggedIn => "not-logged-in",
+            Self::AppOnly => "app-only",
             Self::Unreadable(_) => "unreadable",
         }
     }
@@ -355,12 +375,17 @@ pub fn collect_status(
             expires_at,
             has_refresh_token,
         };
+        // An app-only plugin has no login: its row never reads the token store,
+        // so a stale file of the same alias is neither consulted nor shown.
+        if probe.declares == OAuthDeclared::AppOnly {
+            rows.push(row(StatusState::AppOnly, None, None));
+            continue;
+        }
         match store.read() {
             Ok(None) => match probe.declares {
-                OAuthDeclared::Yes | OAuthDeclared::AppOnly => {
-                    rows.push(row(StatusState::NotLoggedIn, None, None));
-                }
-                OAuthDeclared::No => {}
+                OAuthDeclared::Yes => rows.push(row(StatusState::NotLoggedIn, None, None)),
+                // `AppOnly` was answered above, before the token store was read.
+                OAuthDeclared::No | OAuthDeclared::AppOnly => {}
                 OAuthDeclared::Unknown(_) => {
                     // A note is best effort: an unwritable stderr must not fail status.
                     writeln!(

@@ -718,8 +718,18 @@ struct HostView {
     oauth: Option<toml::Value>,
 }
 
+/// `true` when the `[host.oauth]` table's `grant` key is the string
+/// `client_credentials`. Nothing else in the table is looked at.
+fn declares_client_credentials(oauth: &toml::Value) -> bool {
+    oauth
+        .get("grant")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|grant| grant == GRANT_CLIENT_CREDENTIALS)
+}
+
 /// Reports, for every source in the registry at `path` (enabled or not),
-/// whether its plugin file declares `[host.oauth]`.
+/// whether its plugin file declares `[host.oauth]`, and whether that table
+/// uses the `client_credentials` grant.
 ///
 /// The read is lenient on purpose: it parses only far enough to see whether
 /// the table is there, never validates it, and touches no environment or
@@ -741,13 +751,13 @@ pub fn probe_oauth_sources(path: &Path) -> Result<OAuthProbeReport, ConfigErrors
                     Err(_) => {
                         OAuthDeclared::Unknown("the plugin file is not valid TOML".to_string())
                     }
-                    Ok(view) => {
-                        if view.host.and_then(|host| host.oauth).is_some() {
-                            OAuthDeclared::Yes
-                        } else {
-                            OAuthDeclared::No
+                    Ok(view) => match view.host.and_then(|host| host.oauth) {
+                        None => OAuthDeclared::No,
+                        Some(oauth) if declares_client_credentials(&oauth) => {
+                            OAuthDeclared::AppOnly
                         }
-                    }
+                        Some(_) => OAuthDeclared::Yes,
+                    },
                 },
             };
             OAuthProbe {
