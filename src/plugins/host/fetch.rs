@@ -1333,6 +1333,134 @@ mod tests {
         assert!(policy.check(&url).is_ok(), "an 8 KiB url");
     }
 
+    // ── Fidelity and log hygiene tests (loopback server, no wasm) ─────────────
+
+    fn values_of<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+        headers
+            .iter()
+            .filter(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn egress_returns_every_same_name_response_header_in_order() {
+        let server = TestHttpServer::start(|_| {
+            Reply::ok("x")
+                .with_header("x-dup", "a")
+                .with_header("x-dup", "b")
+                .with_header("x-dup", "c")
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let response = Egress::new()
+            .execute(&policy, get(&server.url("/d")), in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        assert_eq!(values_of(&response.headers, "x-dup"), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn egress_request_headers_reach_the_server_in_order_with_duplicates() {
+        let server = TestHttpServer::start(|_| Reply::ok("x")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let request = with_headers(
+            &server.url("/m"),
+            &[("x-multi", "1"), ("x-other", "z"), ("x-multi", "2")],
+        );
+
+        Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(values_of(&seen[0].headers, "x-multi"), ["1", "2"]);
+        assert_eq!(seen[0].header("x-other"), Some("z"));
+    }
+
+    #[tokio::test]
+    async fn egress_returns_binary_bodies_unchanged() {
+        let server = TestHttpServer::start(|seen| Reply::ok(seen.body.clone())).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let body: Vec<u8> = (0..4).flat_map(|_| 0..=255_u8).collect();
+        let request = types::Request {
+            method: types::Method::Post,
+            body: Some(body.clone()),
+            ..get(&server.url("/echo"))
+        };
+
+        let response = Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        assert_eq!(server.seen()[0].body, body);
+        assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn egress_returns_a_429_as_an_ordinary_response() {
+        let server = TestHttpServer::start(|_| {
+            Reply::status(429)
+                .with_header("retry-after", "7")
+        })
+        .await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+
+        let response = Egress::new()
+            .execute(&policy, get(&server.url("/limited")), in_five_seconds())
+            .await
+            .expect("a 429 is an ordinary response");
+
+        assert_eq!(response.status, 429);
+        assert_eq!(values_of(&response.headers, "retry-after"), ["7"]);
+    }
+
+    #[tokio::test]
+    async fn egress_never_logs_headers_bodies_or_query_strings() {
+        let server = TestHttpServer::start(|_| Reply::ok("SECRET-RESPONSE")).await;
+        let policy = policy_for(&["127.0.0.1"], Duration::from_secs(5));
+        let request = types::Request {
+            method: types::Method::Post,
+            headers: vec![("authorization".to_string(), "Bearer SECRET-AUTH".to_string())],
+            body: Some(b"SECRET-BODY".to_vec()),
+            ..get(&server.url("/secret/path?token=SECRET-QUERY"))
+        };
+        let (logs, _guard) = LogCapture::start();
+
+        let response = Egress::new()
+            .execute(&policy, request, in_five_seconds())
+            .await
+            .expect("the request succeeds");
+
+        assert_eq!(response.body, b"SECRET-RESPONSE");
+        let text = logs.text();
+        let ours: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("fili::plugins"))
+            .collect();
+        assert!(
+            ours.iter()
+                .any(|line| line.contains("outbound request") && line.contains("127.0.0.1")),
+            "no outbound request line: {text}"
+        );
+        for line in &ours {
+            for secret in [
+                "SECRET-QUERY",
+                "SECRET-AUTH",
+                "SECRET-BODY",
+                "SECRET-RESPONSE",
+                "/secret/path",
+            ] {
+                assert!(!line.contains(secret), "{secret} leaked: {line}");
+            }
+        }
+    }
+
     // ── Policy Tests (no wasm) ────────────────────────────────────────────────
 
     fn policy(consumer: &str, hosts: &[&str]) -> FetchPolicy {
