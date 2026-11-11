@@ -2017,9 +2017,13 @@ mod sched_auth {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::plugins::auth::testing::{unix_now, write_tokens};
+    use crate::plugins::auth::store::{AccessToken, StoredTokens, TokenStore};
+    use crate::plugins::auth::testing::{provider_for, unix_now, write_tokens};
+    use crate::plugins::host::cursor::status_path;
     use crate::plugins::host::sink::VecSink;
-    use crate::plugins::host::testing::{FakeFactory, FakeStep, load_test_registry, run_for};
+    use crate::plugins::host::testing::{
+        FakeFactory, FakeStep, LogCapture, load_test_registry, run_for, spec,
+    };
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
@@ -2052,6 +2056,13 @@ mod sched_auth {
         (state_dir, cursors)
     }
 
+    /// A spec polling every 60 s with a provider over `state_dir`.
+    fn oauth_spec(alias: &str, state_dir: &Path) -> PluginSpec {
+        let mut spec = spec(alias, 60, 60, 3600, 2.0);
+        spec.auth = Some(provider_for(state_dir, alias));
+        spec
+    }
+
     #[tokio::test(start_paused = true)]
     async fn tracer_a_logged_in_plugin_gets_its_access_token_from_toml_to_poll() {
         let dir = TempDir::new().expect("tempdir");
@@ -2074,5 +2085,157 @@ mod sched_auth {
 
         assert_eq!(factory.poll_tokens(), vec![Some("AT-1".to_string())]);
         assert_eq!(report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_token_file_replaced_between_polls_takes_effect() {
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        write_tokens(&state_dir, "swap", "AT-A", unix_now() + 3600);
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_plugin(
+            oauth_spec("swap", &state_dir),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            shutdown.clone(),
+        ));
+
+        // Polls at 0, 60 and 120 s; the file is replaced at 30 s.
+        tokio::time::sleep(secs(30)).await;
+        write_tokens(&state_dir, "swap", "AT-B", unix_now() + 3600);
+        tokio::time::sleep(secs(120)).await;
+        shutdown.cancel();
+        let report = handle.await.expect("plugin task");
+
+        let tokens: Vec<Option<String>> = ["AT-A", "AT-B", "AT-B"]
+            .iter()
+            .map(|t| Some((*t).to_string()))
+            .collect();
+        assert_eq!(factory.poll_tokens(), tokens);
+        assert_eq!(report.disabled, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_token_file_polls_with_none_and_hints_once() {
+        let (logs, _guard) = LogCapture::start();
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+
+        run_for(
+            oauth_spec("nolog", &state_dir),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(150),
+        )
+        .await;
+
+        assert_eq!(factory.poll_tokens(), vec![None, None, None]);
+        let text = logs.text();
+        let hints = text
+            .lines()
+            .filter(|line| line.contains("run: fili auth login"))
+            .count();
+        assert_eq!(hints, 1, "one hint per transition, not one per poll:\n{text}");
+        assert!(text.contains("plugin=nolog"), "{text}");
+        assert!(!state_dir.join("auth").exists(), "nothing was created");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn needs_login_polls_with_none_and_keeps_the_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        TokenStore::new(&state_dir, "flagged")
+            .write(&StoredTokens {
+                access_token: AccessToken::new("AT-OLD".to_string()),
+                refresh_token: None,
+                expires_at: unix_now() + 3600,
+                token_type: None,
+                scope: None,
+                needs_login: true,
+                obtained_at: unix_now(),
+            })
+            .expect("write the flagged file");
+        let path = state_dir.join("auth").join("flagged.json");
+        let before = std::fs::read(&path).expect("bytes");
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+
+        let report = run_for(
+            oauth_spec("flagged", &state_dir),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(100),
+        )
+        .await;
+
+        assert_eq!(factory.poll_tokens(), vec![None, None]);
+        assert_eq!(report.disabled, None);
+        assert_eq!(std::fs::read(&path).expect("bytes"), before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_corrupt_token_file_disables_only_that_plugin() {
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        let bad_path = state_dir.join("auth").join("bad.json");
+        std::fs::create_dir_all(state_dir.join("auth")).expect("auth dir");
+        std::fs::write(&bad_path, "NOT-JSON-SENTINEL").expect("write the corrupt file");
+        let before = std::fs::read(&bad_path).expect("bytes");
+        write_tokens(&state_dir, "good", "AT-good", unix_now() + 3600);
+        let bad_factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let good_factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+
+        let (bad, good) = tokio::join!(
+            run_for(
+                oauth_spec("bad", &state_dir),
+                Arc::clone(&bad_factory),
+                Arc::new(VecSink::default()),
+                Arc::clone(&cursors),
+                secs(150),
+            ),
+            run_for(
+                oauth_spec("good", &state_dir),
+                Arc::clone(&good_factory),
+                Arc::new(VecSink::default()),
+                Arc::clone(&cursors),
+                secs(150),
+            ),
+        );
+
+        let reason = bad.disabled.expect("the bad plugin is disabled");
+        assert!(reason.contains("`bad`"), "{reason}");
+        assert!(reason.contains(&bad_path.display().to_string()), "{reason}");
+        assert!(!reason.contains("NOT-JSON-SENTINEL"), "{reason}");
+        assert!(bad_factory.poll_tokens().is_empty(), "never polled");
+        assert_eq!(std::fs::read(&bad_path).expect("bytes"), before);
+        let status = std::fs::read_to_string(status_path(&state_dir, "bad")).expect("status");
+        assert!(status.contains("token file problem"), "{status}");
+
+        assert_eq!(good.disabled, None);
+        let good_tokens: Vec<Option<String>> = vec![Some("AT-good".to_string()); 3];
+        assert_eq!(good_factory.poll_tokens(), good_tokens);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plugin_without_oauth_polls_with_none() {
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+
+        run_for(
+            spec("plain", 60, 60, 3600, 2.0),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            secs(100),
+        )
+        .await;
+
+        assert_eq!(factory.poll_tokens(), vec![None, None]);
+        assert!(!state_dir.join("auth").exists());
     }
 }

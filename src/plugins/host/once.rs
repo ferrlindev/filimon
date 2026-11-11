@@ -323,6 +323,35 @@ mod tests {
         assert_eq!(factory.poll_tokens(), vec![Some("AT-once".to_string())]);
     }
 
+    #[tokio::test]
+    async fn once_reports_a_token_file_problem_naming_plugin_and_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let auth_dir = dir.path().join("auth");
+        std::fs::create_dir_all(&auth_dir).expect("auth dir");
+        let path = auth_dir.join("fake.json");
+        std::fs::write(&path, "NOT-JSON-SENTINEL").expect("write the corrupt file");
+        let mut spec = once_spec();
+        spec.auth = Some(provider_for(dir.path(), "fake"));
+        let factory = FakeFactory::new(vec![FakeStep::InitOk, poll_ok(vec![], None)]);
+
+        let outcome = poll_once(&spec, &factory, None)
+            .await
+            .expect_err("a corrupt token file fails the cycle");
+
+        let CycleOutcome::TokenFile(text) = &outcome else {
+            panic!("expected a token file outcome, got {outcome:?}");
+        };
+        assert!(text.contains("`fake`"), "{text}");
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(!text.contains("NOT-JSON-SENTINEL"), "{text}");
+        assert!(factory.poll_tokens().is_empty(), "the guest was never polled");
+        assert_eq!(
+            std::fs::read(&path).expect("bytes"),
+            b"NOT-JSON-SENTINEL",
+            "the file is left as found"
+        );
+    }
+
     // ── commit_once (D-07) ────────────────────────────────────────────────────
 
     use std::path::PathBuf;
