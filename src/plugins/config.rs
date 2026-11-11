@@ -165,6 +165,8 @@ struct OAuthSection {
     /// Extra authorize-request parameters (D-14), iterated in key order.
     #[serde(default)]
     authorize_params: BTreeMap<String, toml::Spanned<String>>,
+    /// The User-Agent of the host's token and revocation requests.
+    user_agent: Option<toml::Spanned<String>>,
 }
 
 /// The `[host.backoff]` table. Each value keeps its span when it is given, so
@@ -313,6 +315,10 @@ pub struct OAuthConfig {
     /// The User-Agent for the host's token and revocation requests (both
     /// grants); `None` keeps the host's default. The plugin's own requests are
     /// unaffected.
+    #[allow(
+        dead_code,
+        reason = "loaded and validated here; the token client reads it from plan 07-03"
+    )]
     pub user_agent: Option<String>,
 }
 
@@ -1105,6 +1111,11 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
         return None;
     }
     let token_url = https_endpoint(section.token_url.get_ref())?;
+    let user_agent = match &section.user_agent {
+        Some(value) if user_agent_is_valid(value.get_ref()) => Some(value.get_ref().clone()),
+        Some(_) => return None,
+        None => None,
+    };
     let revocation_url = match &section.revocation_url {
         Some(value) => Some(https_endpoint(value.get_ref())?),
         None => None,
@@ -1137,7 +1148,7 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
             .iter()
             .map(|(key, value)| (key.clone(), value.get_ref().clone()))
             .collect(),
-        user_agent: None,
+        user_agent,
     })
 }
 
@@ -1149,6 +1160,12 @@ fn https_endpoint(text: &str) -> Option<url::Url> {
     (url.scheme() == "https" && url.host_str().is_some() && plain).then_some(url)
 }
 
+/// `true` when `text` is 1 to 200 printable ASCII characters (0x20 to 0x7E),
+/// which keeps a User-Agent a safe single-line header value.
+fn user_agent_is_valid(text: &str) -> bool {
+    (1..=200).contains(&text.len()) && text.chars().all(|c| matches!(c, ' '..='~'))
+}
+
 /// `true` when `scope` is empty or contains whitespace: a joined scope list
 /// splits on spaces, so one entry must be one scope.
 fn scope_is_invalid(scope: &str) -> bool {
@@ -1157,7 +1174,7 @@ fn scope_is_invalid(scope: &str) -> bool {
 
 /// `[host.oauth]` checks. Every problem of the table is collected, in a fixed
 /// order: the three endpoints, `client_id`, `redirect_port`, scopes by index,
-/// `client_secret_env`, then `authorize_params` in key order, then the checks
+/// `client_secret_env`, `user_agent`, then `authorize_params` in key order, then the checks
 /// that depend on the grant (`grant_problems`). An unknown `grant` is reported
 /// first. A message states the rule and never repeats the value it rejects.
 fn oauth_problems(
@@ -1230,6 +1247,15 @@ fn oauth_problems(
             "host.oauth.client_secret_env".to_string(),
             "must not be empty",
             env_var.span().into(),
+        ));
+    }
+    if let Some(value) = &section.user_agent
+        && !user_agent_is_valid(value.get_ref())
+    {
+        problems.push(invalid(
+            "host.oauth.user_agent".to_string(),
+            "must be 1 to 200 printable ASCII characters",
+            value.span().into(),
         ));
     }
     for (key, value) in &section.authorize_params {
@@ -2526,7 +2552,10 @@ fetcher = "nope"
 
         let registry = load_with(&dir, &env).expect("a client_credentials table loads");
 
-        let oauth = plugin_of(&registry).oauth.as_ref().expect("the oauth table");
+        let oauth = plugin_of(&registry)
+            .oauth
+            .as_ref()
+            .expect("the oauth table");
         assert_eq!(oauth.grant, OAuthGrant::ClientCredentials);
         assert!(oauth.authorize_url.is_none());
         assert_eq!(oauth.token_url.as_str(), "https://auth.example/token");
@@ -2606,7 +2635,10 @@ fetcher = "nope"
                 "{field}: {message}"
             );
             for value in ["auth.example", "8123", "consent", "read", "revoke"] {
-                assert!(!message.contains(value), "{field} echoes {value}: {message}");
+                assert!(
+                    !message.contains(value),
+                    "{field} echoes {value}: {message}"
+                );
             }
         }
     }
@@ -2650,7 +2682,9 @@ fetcher = "nope"
 
         alpha_with_plugin(
             &dir,
-            &client_credentials_file(&format!("client_secret_env = \"STUB_CLIENT_SECRET\"\n{line}")),
+            &client_credentials_file(&format!(
+                "client_secret_env = \"STUB_CLIENT_SECRET\"\n{line}"
+            )),
         );
         let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(|| SENTINEL.to_string());
         let registry = load_with(&dir, &env).expect("a client_credentials table loads");
@@ -2660,7 +2694,12 @@ fetcher = "nope"
 
     #[test]
     fn user_agent_with_control_characters_is_rejected_naming_the_field() {
-        for value in ["bad\\nvalue", "bad\\rvalue", "bad\\tvalue", "bad\\u0000value"] {
+        for value in [
+            "bad\\nvalue",
+            "bad\\rvalue",
+            "bad\\tvalue",
+            "bad\\u0000value",
+        ] {
             let dir = TempDir::new().expect("tempdir");
             alpha_with_plugin(
                 &dir,
@@ -2729,7 +2768,11 @@ fetcher = "nope"
 
         let plugin = plugin_of(&registry);
         let keys: Vec<&str> = plugin.secrets.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["token"], "only the [host.secrets] alias reaches init");
+        assert_eq!(
+            keys,
+            ["token"],
+            "only the [host.secrets] alias reaches init"
+        );
         assert!(plugin.secrets.values().all(|s| s.expose() != SENTINEL));
         assert!(!plugin.settings_toml.contains(SENTINEL));
         assert!(!plugin.settings_toml.contains("client-1"));
