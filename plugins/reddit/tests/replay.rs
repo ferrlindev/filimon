@@ -570,3 +570,244 @@ fn hostile_shapes_return_errors_or_skips_never_a_panic() {
         }
     }
 }
+
+// ── Task 2: per-feed marks across several feeds, stable output, errors ───────
+
+fn two_feed_settings() -> Settings {
+    feed_settings(&["rust", "programming"], &["new"])
+}
+
+fn mark(cursor: &cursor::Cursor, key: &str) -> cursor::Mark {
+    cursor
+        .0
+        .get(key)
+        .unwrap_or_else(|| panic!("no mark for {key}"))
+        .clone()
+}
+
+#[test]
+fn first_poll_emits_one_page_per_feed_and_writes_a_mark_per_feed() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("listing_new")), Ok(fixture("listing_new"))]);
+    let outcome = run(&http, &two_feed_settings(), None).unwrap();
+    let urls: Vec<String> = http.requests().into_iter().map(|r| r.url).collect();
+    assert_eq!(
+        urls,
+        [
+            "https://oauth.reddit.com/r/rust/new?limit=25&raw_json=1",
+            "https://oauth.reddit.com/r/programming/new?limit=25&raw_json=1",
+        ]
+    );
+    // The same three posts answer both feeds: one is emitted once per poll.
+    assert_eq!(outcome.items.len(), 3);
+    let keys: Vec<String> = marks_of(&outcome).0.keys().cloned().collect();
+    assert_eq!(keys, ["r/programming:new", "r/rust:new"]);
+}
+
+#[test]
+fn later_poll_emits_only_posts_strictly_newer_than_the_mark() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("listing_new")), Ok(fixture("listing_newer"))]);
+    let first = first_poll(&http);
+    let second = run(&http, &rust_settings(), first.next_cursor.as_deref()).unwrap();
+    // Oldest first: the two posts above the previously seen page.
+    assert_eq!(ids(&second), ["t3_1kx9ae5", "t3_1kx9ad4"]);
+    let advanced = mark(&marks_of(&second), "r/rust:new");
+    assert_eq!(advanced.t, 1_700_000_500);
+    assert_eq!(advanced.n, "t3_1kx9ad4");
+    assert_eq!(
+        http.requests()[1].url,
+        "https://oauth.reddit.com/r/rust/new?limit=100&raw_json=1"
+    );
+}
+
+#[test]
+fn a_post_with_the_same_created_utc_as_the_mark_is_not_re_emitted() {
+    let http = ScriptedHttp::new(vec![
+        Ok(page(vec![post_data("t3_a", 1_700_000_100.0)])),
+        Ok(page(vec![
+            post_data("t3_a", 1_700_000_100.0),
+            post_data("t3_b", 1_700_000_100.0),
+            post_data("t3_c", 1_700_000_100.7),
+        ])),
+    ]);
+    let first = first_poll(&http);
+    let second = run(&http, &rust_settings(), first.next_cursor.as_deref()).unwrap();
+    assert!(second.items.is_empty(), "{:?}", ids(&second));
+    assert_eq!(second.next_cursor, first.next_cursor);
+}
+
+#[test]
+fn a_deleted_marked_post_does_not_cause_a_full_re_emit() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("listing_new")),
+        Ok(fixture("listing_marked_post_gone")),
+    ]);
+    let first = first_poll(&http);
+    let second = run(&http, &rust_settings(), first.next_cursor.as_deref()).unwrap();
+    assert!(second.items.is_empty(), "{:?}", ids(&second));
+    assert_eq!(second.next_cursor, first.next_cursor, "the old mark stays");
+}
+
+#[test]
+fn the_mark_is_the_max_over_the_emitted_posts_not_the_first_item() {
+    let http = ScriptedHttp::new(vec![Ok(page(vec![
+        post_data("t3_a", 1_700_000_100.0),
+        post_data("t3_c", 1_700_000_300.0),
+        post_data("t3_b", 1_700_000_200.0),
+    ]))]);
+    let outcome = first_poll(&http);
+    let newest = mark(&marks_of(&outcome), "r/rust:new");
+    assert_eq!((newest.t, newest.n.as_str()), (1_700_000_300, "t3_c"));
+}
+
+#[test]
+fn feeds_have_independent_marks() {
+    let both = feed_settings(&["rust"], &["new", "hot"]);
+    let http = ScriptedHttp::new(vec![
+        Ok(page(vec![post_data("t3_a", 1_700_000_100.0)])),
+        Ok(page(vec![post_data("t3_b", 1_700_000_150.0)])),
+        Ok(page(vec![post_data("t3_a", 1_700_000_100.0)])),
+        Ok(page(vec![
+            post_data("t3_c", 1_700_000_400.0),
+            post_data("t3_b", 1_700_000_150.0),
+        ])),
+    ]);
+    let first = run(&http, &both, None).unwrap();
+    let before = marks_of(&first);
+    let second = run(&http, &both, first.next_cursor.as_deref()).unwrap();
+    assert_eq!(ids(&second), ["t3_c"]);
+    let after = marks_of(&second);
+    assert_eq!(mark(&after, "r/rust:new"), mark(&before, "r/rust:new"));
+    assert_eq!(mark(&after, "r/rust:hot").n, "t3_c");
+    assert_ne!(mark(&after, "r/rust:hot"), mark(&before, "r/rust:hot"));
+}
+
+#[test]
+fn a_post_in_both_new_and_hot_is_emitted_once_per_poll() {
+    let both = feed_settings(&["rust"], &["new", "hot"]);
+    let http = ScriptedHttp::new(vec![
+        Ok(page(vec![
+            post_data("t3_a", 1_700_000_100.0),
+            post_data("t3_b", 1_700_000_200.0),
+        ])),
+        Ok(page(vec![
+            post_data("t3_b", 1_700_000_200.0),
+            post_data("t3_c", 1_700_000_300.0),
+        ])),
+    ]);
+    let outcome = run(&http, &both, None).unwrap();
+    assert_eq!(ids(&outcome), ["t3_a", "t3_b", "t3_c"]);
+    // The deduped post still moves its own feed's mark.
+    let marks = marks_of(&outcome);
+    assert_eq!(mark(&marks, "r/rust:new").n, "t3_b");
+    assert_eq!(mark(&marks, "r/rust:hot").n, "t3_c");
+}
+
+#[test]
+fn output_is_oldest_first_with_ties_broken_by_fullname() {
+    let http = ScriptedHttp::new(vec![Ok(page(vec![
+        post_data("t3_z", 1_700_000_100.0),
+        post_data("t3_b", 1_700_000_100.0),
+        post_data("t3_m", 1_700_000_050.0),
+        post_data("t3_a", 1_700_000_100.0),
+        post_data("t3_y", 1_700_000_900.0),
+    ]))]);
+    let outcome = first_poll(&http);
+    assert_eq!(ids(&outcome), ["t3_m", "t3_a", "t3_b", "t3_z", "t3_y"]);
+    assert_eq!(mark(&marks_of(&outcome), "r/rust:new").n, "t3_y");
+}
+
+#[test]
+fn an_all_empty_first_poll_still_returns_a_cursor_not_none() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("listing_empty"))]);
+    let outcome = first_poll(&http);
+    assert!(outcome.items.is_empty());
+    assert_eq!(outcome.next_cursor.as_deref(), Some(&b"{}"[..]));
+    assert!(marks_of(&outcome).0.is_empty());
+}
+
+#[test]
+fn marks_for_feeds_no_longer_configured_are_dropped() {
+    let mut stored = cursor::Cursor::default();
+    for key in ["r/rust:new", "r/removed_sub:new"] {
+        stored.0.insert(
+            key.to_string(),
+            cursor::Mark {
+                t: 1_700_000_300,
+                n: "t3_1kx9aa1".to_string(),
+            },
+        );
+    }
+    let bytes = cursor::encode(&stored).unwrap();
+    let http = ScriptedHttp::new(vec![Ok(fixture("listing_new"))]);
+    let outcome = run(&http, &rust_settings(), Some(&bytes)).unwrap();
+    assert!(outcome.items.is_empty());
+    let keys: Vec<String> = marks_of(&outcome).0.keys().cloned().collect();
+    assert_eq!(keys, ["r/rust:new"]);
+}
+
+#[test]
+fn an_undecodable_cursor_is_a_first_poll_with_a_warning() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("listing_new"))]);
+    let outcome = run(&http, &rust_settings(), Some(b"not json")).unwrap();
+    assert_eq!(outcome.items.len(), 3, "a first poll emits the page");
+    assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+    assert!(!outcome.warnings[0].contains("not json"));
+    assert_eq!(
+        http.requests()[0].url,
+        "https://oauth.reddit.com/r/rust/new?limit=25&raw_json=1",
+        "a first poll takes the first-page limit"
+    );
+}
+
+#[test]
+fn a_failed_feed_fails_the_whole_poll_with_no_items_and_no_new_cursor() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("listing_new")),
+        Err(HttpError::Timeout),
+    ]);
+    let result = run(&http, &two_feed_settings(), None);
+    // `Err` carries no items and no cursor by construction: the host keeps
+    // the cursor it stored, so a failure can only cause a re-fetch.
+    assert!(matches!(result, Err(PollError::Transient(_))), "{result:?}");
+    assert_eq!(http.requests().len(), 2);
+}
+
+#[test]
+fn fetch_level_errors_map_to_the_poll_error_variants() {
+    let poll_with = |error: HttpError| {
+        let http = ScriptedHttp::new(vec![Err(error)]);
+        run(&http, &rust_settings(), None).unwrap_err()
+    };
+    assert!(matches!(
+        poll_with(HttpError::Denied("detail-zzz".to_string())),
+        PollError::Config(text) if !text.contains("detail-zzz")
+    ));
+    assert!(matches!(
+        poll_with(HttpError::NotConfigured),
+        PollError::Config(_)
+    ));
+    assert!(matches!(
+        poll_with(HttpError::Timeout),
+        PollError::Transient(_)
+    ));
+    match poll_with(HttpError::Transport(
+        "https://secret.example/path?token=abc".to_string(),
+    )) {
+        PollError::Transient(text) => {
+            assert!(!text.contains("secret") && !text.contains("token"), "{text}");
+        }
+        other => panic!("expected transient, got {other:?}"),
+    }
+    assert_eq!(
+        poll_with(HttpError::RateLimited(Some(30))),
+        PollError::RateLimited(Some(30))
+    );
+    assert_eq!(
+        poll_with(HttpError::RateLimited(None)),
+        PollError::RateLimited(None)
+    );
+    assert!(matches!(
+        poll_with(HttpError::InvalidRequest("detail-zzz".to_string())),
+        PollError::Fatal(text) if !text.contains("detail-zzz")
+    ));
+}
