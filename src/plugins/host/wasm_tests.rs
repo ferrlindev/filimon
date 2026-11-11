@@ -5,6 +5,7 @@
 // plugins/README.md. Time is paused, so the poll interval costs nothing.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,10 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 use super::sink::{ItemSink, SinkError, SinkRecord, VecSink};
-use super::testing::{LogCapture, TestSource, fixture_wasm, load_test_registry, write_registry};
+use super::testing::{
+    LogCapture, Reply, SeenRequest, TestHttpServer, TestSource, fixture_wasm, load_test_registry,
+    write_registry,
+};
 use super::{Host, HostOptions, HostReport};
 use crate::models::SourceType;
 
@@ -495,4 +499,98 @@ async fn wasm_spinning_guest_is_cancelled_on_shutdown_and_does_not_block_other_p
     assert_eq!(spinner.disabled, None);
     assert!(report.plugins["stub"].polls >= 2);
     assert_eq!(report.plugins["stub"].disabled, None);
+}
+
+// ── Fetcher Routing And Enforcement (real wasm, real network on loopback) ─────
+//
+// Real time throughout: these tests wait on a socket and on a guest that never
+// finishes, so tokio's paused clock would never advance.
+
+/// Writes `filimon.toml` and `stub.toml` into `dir`: one source `stub` assigned
+/// `fetcher`, and the two fetchers `stub-fetcher` and `http`. The source allows
+/// `127.0.0.1` and fetches `http://127.0.0.1:<port>/swap` during `init`.
+fn registry_assigning(fetcher: &str, port: u16, dir: &Path) -> PathBuf {
+    let registry = format!(
+        "[sources.stub]\ncomponent = {source:?}\nconfig = \"stub.toml\"\nfetcher = \"{fetcher}\"\n\n\
+         [fetchers.stub-fetcher]\ncomponent = {stub_fetcher:?}\n\n\
+         [fetchers.http]\ncomponent = {http_fetcher:?}\n",
+        source = fixture_wasm("stub-source", "stub_source.wasm")
+            .display()
+            .to_string(),
+        stub_fetcher = fixture_wasm("stub-fetcher", "stub_fetcher.wasm")
+            .display()
+            .to_string(),
+        http_fetcher = fixture_wasm("http-fetcher", "http_fetcher.wasm")
+            .display()
+            .to_string(),
+    );
+    std::fs::write(
+        dir.join("stub.toml"),
+        format!(
+            "[host]\npoll_interval_secs = 60\nallowlist = [\"127.0.0.1\"]\n\n\
+             [settings]\ngreeting = \"{GREETING}\"\nfetch_url = \"http://127.0.0.1:{port}/swap\"\n"
+        ),
+    )
+    .expect("write plugin toml");
+    let path = dir.join("filimon.toml");
+    std::fs::write(&path, registry).expect("write registry");
+    path
+}
+
+/// Runs `host` until its sink holds one record (polling every 50 ms for at most
+/// 10 s), then cancels it and returns its report.
+async fn run_until_one_record(host: Host) -> HostReport {
+    let sink = Arc::new(VecSink::default());
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(host.run(Arc::clone(&sink), token.clone()));
+    let started = std::time::Instant::now();
+    while sink.records().is_empty() && started.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    token.cancel();
+    let report = handle.await.expect("host task");
+    assert_eq!(sink.records().len(), 1, "the source produced one record");
+    report
+}
+
+/// One run of the swap registry: its log text and the requests the server saw.
+async fn swap_run(fetcher: &str) -> (String, Vec<SeenRequest>) {
+    let server = TestHttpServer::start(|_| Reply::ok("swapped")).await;
+    let dir = TempDir::new().expect("tempdir");
+    let registry = load_test_registry(&registry_assigning(fetcher, server.port(), dir.path()));
+    let (logs, _guard) = LogCapture::start();
+
+    let host = Host::load(
+        &registry,
+        HostOptions {
+            state_dir: dir.path().join("state"),
+        },
+    )
+    .expect("host loads");
+    assert!(host.load_failures().is_empty(), "{:?}", host.load_failures());
+    let report = run_until_one_record(host).await;
+    assert_eq!(report.plugins["stub"].disabled, None);
+
+    (logs.text(), server.seen())
+}
+
+/// FETCH-01 tracer: the registry's `fetcher` value alone decides who serves the
+/// source's request. The same three components, two registries that differ in
+/// one line.
+#[tokio::test]
+#[ignore = "needs plugin fixtures: see plugins/README.md"]
+async fn wasm_changing_the_assigned_fetcher_changes_who_serves_the_request() {
+    // Run A: the stub fetcher answers itself, so nothing reaches the server.
+    let (text, seen) = swap_run("stub-fetcher").await;
+    assert!(text.contains("stub fetch:"), "{text}");
+    assert!(text.contains("init fetch status 200"), "{text}");
+    assert!(seen.is_empty(), "the server saw {seen:?}");
+
+    // Run B: the default fetcher goes to the network, and the stub never runs.
+    let (text, seen) = swap_run("http").await;
+    assert!(text.contains("init fetch status 200"), "{text}");
+    assert!(!text.contains("stub fetch:"), "{text}");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(seen[0].target, "/swap");
 }
