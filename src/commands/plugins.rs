@@ -1408,7 +1408,7 @@ mod tests {
     // ── check ────────────────────────────────────────────────────────────────
 
     use crate::plugins::error::ConfigError;
-    use crate::plugins::host::testing::{WASI_IMPORT_COMPONENT, fixture_wasm};
+    use crate::plugins::host::testing::{LogCapture, WASI_IMPORT_COMPONENT, fixture_wasm};
 
     const SECRET_VALUE: &str = "hunter2-distinctive";
     const GARBAGE: &[u8] = b"this is not a wasm component";
@@ -2452,6 +2452,135 @@ mod tests {
             !state.exists(),
             "a dry run must not create the state directory"
         );
+    }
+
+    // ── Fetch routing ────────────────────────────────────────────────────────
+
+    /// A registry with source `stub` (the real stub source, which fetches
+    /// `http://example.invalid/once` during `init` and may reach only that host)
+    /// and the real stub fetcher registered as `stub-fetcher`. With `Some`,
+    /// `stub` is assigned that fetcher; with `None` it has no `fetcher` key.
+    fn fetch_registry(dir: &Path, assigned: Option<&str>) -> PathBuf {
+        let mut text = format!(
+            "[sources.stub]\ncomponent = {:?}\nconfig = \"stub.toml\"\n",
+            fixture_wasm("stub-source", "stub_source.wasm")
+                .display()
+                .to_string()
+        );
+        if let Some(fetcher) = assigned {
+            let _ = writeln!(text, "fetcher = \"{fetcher}\"");
+        }
+        let _ = write!(
+            text,
+            "\n[fetchers.stub-fetcher]\ncomponent = {:?}\n",
+            fixture_wasm("stub-fetcher", "stub_fetcher.wasm")
+                .display()
+                .to_string()
+        );
+        std::fs::write(
+            dir.join("stub.toml"),
+            "[host]\npoll_interval_secs = 60\nallowlist = [\"example.invalid\"]\n\n\
+             [settings]\ngreeting = \"hello\"\nfetch_url = \"http://example.invalid/once\"\n",
+        )
+        .expect("write plugin toml");
+        write_registry_text(dir, &text)
+    }
+
+    /// Runs `run-once stub` as a JSON dry run on a real-time runtime and returns
+    /// (stdout, everything logged).
+    fn dry_run_json(registry: &Path, state: &Path) -> (String, String) {
+        let (logs, _guard) = LogCapture::start();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        runtime
+            .block_on(run_once(
+                registry,
+                Some(state),
+                "stub",
+                false,
+                true,
+                &mut out,
+                &mut err,
+            ))
+            .expect("the real stub polls");
+        (String::from_utf8(out).expect("utf8"), logs.text())
+    }
+
+    #[test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    fn wasm_run_once_routes_fetch_through_the_assigned_fetcher() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = fetch_registry(dir.path(), Some("stub-fetcher"));
+        let state = dir.path().join("state");
+
+        let (stdout, logs) = dry_run_json(&registry, &state);
+
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 1, "{stdout}");
+        let item: SourceItem = serde_json::from_str(lines[0]).expect("a SourceItem");
+        assert_eq!(item.id, "stub-0");
+        assert!(logs.contains("stub fetch: http://example.invalid/once"), "{logs}");
+        assert!(logs.contains("plugin=stub-fetcher"), "{logs}");
+        assert!(logs.contains("init fetch status 200"), "{logs}");
+        assert!(!state.exists(), "a dry run must not create the state directory");
+    }
+
+    #[test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    fn wasm_run_once_a_source_without_a_fetcher_still_gets_not_configured() {
+        let dir = TempDir::new().expect("tempdir");
+        let registry = fetch_registry(dir.path(), None);
+        let state = dir.path().join("state");
+
+        let (stdout, logs) = dry_run_json(&registry, &state);
+
+        assert_eq!(stdout.lines().count(), 1, "the item is still printed: {stdout}");
+        assert!(logs.contains("init fetch failed: FetchError::NotConfigured"), "{logs}");
+        assert!(!logs.contains("stub fetch:"), "no fetcher ran: {logs}");
+    }
+
+    #[tokio::test]
+    async fn run_once_names_both_plugins_when_the_assigned_fetcher_cannot_load() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("stub.wasm"), GARBAGE).expect("source component");
+        std::fs::write(dir.path().join("f.wasm"), GARBAGE).expect("fetcher component");
+        std::fs::write(dir.path().join("stub.toml"), MINIMAL_TOML).expect("plugin toml");
+        let registry = write_registry_text(
+            dir.path(),
+            "[sources.stub]\ncomponent = \"stub.wasm\"\nconfig = \"stub.toml\"\nfetcher = \"f\"\n\n\
+             [fetchers.f]\ncomponent = \"f.wasm\"\n",
+        );
+        let state = dir.path().join("state");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let error = run_once(&registry, Some(&state), "stub", false, false, &mut out, &mut err)
+            .await
+            .expect_err("a fetcher that cannot load stops run-once");
+
+        // The fetcher is loaded before the source's own component, so this is
+        // the dependency's error, not a complaint about the source's bytes.
+        let host_error = error
+            .downcast_ref::<HostError>()
+            .unwrap_or_else(|| panic!("a HostError, got {error:?}"));
+        assert!(
+            matches!(
+                host_error,
+                HostError::FetcherUnavailable { plugin, fetcher, .. }
+                    if plugin == "stub" && fetcher == "f"
+            ),
+            "{host_error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("`stub`"), "{text}");
+        assert!(text.contains("`f`"), "{text}");
+        assert!(text.contains("fetcher"), "{text}");
+        assert!(out.is_empty(), "nothing was printed");
+        assert!(!state.exists(), "no state directory was created");
     }
 
     #[test]
