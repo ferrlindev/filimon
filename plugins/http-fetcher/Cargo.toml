@@ -1,0 +1,23 @@
+[package]
+name = "http-fetcher"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Default filimon HTTP fetcher plugin: forwards each request to the host's outbound-http send."
+authors = ["filimon"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "filimon:http-fetcher"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "fetcher"
+
+# Own workspace, so the root filimon workspace does not capture this crate.
+[workspace]
