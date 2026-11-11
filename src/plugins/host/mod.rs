@@ -157,6 +157,7 @@ impl Host {
                     Arc::clone(fetcher_pre),
                     host_engine.engine().clone(),
                     Arc::new(FetchPolicy::for_source(&name, &spec.host)),
+                    host_engine.egress(),
                 ));
                 factory = factory.with_route(Some(route));
             }
