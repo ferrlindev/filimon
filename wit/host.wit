@@ -13,9 +13,13 @@ interface log {
 interface fetch {
     use types.{request, response, fetch-error};
 
-    /// Perform one HTTP request on behalf of the plugin. The host routes the
-    /// request to the source's assigned fetcher and enforces its allowlist and
-    /// timeout.
+    /// Perform one HTTP request on behalf of the plugin.
+    ///
+    /// The host routes the request to the fetcher assigned to the calling
+    /// source and runs it in a fresh fetcher instance for this call alone. It
+    /// enforces the source's allowlist (an exact host match, `http` and
+    /// `https` only) before any fetcher starts, and one timeout for the whole
+    /// call. A source with no assigned fetcher gets `not-configured`.
     fetch: func(request: request) -> result<response, fetch-error>;
 }
 
@@ -24,5 +28,12 @@ interface outbound-http {
     use types.{request, response, fetch-error};
 
     /// Send one HTTP request over the host's network stack.
+    ///
+    /// The host performs the request with its own certificate-validating
+    /// client and applies the same request rules as at the source's entry.
+    /// It follows at most five redirects itself, checks the allowlist of the
+    /// calling source on every hop, and removes credentials when a redirect
+    /// changes origin. The response body is capped, and the call ends with
+    /// `timeout` when the source's single deadline passes.
     send: func(request: request) -> result<response, fetch-error>;
 }

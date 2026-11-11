@@ -68,17 +68,23 @@ interface types {
 
     /// Why a fetch failed (D-04).
     variant fetch-error {
-        /// Blocked by host policy (allowlist), FETCH-02.
+        /// Blocked by host policy: the host of the url, or of a redirect
+        /// target, is not in the allowlist. No connection is made.
         denied(string),
-        /// The request exceeded the host timeout.
+        /// The call's single deadline passed. It covers fetcher start-up,
+        /// every redirect and the body read.
         timeout,
-        /// Connection, DNS, or TLS failure.
+        /// The request could not be completed: a connection, DNS or
+        /// certificate failure, a refused connection, a response over the
+        /// size cap, too many redirects, or a fetcher that failed.
         transport(string),
         /// Retry-after in seconds, when known.
         rate-limited(option<u32>),
-        /// No fetcher is assigned to this source (Phase 3 interim).
+        /// No fetcher is assigned to this source.
         not-configured,
-        /// The request itself is malformed, for example an unparsable URL.
+        /// The request itself cannot be used: a bad url or scheme, a
+        /// malformed or forbidden header, a method the host refuses, or a
+        /// request over the size limits.
         invalid-request(string),
     }
 }
