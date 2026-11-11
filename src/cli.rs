@@ -156,6 +156,20 @@ pub enum AuthCommand {
         #[arg(long)]
         no_browser: bool,
     },
+
+    /// Show every stored login and its expiry state; --json prints one JSON array.
+    Status {
+        /// Print the rows as one JSON array
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete a plugin's stored login and revoke it at the provider when the plugin declares a `revocation_url`.
+    Logout {
+        /// The registered source to log out of
+        #[arg(value_name = "NAME")]
+        plugin: String,
+    },
 }
 
 /// The `fili plugins` subcommands.
@@ -301,6 +315,44 @@ mod tests {
     #[test]
     fn auth_login_requires_a_plugin_name() {
         assert!(Cli::try_parse_from(["fili", "auth", "login"]).is_err());
+    }
+
+    #[test]
+    fn auth_status_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "status"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Status { json: false }
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_logout_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "logout", "reddit"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Logout { ref plugin }
+            } if plugin == "reddit"
+        ));
+    }
+
+    #[test]
+    fn auth_logout_requires_a_plugin_name() {
+        assert!(Cli::try_parse_from(["fili", "auth", "logout"]).is_err());
+    }
+
+    #[test]
+    fn auth_status_json_flag_parses() {
+        let cli = Cli::try_parse_from(["fili", "auth", "status", "--json"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Status { json: true }
+            }
+        ));
     }
 
     #[test]

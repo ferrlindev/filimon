@@ -17,13 +17,6 @@
 // for its whole life, and the auth commands must work beside it.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// The login flow, the token client and the CLI commands that read the items
-// still unused here land in later plans of this phase; plan 06-08 removes this.
-#![allow(
-    dead_code,
-    reason = "readers for the remaining items land in later plans of this phase"
-)]
-
 pub mod callback;
 pub mod client;
 pub mod error;
