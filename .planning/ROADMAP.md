@@ -213,7 +213,7 @@ Plans:
   3. `fili plugins run-once youtube` returns new uploads from the channels in its TOML, read from their uploads playlists. After `fili auth login youtube`, it also returns new uploads from the user's subscriptions.
   4. YouTube polls use only low-cost Data API endpoints (no 100-unit search calls). A quota-exceeded response shows up as a clear, named error, not a silently empty poll.
   5. Each plugin's unit tests pass against recorded API fixtures with no network access and no API keys.
-**Plans:** 10/12 plans executed
+**Plans:** 11/12 plans executed
 
 Plans:
 **Wave 1**
@@ -235,7 +235,7 @@ Plans:
 - [x] 07-09-PLAN.md — YouTube subscriptions for `youtube-user` with `subscriptions_limit` and the tested quota formula (YTUB-02, YTUB-03, TEST-01)
 
 **Wave 5** *(blocked on Wave 4)*
-- [ ] 07-11-PLAN.md — Sample registry of five instances over two components, host sample tests and the Reddit and YouTube operator documentation (RDDT-01 to RDDT-03, YTUB-01 to YTUB-03, TEST-01)
+- [x] 07-11-PLAN.md — Sample registry of five instances over two components, host sample tests and the Reddit and YouTube operator documentation (RDDT-01 to RDDT-03, YTUB-01 to YTUB-03, TEST-01)
 
 **Wave 6** *(blocked on Wave 5; contains a human-action checkpoint)*
 - [ ] 07-12-PLAN.md — Optional real-fixture capture (synthetic fallback accepted, D-21), reconciliation and the offline phase gate (all Phase 7 requirements)
@@ -265,5 +265,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
 | 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
-| 7. Reddit & YouTube Plugins | 10/12 | In Progress | - |
+| 7. Reddit & YouTube Plugins | 11/12 | In Progress | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
