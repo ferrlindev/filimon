@@ -2468,4 +2468,127 @@ mod sched_auth {
         assert_eq!(server.seen().len(), 1, "no request after the mark");
         assert_eq!(report.disabled, None);
     }
+
+    // ── SC3 at the fake level: the plugin holds only an access token ──────────
+    //
+    // Real time, like the refresh tests above.
+
+    /// Writes a registry and plugin file for a source `stub` that declares one
+    /// plugin secret and an OAuth client secret, both named by env keys.
+    fn secret_registry(dir: &Path) -> PathBuf {
+        std::fs::write(
+            dir.join("filimon.toml"),
+            "[sources.stub]\ncomponent = \"stub.wasm\"\nconfig = \"stub.toml\"\n",
+        )
+        .expect("write registry");
+        std::fs::write(
+            dir.join("stub.toml"),
+            "[host]\npoll_interval_secs = 1\n\n\
+             [host.secrets]\napi_key = \"STUB_API_KEY\"\n\n\
+             [host.oauth]\n\
+             authorize_url = \"https://auth.example/authorize\"\n\
+             token_url = \"https://auth.example/token\"\n\
+             scopes = [\"read\"]\nclient_id = \"client-1\"\n\
+             client_secret_env = \"STUB_CLIENT_SECRET\"\n",
+        )
+        .expect("write plugin toml");
+        dir.join("filimon.toml")
+    }
+
+    #[tokio::test]
+    async fn the_plugin_never_receives_the_refresh_token_or_the_client_secret() {
+        use base64::Engine as _;
+
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        let env = |key: &str| match key {
+            "STUB_API_KEY" => Some("API-VALUE-1".to_string()),
+            "STUB_CLIENT_SECRET" => Some("CS-SENTINEL-91bc".to_string()),
+            _ => None,
+        };
+        let registry = crate::plugins::config::load_registry_with_env(
+            &secret_registry(dir.path()),
+            &env,
+        )
+        .expect("the registry loads");
+        let source = &registry.sources["stub"];
+        let mut oauth = source
+            .plugin
+            .as_ref()
+            .and_then(|plugin| plugin.oauth.clone())
+            .expect("the plugin declares [host.oauth]");
+        assert!(oauth.client_secret.is_some(), "the host holds the client secret");
+
+        let server = TestHttpServer::start(|_| {
+            Reply::json(
+                200,
+                &token_body("AT-NEW", Some("RT-ROTATED-0d1e"), Some(3600)),
+            )
+        })
+        .await;
+        oauth.token_url = url::Url::parse(&server.url("/token")).expect("token url");
+
+        let mut plugin = PluginSpec::from_loaded(source, &state_dir).expect("an enabled source");
+        plugin.auth = Some(Arc::new(TokenProvider::new("stub", oauth, &state_dir)));
+        plugin.host.poll_interval = Duration::from_millis(300);
+        let spec_debug = format!("{plugin:?}");
+
+        TokenStore::new(&state_dir, "stub")
+            .write(&StoredTokens {
+                access_token: AccessToken::new("AT-OLD".to_string()),
+                refresh_token: Some(RefreshToken::new("RT-SENTINEL-7f3a".to_string())),
+                expires_at: unix_now() + 30,
+                token_type: None,
+                scope: None,
+                needs_login: false,
+                obtained_at: unix_now() - 3000,
+            })
+            .expect("write the login");
+
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_plugin(
+            plugin,
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            shutdown.clone(),
+        ));
+        wait_until("two polls", || factory.poll_tokens().len() >= 2).await;
+        shutdown.cancel();
+        let report = handle.await.expect("plugin task");
+        assert_eq!(report.disabled, None);
+
+        // Everything the guest was handed, in call order, plus the spec.
+        let everything = format!("{:?}\n{spec_debug}", factory.inputs());
+        assert!(everything.contains("AT-NEW"), "{everything}");
+        assert!(everything.contains("API-VALUE-1"), "{everything}");
+        for secret in ["RT-SENTINEL-7f3a", "RT-ROTATED-0d1e", "CS-SENTINEL-91bc"] {
+            assert!(
+                !everything.contains(secret),
+                "{secret} reached the plugin:\n{everything}"
+            );
+        }
+        assert_eq!(factory.poll_tokens()[0].as_deref(), Some("AT-NEW"));
+
+        // The absence above is not vacuous: the host used the client secret
+        // and held a refresh token that it rotated.
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1, "one refresh, then the new token is fresh");
+        let auth = seen[0].header("authorization").expect("an authorization header");
+        let encoded = auth.strip_prefix("Basic ").expect("Basic authentication");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64 credentials");
+        let decoded = String::from_utf8(decoded).expect("utf-8 credentials");
+        assert!(decoded.contains("CS-SENTINEL-91bc"), "{decoded}");
+        let stored = TokenStore::new(&state_dir, "stub")
+            .read()
+            .expect("read")
+            .expect("a login");
+        assert_eq!(
+            stored.refresh_token.expect("rotated").expose(),
+            "RT-ROTATED-0d1e"
+        );
+    }
 }
