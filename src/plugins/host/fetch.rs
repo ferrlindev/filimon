@@ -1920,4 +1920,48 @@ mod tests {
             Some("WISECrawler/1.0 (academic research)")
         );
     }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_source_and_crawler_routes_enforce_the_same_policy() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/slow" => Reply::ok("late").delayed(Duration::from_secs(3)),
+            _ => Reply::ok("fast"),
+        })
+        .await;
+        let timeout = Duration::from_millis(500);
+
+        // A source-labelled route over the http fetcher component.
+        let engine = HostEngine::new().expect("engine");
+        let path = fixture_wasm("http-fetcher", "http_fetcher.wasm");
+        let pre = load_fetcher("http", &path, &engine).expect("fetcher loads");
+        let source_route = FetchRoute::new(
+            "http",
+            Arc::new(pre),
+            engine.engine().clone(),
+            Arc::new(FetchPolicy::new("reddit", Allowlist::new(["127.0.0.1"]), timeout)),
+            engine.egress(),
+        );
+
+        // A crawler-labelled route over the same component and allowlist.
+        let crawler = crawler_over_http_fetcher(timeout, &[]);
+        let crawl_fetcher = CrawlFetcher::load(&crawler, &[server.url("/")]).expect("loads");
+        let crawler_route = &crawl_fetcher.route;
+
+        for (label, route) in [("source", &source_route), ("crawler", crawler_route)] {
+            let denied_url = server.localhost_url("/fast");
+            let result = route.fetch(request(&denied_url)).await;
+            assert!(
+                matches!(result, Err(types::FetchError::Denied(_))),
+                "{label}: {result:?}"
+            );
+
+            let slow_url = server.url("/slow");
+            let result = route.fetch(request(&slow_url)).await;
+            assert!(
+                matches!(result, Err(types::FetchError::Timeout)),
+                "{label}: {result:?}"
+            );
+        }
+    }
 }

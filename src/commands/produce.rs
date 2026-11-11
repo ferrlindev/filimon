@@ -181,12 +181,14 @@ mod tests {
     use super::*;
 
     use std::cell::RefCell;
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
 
     use crate::plugins::config::LoadedCrawler;
-    use crate::plugins::host::testing::{Reply, TestHttpServer, fixture_wasm};
+    use crate::plugins::host::testing::{Reply, SeenRequest, TestHttpServer, fixture_wasm};
 
     fn write(dir: &TempDir, name: &str, text: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
@@ -355,5 +357,97 @@ mod tests {
                 Some("WISECrawler/1.0 (academic research)")
             );
         }
+    }
+
+    // ── Allowlist, redirect and timeout on real wasm ──────────────────────────
+
+    /// A server whose handler also learns the server's own port, so a reply
+    /// can point at `localhost:<port>`.
+    async fn start_with_port(
+        handler: impl Fn(&SeenRequest, u16) -> Reply + Send + Sync + 'static,
+    ) -> TestHttpServer {
+        let port = Arc::new(AtomicU16::new(0));
+        let shared = Arc::clone(&port);
+        let server =
+            TestHttpServer::start(move |seen| handler(seen, shared.load(Ordering::SeqCst))).await;
+        port.store(server.port(), Ordering::SeqCst);
+        server
+    }
+
+    fn redirecting_server() -> impl std::future::Future<Output = TestHttpServer> {
+        start_with_port(|seen, port| match seen.target.as_str() {
+            "/r" => Reply::redirect(302, &format!("http://localhost:{port}/x")),
+            _ => Reply::ok("reached"),
+        })
+    }
+
+    fn target(url: String) -> CrawlTarget {
+        CrawlTarget {
+            url,
+            priority: 1.0,
+            depth: 0,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_crawler_denies_a_redirect_to_a_host_that_is_not_a_seed_host() {
+        let server = redirecting_server().await;
+        let urls = vec![server.url("/r")];
+        let fetcher = component_fetcher(&urls, Duration::from_secs(5), &[]);
+
+        let result = fetcher.fetch_page(&target(server.url("/r"))).await;
+
+        let Err(text) = result else {
+            panic!("a redirect to another host was followed: {result:?}");
+        };
+        assert!(text.contains("denied"), "{text}");
+        assert!(text.contains("localhost"), "{text}");
+        let requests: Vec<String> = server.seen().into_iter().map(|r| r.target).collect();
+        assert_eq!(requests, ["/r"], "the second host was contacted");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_crawler_extra_hosts_allow_a_redirect_target() {
+        let server = redirecting_server().await;
+        let urls = vec![server.url("/r")];
+        let fetcher = component_fetcher(&urls, Duration::from_secs(5), &["localhost"]);
+
+        let page = fetcher
+            .fetch_page(&target(server.url("/r")))
+            .await
+            .expect("the listed host is reachable through the redirect");
+
+        assert_eq!(page.html, "reached");
+        let requests: Vec<String> = server.seen().into_iter().map(|r| r.target).collect();
+        assert_eq!(requests, ["/r", "/x"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs plugin fixtures: see plugins/README.md"]
+    async fn wasm_a_hung_server_is_abandoned_at_the_crawler_timeout_and_the_crawl_moves_on() {
+        let server = TestHttpServer::start(|seen| match seen.target.as_str() {
+            "/slow" => Reply::ok("too late").delayed(Duration::from_secs(5)),
+            _ => Reply::ok("<html><body>ok</body></html>"),
+        })
+        .await;
+        let urls = vec![server.url("/slow"), server.url("/ok")];
+        let fetcher = component_fetcher(&urls, Duration::from_secs(1), &[]);
+        let pages = RefCell::new(Vec::new());
+        let started = Instant::now();
+
+        let count = crawl(&fetcher, &urls, 0, |page| {
+            pages.borrow_mut().push(page.url);
+            async { Ok(()) }
+        })
+        .await
+        .expect("a hung seed does not stop the crawl");
+
+        assert_eq!(count, 1);
+        assert_eq!(pages.into_inner(), [server.url("/ok")]);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(4), "the crawl took {elapsed:?}");
+        assert!(elapsed >= Duration::from_secs(1), "the timeout was not applied: {elapsed:?}");
     }
 }
