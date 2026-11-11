@@ -62,6 +62,12 @@ impl AuthCode {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// A code with this text, for tests of the token request.
+    #[cfg(test)]
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self(value.to_string())
+    }
 }
 
 impl std::fmt::Debug for AuthCode {

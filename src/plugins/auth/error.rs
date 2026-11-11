@@ -77,4 +77,29 @@ pub enum AuthError {
     #[error("the login callback is not usable: {reason}")]
     #[diagnostic(code(fili::auth::callback_invalid))]
     CallbackInvalid { reason: String },
+
+    /// The token or revocation endpoint could not be reached, or its answer
+    /// could not be read. The text is a cleaned transport description with no
+    /// url, never a body.
+    #[error("the token endpoint could not be reached: {reason}")]
+    #[diagnostic(code(fili::auth::token_request))]
+    TokenRequest { reason: String },
+
+    /// The token endpoint answered with a non-success status. Only the cleaned
+    /// OAuth error code and description (or the HTTP status) are carried.
+    #[error("the token endpoint rejected the request: {error}")]
+    #[diagnostic(code(fili::auth::token_rejected))]
+    TokenRejected { error: String },
+
+    /// The token endpoint answered with success but the answer is not usable.
+    /// The body is never carried.
+    #[error("the token endpoint's answer is not usable: {reason}")]
+    #[diagnostic(code(fili::auth::token_response))]
+    TokenResponse { reason: String },
+
+    /// Revoking the login at the provider failed. The caller decides whether
+    /// to warn (D-03).
+    #[error("revoking the login at the provider failed: {reason}")]
+    #[diagnostic(code(fili::auth::revoke_failed))]
+    RevokeFailed { reason: String },
 }

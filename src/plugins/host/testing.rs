@@ -245,6 +245,17 @@ impl Reply {
         }
     }
 
+    /// An answer with this status, `body` and a JSON `content-type`.
+    pub(crate) fn json(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: body.as_bytes().to_vec(),
+            delay: Duration::ZERO,
+            omit_length: false,
+        }
+    }
+
     /// A redirect with this status and a `Location` header.
     pub(crate) fn redirect(status: u16, location: &str) -> Self {
         Self {
