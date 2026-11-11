@@ -1098,6 +1098,137 @@ fn every_request_is_official_authenticated_and_carries_the_enforced_user_agent()
     let requests = http.inner.requests();
     let agent = reddit_source::http::header(&requests[0].headers, "user-agent").unwrap();
     assert!(agent.starts_with("filimon:my-app:"), "{agent}");
+
+    // The logged-in feeds (plan 07-07): `home` and `saved`, first poll then a
+    // later poll with the returned cursor, plus the failure statuses.
+    for (feed_line, page_name) in [
+        ("feed = \"home\"", "home_page"),
+        ("feed = \"saved\"\nusername = \"sweepuser\"", "saved_page"),
+    ] {
+        let user = settings(&format!(
+            "{feed_line}\nuser_agent_contact = \"u/sweeper\"\n"
+        ));
+        let http = StrictHttp::new(
+            vec![Ok(fixture(page_name)), Ok(fixture(page_name))],
+            "reddit",
+            "sweeper",
+        );
+        let first = poll(&http, &user, None, Some(TOKEN)).expect("first user-feed poll");
+        poll(&http, &user, first.next_cursor.as_deref(), Some(TOKEN))
+            .expect("later user-feed poll");
+        assert_eq!(http.inner.requests().len(), 2, "{page_name}");
+
+        for response in [
+            fixture("rate_limited_429"),
+            fixture("unauthorized_401"),
+            status_response(403, &[], ""),
+            status_response(404, &[], ""),
+            status_response(503, &[], ""),
+        ] {
+            let http = StrictHttp::new(vec![Ok(response)], "reddit", "sweeper");
+            assert!(poll(&http, &user, None, Some(TOKEN)).is_err());
+            assert_eq!(http.inner.requests().len(), 1);
+        }
+    }
+}
+
+// ── Plan 07-07 Task 2: private feed content never reaches a log or an error ──
+
+/// Every title, text, author and comment body of the two user-feed fixtures,
+/// read from the fixture JSON itself so the test cannot drift from the data.
+fn private_sentinels() -> Vec<String> {
+    let mut sentinels = Vec::new();
+    for name in ["home_page", "saved_page"] {
+        for child in fixture_children(name) {
+            for key in ["title", "selftext", "author", "body"] {
+                if let Some(text) = child["data"][key].as_str() {
+                    if !text.is_empty() {
+                        sentinels.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    sentinels
+}
+
+/// The texts one poll result can put on a log line or a status field.
+fn visible_texts(result: &Result<PollOutcome, PollError>, texts: &mut Vec<String>) {
+    match result {
+        Ok(outcome) => texts.extend(outcome.warnings.iter().cloned()),
+        Err(error) => {
+            texts.push(format!("{error:?}"));
+            if let PollError::Config(text)
+            | PollError::Transient(text)
+            | PollError::Fatal(text) = error
+            {
+                texts.push(text.clone());
+            }
+        }
+    }
+}
+
+#[test]
+fn user_feed_logs_and_errors_carry_no_private_content() {
+    let sentinels = private_sentinels();
+    // Two fixtures: 4 + 5 children, each with a title or a body at least.
+    assert!(sentinels.len() >= 12, "{} sentinels", sentinels.len());
+    assert!(sentinels.iter().all(|text| text.len() >= 8));
+
+    let mut texts: Vec<String> = Vec::new();
+    for feed in [home_settings(), saved_settings()] {
+        let bodies = [fixture("home_page").body, fixture("saved_page").body];
+        for body in &bodies {
+            // Success: a skipped comment, a normal page.
+            let http = ScriptedHttp::new(vec![Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: body.clone(),
+            })]);
+            let result = run(&http, &feed, None);
+            assert!(result.is_ok());
+            visible_texts(&result, &mut texts);
+
+            // Failure statuses that carry the private body.
+            for status in [401u16, 403, 404, 429, 500, 503] {
+                let http = ScriptedHttp::new(vec![Ok(HttpResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: body.clone(),
+                })]);
+                let result = run(&http, &feed, None);
+                assert!(result.is_err());
+                visible_texts(&result, &mut texts);
+            }
+        }
+
+        // An empty page, an undecodable stored cursor, a body that is not a
+        // listing, and transport errors that quote the request url.
+        for response in [
+            Ok(listing_of(Vec::new())),
+            Ok(fixture("malformed")),
+            Ok(text_response(r#"{"message":"private titles are not here"}"#)),
+            Err(HttpError::Transport(format!(
+                "https://oauth.reddit.com/user/{SAVED_USER}/saved failed"
+            ))),
+            Err(HttpError::Denied(format!("denied for {SAVED_USER}"))),
+        ] {
+            let http = ScriptedHttp::new(vec![response]);
+            visible_texts(&run(&http, &feed, None), &mut texts);
+        }
+        let http = ScriptedHttp::new(vec![Ok(fixture("saved_page"))]);
+        let result = run(&http, &feed, Some(b"not json"));
+        visible_texts(&result, &mut texts);
+    }
+    assert!(texts.len() >= 40, "only {} texts were collected", texts.len());
+
+    for text in &texts {
+        for sentinel in &sentinels {
+            assert!(!text.contains(sentinel.as_str()), "private text leaked: {text}");
+        }
+        assert!(!text.contains(SAVED_USER), "the username leaked: {text}");
+        assert!(!text.contains(TOKEN), "the token leaked: {text}");
+    }
 }
 
 // ── Plan 07-07 Task 1: the logged-in feeds, home and saved (D-05, D-19) ──────
