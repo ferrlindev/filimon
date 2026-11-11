@@ -8,7 +8,9 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
 - `stub-source/`: a minimal plugin for the `source` world. `init` parses its
   `[settings]` TOML, logs a greeting and the secret alias names (never the
   values), and calls the imported `fetch` when `fetch_url` is set (an optional
-  `fetch_headers` table is sent with that request, for host tests). `poll`
+  `fetch_headers` table is sent with that request; it exists for host tests
+  only, to steer the test fetcher through a header such as `x-stub-mode`, and
+  is not meant for a registry). `poll`
   returns one hardcoded item and advances a one-byte cursor.
 - `stub-fetcher/`: a minimal plugin for the `fetcher` world. `fetch` logs the
   request URL and returns a canned `200` JSON response, unless the request
@@ -299,13 +301,14 @@ and try plugins without running it (see [Plugin CLI](#plugin-cli)).
   returned them. The key assumes a single-partition topic. A missing topic is
   reported with the `fluvio topic create` command.
 
-### Interim imports
+### Imports
 
-Until the fetcher and OAuth phases land, the `fetch` import returns
-`not-configured` for every request, and `poll` receives no access token (`none`).
-A source that needs HTTP or a token cannot get far yet. The guest `log` import
-is live: guest log lines become host log events with a `plugin` field, cleaned
-of control characters and clipped.
+- `fetch` is answered by the source's assigned fetcher (see
+  [Fetcher layer](#fetcher-layer)). It answers `not-configured` only for a
+  source that has no `fetcher` key.
+- `poll` receives no access token (`none`) until the OAuth phase lands.
+- The guest `log` import is live: guest log lines become host log events with a
+  `plugin` field, cleaned of control characters and clipped.
 
 ### Known limits
 
@@ -321,8 +324,23 @@ of control characters and clipped.
   spinning plugin itself stays stuck inside its poll and is never polled again.
 - No dedupe across polls (v2 HOST-07). A plugin that returns the same item twice
   produces it twice, and a replay after a crash can duplicate the last batch.
-- `timeout_secs` and `allowlist` are read from the registry but only enforced
-  when real fetch routing lands, not yet.
+- The allowlist is the operator's list of host names, not an address filter.
+  The host compares the name in the url and does not look at the address the
+  name resolves to, so DNS rebinding (or any private or loopback address behind
+  an allowlisted name) is not blocked. Allowlist only names you control or
+  trust.
+- A fetcher sees every header of the requests it serves, `authorization` and
+  `cookie` included, and can read the response. Register only fetchers you
+  trust. Its own sends are held to the calling source's allowlist, so it cannot
+  reach a host the source may not, but it can still pass what it sees to an
+  allowlisted host.
+- There is no per-source request rate limiter. A `429` reaches the plugin as an
+  ordinary response, with its status and headers (a `Retry-After` included),
+  and the plugin decides what to do with it.
+- The host trusts the certificate roots bundled with its HTTP client, not the
+  operating system's store. Behind a TLS-intercepting proxy whose CA is only in
+  the system store, every https request fails with a certificate error. The
+  host has no setting to add a root.
 - The last poll's status is kept in a separate file, `<alias>.status.json`,
   which only `fili plugins list` reads (see Cursor state). It describes the
   most recent cycle only; there is no history.
@@ -336,18 +354,116 @@ not run.
 # 1. No wasm, no cluster.
 cargo test -p filimon plugins::host
 
-# 2. Real components. Needs the three fixtures built with the build lines above.
+# 2. Real components. Needs the four fixtures built with the build lines above.
 cargo test -p filimon -- --ignored wasm_
 
 # 3. Real cluster. Needs a local Fluvio cluster; uses scratch topics only.
 cargo test -p filimon -- --ignored live_
+
+# 4. TLS. Needs the `openssl` binary (it makes throwaway certificates).
+cargo test -p filimon -- --ignored tls_
+
+# 5. Public internet. Needs outbound access to the network.
+cargo test -p filimon -- --ignored net_
 ```
 
 The live group creates its own `filimon-test-...` topics and deletes them, also
 when a test fails. It never touches `filimon-social-items` or the other real
-topics. Group 3 also needs the `stub-source` fixture. Each group filter is a
-single substring on purpose: libtest ORs several filters, so adding a path
-filter beside `wasm_` or `live_` would run the other group as well.
+topics. Group 3 also needs the `stub-source` fixture. Group 4 needs the
+`http_fetcher.wasm` fixture for one test and a local certificate authority made
+with `openssl`; a machine without the binary fails the group, so report it as
+not run rather than passed. Group 5 reaches real sites, so it is off by default and depends on
+the network and on those sites staying up. Each group filter is a single
+substring on purpose: libtest ORs several filters, so adding a path filter
+beside `wasm_`, `live_`, `tls_` or `net_` would run another group as well.
+
+## Fetcher layer
+
+A source never opens a connection itself. Its `fetch` import goes to the
+fetcher the registry assigns to it, and the fetcher goes out through the
+host's `outbound-http.send` import. The host judges both calls, so the rules
+below hold whichever fetcher is in charge.
+
+### Assigning a fetcher
+
+- Define a fetcher under `[fetchers.<name>]` in the registry and point a source
+  at it with `fetcher = "<name>"` under `[sources.<name>]`. See
+  [`examples/plugins/filimon.toml`](../examples/plugins/filimon.toml).
+- There is no implicit default. [`http-fetcher/`](http-fetcher) is the default
+  fetcher in the sense that the sample registry uses it as `[fetchers.http]`:
+  it forwards every request to `outbound-http.send` and adds nothing. A source
+  with no `fetcher` key gets `not-configured` for every `fetch` call.
+- Changing the key changes who serves that source's requests. Nothing is
+  rebuilt: restart `fili` and the next call goes to the new component.
+- A source whose assigned fetcher cannot be loaded (the component is missing,
+  invalid, or does not fit the `fetcher` world) is not loaded at all. The host
+  report and `fili plugins run-once` name both the source and the fetcher,
+  with the fetcher's own failure as the reason. A registry that names an
+  undefined or disabled fetcher is rejected when the registry is read.
+- Every call runs in a fresh fetcher instance, which is dropped when the call
+  ends. A fetcher has no state between calls, and one component may serve
+  several sources, so no instance is ever re-used and nothing a fetcher stores
+  in memory can reach another call or another source.
+
+### What the host enforces
+
+The same checks run when a source calls `fetch` and again when the fetcher
+calls `send`, with the calling source's allowlist and deadline in both cases.
+
+| Rule | Value |
+|------|-------|
+| Allowlist | The url's host must equal an entry of the source's `[host] allowlist`. Matching is exact and case-insensitive, one trailing dot is ignored, any port matches, and there are no wildcards or subdomain matching. An entry that is not a bare host name never matches (a `[host]` entry like that is a registry error). |
+| Schemes | `http` and `https` only. Anything else is `invalid-request`. |
+| Deadline | One per call, from `[host] timeout_secs` (default 30). It covers fetcher start-up, every redirect hop and the response body read. The fetcher is dropped when it passes. |
+| Redirects | At most five redirects (`MAX_REDIRECTS`). The host follows them itself, checks the allowlist on every hop before it connects, and removes `authorization`, `cookie` and `proxy-authorization` when a hop changes origin. A `303`, and a `301` or `302` after a `POST`, becomes a `GET` without body or `content-type`. A sixth redirect is a `transport` error. |
+| Request headers | At most 100 headers and 64 KiB of header text (names plus values). `host`, `content-length`, `transfer-encoding`, `connection`, `proxy-connection`, `upgrade`, `te` and `trailer` are refused. |
+| Request size | A url of at most 8 KiB and a body of at most 1 MiB. |
+| Methods | The standard methods and `other(...)` for a valid method token. `CONNECT` and `TRACE` are refused in any letter case. |
+| Response size | At most 8 MiB (`MAX_RESPONSE_BYTES`). A larger declared length, or a body that passes the cap while it is read, is a `transport` error. |
+| Rate limiting | None. A `429` is returned as an ordinary response. |
+| Certificates | Validated, with the roots bundled with the HTTP client. The operating system's store is not read, so a TLS-intercepting proxy CA is not trusted and its connections fail as `transport` errors. |
+| Logs | Host log lines name the consumer, method, host, status and body length only: never a path, a query, a header or a body. A denial names the host and the consumer, never the rest of the url. |
+
+Errors a plugin can see:
+
+- `invalid-request`: the url is empty, unparsable, too long, has no host or has
+  a scheme other than `http`/`https`; a header is malformed, forbidden, too
+  many or too large; the body is too large; the method is not allowed.
+- `denied`: the host of the url, or of a redirect target, is not in the
+  allowlist. No connection is made.
+- `timeout`: the call's single deadline passed.
+- `transport`: a connection, DNS or certificate failure, a response over the
+  cap, too many redirects, a redirect without a usable `Location`, or a
+  fetcher that could not start or trapped.
+- `not-configured`: the source has no fetcher.
+
+Header order between different names is not specified. Repeated headers with
+the same name keep their order.
+
+### The crawler
+
+`fili produce` can fetch its pages through a fetcher component. Add a
+`[crawler]` table to the registry:
+
+```toml
+[crawler]
+fetcher = "http"        # a [fetchers.<name>] entry that is enabled
+timeout_secs = 15       # optional, default 15, one deadline per page
+allowlist = []          # optional, hosts allowed besides the seed urls' hosts
+```
+
+- The crawler is a consumer of its own, labelled `crawler`. It may reach the
+  hosts of the seed urls given to `fili produce` and the extra `allowlist`
+  hosts, under the same rules as a source (the table above).
+- A page link that redirects to another host is denied, naming the host, and
+  that page is reported and skipped like any other failed page.
+- The built-in HTTP client is used only when there is no registry file or the
+  registry has no `[crawler]` table. `fili produce` prints which one it uses.
+- A `[crawler]` table that cannot be used is an error, never a silent fall
+  back: an undefined or disabled `fetcher`, or a fetcher component that
+  cannot be loaded, stops `fili produce` before it crawls.
+- The built-in client keeps its existing behaviour, including its own
+  certificate handling. Only the fetcher path validates certificates.
 
 ## Plugin CLI
 
@@ -389,7 +505,8 @@ nothing, saves nothing and does not create the state directory. `--produce`
 takes the state-directory lock, polls, sends the batch to `filimon-social-items`
 and only then saves the cursor, so the next `run-once` or `fili run` continues
 from there. `--json` prints one `SourceItem` per line on stdout and moves every
-note to stderr. A fetcher, a disabled source or an unknown name is refused
+note to stderr. The source's fetches go through its assigned fetcher, with its allowlist
+and timeout, exactly as under `fili run`. A fetcher, a disabled source or an unknown name is refused
 before any component is loaded.
 
 ### `fili run`
