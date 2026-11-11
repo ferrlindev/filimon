@@ -1,0 +1,6 @@
+{
+  "kind": "youtube#playlistItemListResponse",
+  "etag": "syntheticEtagEmpty0001",
+  "items": [],
+  "pageInfo": { "totalResults": 0, "resultsPerPage": 10 }
+}

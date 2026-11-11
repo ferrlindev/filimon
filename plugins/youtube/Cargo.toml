@@ -1,0 +1,30 @@
+[package]
+name = "youtube-source"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "filimon YouTube source plugin: polls channel uploads playlists through the official YouTube Data API and returns items."
+authors = ["filimon"]
+
+[lib]
+# `rlib` lets `tests/` link the plain-Rust core; `cdylib` is what cargo-component turns into the component.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+percent-encoding = "2"
+# RFC 3339 parsing only; `std::time` has no clock on wasm32-unknown-unknown.
+time = { version = "0.3", default-features = false, features = ["parsing"] }
+
+[package.metadata.component]
+package = "filimon:youtube-source"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "source"
+
+# Own workspace, so the root filimon workspace does not capture this crate.
+[workspace]

@@ -1,0 +1,80 @@
+{
+  "kind": "youtube#playlistItemListResponse",
+  "etag": "syntheticEtagHoles0001",
+  "items": [
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagHole0001",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZERlbDAwMDAx",
+      "snippet": {
+        "publishedAt": "2024-04-05T00:00:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Deleted video",
+        "description": "This video is unavailable.",
+        "channelTitle": "Synthetic Channel",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 0,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidDel00001" }
+      },
+      "contentDetails": {
+        "videoId": "vidDel00001"
+      }
+    },
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagHole0002",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZFByaXYwMDAx",
+      "snippet": {
+        "publishedAt": "2024-04-03T00:00:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Private video",
+        "description": "This video is private.",
+        "channelTitle": "Synthetic Channel",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 1,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidPriv0001" }
+      },
+      "contentDetails": {
+        "videoId": "vidPriv0001"
+      }
+    },
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagHole0003",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3Lm5vVmlkZW8",
+      "snippet": {
+        "publishedAt": "2024-04-02T00:00:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Entry without a video id",
+        "description": "",
+        "channelTitle": "Synthetic Channel",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 2,
+        "resourceId": { "kind": "youtube#video" }
+      },
+      "contentDetails": {}
+    },
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagItem0010",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZE9rMDAwMDE",
+      "snippet": {
+        "publishedAt": "2024-04-01T00:00:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "An ordinary upload",
+        "description": "Still here.",
+        "channelTitle": "Synthetic Channel",
+        "videoOwnerChannelTitle": "Synthetic Channel",
+        "videoOwnerChannelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 3,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidOk000001" }
+      },
+      "contentDetails": {
+        "videoId": "vidOk000001",
+        "videoPublishedAt": "2024-04-01T00:00:00Z"
+      }
+    }
+  ],
+  "pageInfo": { "totalResults": 4, "resultsPerPage": 10 }
+}
