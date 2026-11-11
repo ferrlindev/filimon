@@ -7,9 +7,12 @@
 // the old login or the new one and never half of either (D-01).
 //
 // `read` takes no lock and creates nothing, so it works while `fili run` holds
-// the state directory lock and on a directory that does not exist yet. A file
-// that cannot be used is an error naming the plugin and the path; it is never
-// treated as "logged out" and never repaired, rewritten or deleted (D-02).
+// the state directory lock and on a directory that does not exist yet. It
+// refuses anything but a small regular file with no group or other permission
+// bit. A file that cannot be used is an error naming the plugin and the path;
+// it is never treated as "logged out" and never repaired, chmod'd, rewritten or
+// deleted (D-02). The directory is created 0700 and files 0600 from the first
+// byte (D-01).
 //
 // Token values live in redacting newtypes: `Debug` prints `***` and there is no
 // `Display`, so a token cannot reach a log line by formatting (D-06).
@@ -32,7 +35,11 @@ pub const AUTH_DIR_NAME: &str = "auth";
 pub const TOKEN_FILE_VERSION: u32 = 1;
 
 /// Largest token file `read` looks at, in bytes.
-const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+pub const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+
+/// Any group or other permission bit makes a token file too loose.
+#[cfg(unix)]
+const LOOSE_MODE_BITS: u32 = 0o077;
 
 /// Longest io error text kept in a diagnostic, in characters.
 const IO_TEXT_CLIP: usize = 160;
@@ -143,25 +150,35 @@ impl TokenStore {
         }
     }
 
-    /// The token file's path, after the alias passed the name rule, so no path
-    /// is ever built from an unchecked alias.
-    fn file_path(&self) -> Result<PathBuf, AuthError> {
+    /// The path of this alias's file with `extension`, after the alias passed
+    /// the name rule, so no path is ever built from an unchecked alias.
+    fn path_with(&self, extension: &str) -> Result<PathBuf, AuthError> {
         if !is_valid_name(&self.alias) {
             return Err(AuthError::InvalidName {
                 name: self.alias.clone(),
             });
         }
-        Ok(self.dir.join(format!("{}.json", self.alias)))
+        Ok(self.dir.join(format!("{}.{extension}", self.alias)))
+    }
+
+    /// The token file's path.
+    fn file_path(&self) -> Result<PathBuf, AuthError> {
+        self.path_with("json")
     }
 
     /// Reads the stored login without taking any lock and without creating
     /// anything. `Ok(None)` means there is no login: no file, or no directory.
     ///
+    /// The checks run in a fixed order and each refusal has a fixed reason that
+    /// never echoes file content: not a regular file (a symlink or a
+    /// directory), permissions with a group or other bit (Unix), too large, not
+    /// valid JSON, an unknown `version`, or a file that belongs to another
+    /// plugin.
+    ///
     /// # Errors
-    /// `InvalidName` for an alias that fails the name rule; `TokenFile` for an
-    /// io failure other than a missing file, a file that is not a valid token
-    /// file, a `version` this host does not know, or a file that belongs to
-    /// another plugin. The file is left as it was found.
+    /// `InvalidName` for an alias that fails the name rule; `TokenFile` for any
+    /// refusal above or an io failure other than a missing file. The file is
+    /// left exactly as it was found: never chmod'd, rewritten or deleted.
     pub fn read(&self) -> Result<Option<StoredTokens>, AuthError> {
         let path = self.file_path()?;
         let bad = |reason: String| AuthError::TokenFile {
@@ -176,11 +193,31 @@ impl TokenStore {
             ))
         };
 
-        let file = match File::open(&path) {
-            Ok(file) => file,
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_problem(&e)),
         };
+        if !meta.file_type().is_file() {
+            return Err(bad("is not a regular file".to_string()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            if mode & LOOSE_MODE_BITS != 0 {
+                return Err(bad(format!(
+                    "has permissions {:03o}, looser than 600; fix it with chmod 600",
+                    mode & 0o777
+                )));
+            }
+        }
+        if meta.len() > MAX_TOKEN_FILE_BYTES {
+            return Err(bad(format!("is larger than {MAX_TOKEN_FILE_BYTES} bytes")));
+        }
+
+        let file = File::open(&path).map_err(|e| io_problem(&e))?;
+        // The file can grow between the check above and this read.
         let mut bytes = Vec::new();
         file.take(MAX_TOKEN_FILE_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -211,8 +248,26 @@ impl TokenStore {
         }))
     }
 
-    /// Atomically stores `tokens`, creating the `auth` directory when needed:
-    /// a same-directory temporary file, synced, then renamed over the target.
+    /// Creates the `auth` directory when it is missing: 0700 on Unix. The
+    /// permissions of a directory that already exists are never changed.
+    fn ensure_dir(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.dir)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&self.dir)
+        }
+    }
+
+    /// Atomically stores `tokens`, creating the `auth` directory (0700) when
+    /// needed: a same-directory temporary file that is 0600 before its first
+    /// byte, synced, then renamed over the target.
     ///
     /// # Errors
     /// `InvalidName` for an alias that fails the name rule; `TokenWrite` when
@@ -224,7 +279,7 @@ impl TokenStore {
             path: path.display().to_string(),
             reason: clean_guest_text(&reason, IO_TEXT_CLIP),
         };
-        std::fs::create_dir_all(&self.dir).map_err(|e| fail(e.to_string()))?;
+        self.ensure_dir().map_err(|e| fail(e.to_string()))?;
 
         let file = TokenFile {
             version: TOKEN_FILE_VERSION,
@@ -239,6 +294,15 @@ impl TokenStore {
         };
         let mut temp =
             tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| fail(e.to_string()))?;
+        // The tempfile crate already creates 0600; stating it here keeps the
+        // guarantee if that ever changes. No byte is written before this.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| fail(e.to_string()))?;
+        }
         serde_json::to_writer(&mut temp, &file).map_err(|e| fail(e.to_string()))?;
         temp.as_file().sync_all().map_err(|e| fail(e.to_string()))?;
         temp.persist(&path).map_err(|e| fail(e.error.to_string()))?;
@@ -256,6 +320,191 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Sets a file's mode on Unix; a no-op elsewhere.
+    fn set_mode(path: &Path, mode: u32) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("set permissions");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, mode);
+        }
+    }
+
+    /// The permission bits of a path.
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    /// Writes `<state>/auth/<alias>.json` with `content` and `mode`.
+    fn put_file(state: &Path, alias: &str, content: &[u8], mode: u32) -> PathBuf {
+        let auth = state.join("auth");
+        std::fs::create_dir_all(&auth).expect("auth dir");
+        let path = auth.join(format!("{alias}.json"));
+        std::fs::write(&path, content).expect("write the fixture");
+        set_mode(&path, mode);
+        path
+    }
+
+    /// A valid version-1 token file body for `plugin`.
+    fn valid_json(plugin: &str) -> String {
+        format!(
+            r#"{{"version":1,"plugin":"{plugin}","access_token":"AT-1","refresh_token":"RT-1","expires_at":2000000000,"obtained_at":1}}"#
+        )
+    }
+
+    /// The text of a refusal, asserting it is a `TokenFile` error and that
+    /// neither its display nor its debug form contains `must_not_contain`.
+    fn refusal(result: Result<Option<StoredTokens>, AuthError>, must_not_contain: &str) -> String {
+        let err = result.expect_err("a refusal");
+        assert!(matches!(err, AuthError::TokenFile { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(!text.contains(must_not_contain), "{text}");
+        assert!(!format!("{err:?}").contains(must_not_contain), "{err:?}");
+        text
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_creates_a_0600_file_in_a_0700_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(dir.path(), "stub");
+        store.write(&tokens("AT-1", 2_000_000_000)).expect("write");
+        assert_eq!(mode_of(&dir.path().join("auth")), 0o700);
+        assert_eq!(mode_of(&dir.path().join("auth").join("stub.json")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_looser_than_0600_is_refused_naming_plugin_and_path_and_left_alone() {
+        for mode in [0o644, 0o640, 0o604, 0o660] {
+            let dir = TempDir::new().expect("tempdir");
+            let body = valid_json("stub");
+            let path = put_file(dir.path(), "stub", body.as_bytes(), mode);
+            let store = TokenStore::new(dir.path(), "stub");
+
+            let text = refusal(store.read(), "AT-1");
+            assert!(text.contains("`stub`"), "{mode:o}: {text}");
+            assert!(text.contains(&path.display().to_string()), "{mode:o}: {text}");
+            assert!(text.contains("permissions"), "{mode:o}: {text}");
+            assert!(text.contains(&format!("{mode:03o}")), "{mode:o}: {text}");
+            assert_eq!(std::fs::read(&path).expect("bytes"), body.as_bytes());
+            assert_eq!(mode_of(&path), mode, "never chmod'd");
+        }
+        for mode in [0o600, 0o400] {
+            let dir = TempDir::new().expect("tempdir");
+            put_file(dir.path(), "stub", valid_json("stub").as_bytes(), mode);
+            let store = TokenStore::new(dir.path(), "stub");
+            assert!(store.read().expect("read").is_some(), "{mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_token_file_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let real = put_file(dir.path(), "real", valid_json("stub").as_bytes(), 0o600);
+        let link = dir.path().join("auth").join("stub.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let store = TokenStore::new(dir.path(), "stub");
+
+        let text = refusal(store.read(), "AT-1");
+        assert!(text.contains("is not a regular file"), "{text}");
+        assert!(link.is_symlink(), "left alone");
+    }
+
+    #[test]
+    fn a_directory_in_place_of_the_file_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("auth").join("stub.json")).expect("dir");
+        let store = TokenStore::new(dir.path(), "stub");
+
+        let text = refusal(store.read(), "AT-1");
+        assert!(text.contains("is not a regular file"), "{text}");
+    }
+
+    #[test]
+    fn an_oversized_token_file_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let big = vec![b' '; usize::try_from(MAX_TOKEN_FILE_BYTES).expect("fits") + 1];
+        put_file(dir.path(), "stub", &big, 0o600);
+        let store = TokenStore::new(dir.path(), "stub");
+
+        let text = refusal(store.read(), "AT-1");
+        assert!(text.contains("65536"), "{text}");
+    }
+
+    #[test]
+    fn a_future_version_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let body = valid_json("stub").replace("\"version\":1", "\"version\":2");
+        put_file(dir.path(), "stub", body.as_bytes(), 0o600);
+        let store = TokenStore::new(dir.path(), "stub");
+
+        let text = refusal(store.read(), "AT-1");
+        assert!(text.contains("unsupported version"), "{text}");
+    }
+
+    #[test]
+    fn a_file_for_another_plugin_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        put_file(dir.path(), "mine", valid_json("other").as_bytes(), 0o600);
+        let store = TokenStore::new(dir.path(), "mine");
+
+        let text = refusal(store.read(), "AT-1");
+        assert!(text.contains("other"), "{text}");
+    }
+
+    #[test]
+    fn invalid_json_is_refused_without_echoing_content() {
+        let dir = TempDir::new().expect("tempdir");
+        put_file(dir.path(), "stub", b"SECRET-CONTENT-SENTINEL", 0o600);
+        let store = TokenStore::new(dir.path(), "stub");
+
+        let text = refusal(store.read(), "SECRET-CONTENT-SENTINEL");
+        assert!(text.contains("is not a valid token file"), "{text}");
+    }
+
+    #[test]
+    fn unknown_fields_are_tolerated() {
+        let dir = TempDir::new().expect("tempdir");
+        let body = valid_json("stub").replace("\"version\":1,", "\"version\":1,\"future_field\":1,");
+        put_file(dir.path(), "stub", body.as_bytes(), 0o600);
+        let store = TokenStore::new(dir.path(), "stub");
+
+        assert!(store.read().expect("read").is_some());
+    }
+
+    #[test]
+    fn read_never_creates_or_modifies_anything() {
+        let dir = TempDir::new().expect("tempdir");
+        let missing = dir.path().join("not-there");
+        assert_eq!(TokenStore::new(&missing, "stub").read().expect("read"), None);
+        assert!(!missing.exists(), "the state directory is still absent");
+
+        let path = put_file(dir.path(), "stub", valid_json("stub").as_bytes(), 0o600);
+        let before = (
+            std::fs::read(&path).expect("bytes"),
+            std::fs::metadata(&path).expect("metadata").modified().expect("mtime"),
+        );
+        let store = TokenStore::new(dir.path(), "stub");
+        assert!(store.read().expect("read").is_some());
+        let after = (
+            std::fs::read(&path).expect("bytes"),
+            std::fs::metadata(&path).expect("metadata").modified().expect("mtime"),
+        );
+        assert_eq!(before, after);
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("auth"))
+            .expect("auth dir")
+            .collect();
+        assert_eq!(names.len(), 1, "nothing was created beside the file");
+    }
 
     fn tokens(access: &str, expires_at: i64) -> StoredTokens {
         StoredTokens {
@@ -298,7 +547,10 @@ mod tests {
         let debug = format!("{access:?} {refresh:?} {:?}", tokens("AT-SECRET", 1));
         assert!(!debug.contains("AT-SECRET"), "{debug}");
         assert!(!debug.contains("RT-1"), "{debug}");
+        assert!(!debug.contains("RT-SECRET"), "{debug}");
         assert!(debug.contains("AccessToken(***)"), "{debug}");
+        assert!(debug.contains("RefreshToken(***)"), "{debug}");
+        assert!(debug.contains("***"), "{debug}");
     }
 
     #[test]
@@ -310,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_that_fails_the_name_rule_never_builds_a_path() {
+    fn an_invalid_alias_is_refused_before_any_path_is_built() {
         let dir = TempDir::new().expect("tempdir");
         for alias in ["", "../x", "a/b", "A", "a.b"] {
             let store = TokenStore::new(dir.path(), alias);
