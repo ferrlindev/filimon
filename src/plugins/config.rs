@@ -310,6 +310,10 @@ pub struct OAuthConfig {
     pub redirect_port: u16,
     /// Extra authorize parameters, in key order.
     pub authorize_params: Vec<(String, String)>,
+    /// The User-Agent for the host's token and revocation requests (both
+    /// grants); `None` keeps the host's default. The plugin's own requests are
+    /// unaffected.
+    pub user_agent: Option<String>,
 }
 
 /// Host-enforced values for one plugin.
@@ -1133,6 +1137,7 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
             .iter()
             .map(|(key, value)| (key.clone(), value.get_ref().clone()))
             .collect(),
+        user_agent: None,
     })
 }
 
@@ -2624,6 +2629,119 @@ fetcher = "nope"
             "{}",
             problems[0].1
         );
+    }
+
+    // ── [host.oauth] user_agent (research T4) ─────────────────────────────────
+
+    const REDDIT_USER_AGENT: &str = "filimon:reddit:0.1.0 (by /u/tester)";
+
+    #[test]
+    fn user_agent_loads_for_both_grants() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", ""));
+        assert_eq!(loaded_oauth(&dir).user_agent, None);
+
+        let line = format!("user_agent = \"{REDDIT_USER_AGENT}\"\n");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", &line));
+        assert_eq!(
+            loaded_oauth(&dir).user_agent.as_deref(),
+            Some(REDDIT_USER_AGENT)
+        );
+
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file(&format!("client_secret_env = \"STUB_CLIENT_SECRET\"\n{line}")),
+        );
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(|| SENTINEL.to_string());
+        let registry = load_with(&dir, &env).expect("a client_credentials table loads");
+        let oauth = plugin_of(&registry).oauth.as_ref().expect("oauth");
+        assert_eq!(oauth.user_agent.as_deref(), Some(REDDIT_USER_AGENT));
+    }
+
+    #[test]
+    fn user_agent_with_control_characters_is_rejected_naming_the_field() {
+        for value in ["bad\\nvalue", "bad\\rvalue", "bad\\tvalue", "bad\\u0000value"] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(
+                &dir,
+                &oauth_file("[\"read\"]", &format!("user_agent = \"{value}\"\n")),
+            );
+
+            let problems = invalid_problems(&dir);
+
+            assert_eq!(problems.len(), 1, "{value}: {problems:?}");
+            assert_eq!(problems[0].0, "host.oauth.user_agent");
+            assert!(
+                problems[0].1.contains("printable ASCII"),
+                "{}",
+                problems[0].1
+            );
+            assert!(!problems[0].1.contains("bad"), "{}", problems[0].1);
+        }
+    }
+
+    #[test]
+    fn user_agent_empty_or_over_200_characters_is_rejected() {
+        for value in [String::new(), "a".repeat(201)] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(
+                &dir,
+                &oauth_file("[\"read\"]", &format!("user_agent = \"{value}\"\n")),
+            );
+
+            let problems = invalid_problems(&dir);
+
+            assert_eq!(problems.len(), 1, "{} chars: {problems:?}", value.len());
+            assert_eq!(problems[0].0, "host.oauth.user_agent");
+            assert!(problems[0].1.contains("1 to 200"), "{}", problems[0].1);
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        let longest = "a".repeat(200);
+        alpha_with_plugin(
+            &dir,
+            &oauth_file("[\"read\"]", &format!("user_agent = \"{longest}\"\n")),
+        );
+        assert_eq!(
+            loaded_oauth(&dir).user_agent.as_deref(),
+            Some(longest.as_str())
+        );
+    }
+
+    #[test]
+    fn client_credentials_secret_is_a_client_secret_not_a_plugin_secret() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file(
+                "client_secret_env = \"STUB_CLIENT_SECRET\"\n\n\
+                 [host.secrets]\ntoken = \"STUB_TOKEN\"\n\n\
+                 [settings]\ngreeting = \"hi\"\n",
+            ),
+        );
+        let env = |key: &str| match key {
+            "STUB_CLIENT_SECRET" => Some(SENTINEL.to_string()),
+            "STUB_TOKEN" => Some("tok-1".to_string()),
+            _ => None,
+        };
+
+        let registry = load_with(&dir, &env).expect("both secrets resolve");
+
+        let plugin = plugin_of(&registry);
+        let keys: Vec<&str> = plugin.secrets.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["token"], "only the [host.secrets] alias reaches init");
+        assert!(plugin.secrets.values().all(|s| s.expose() != SENTINEL));
+        assert!(!plugin.settings_toml.contains(SENTINEL));
+        assert!(!plugin.settings_toml.contains("client-1"));
+        let oauth = plugin.oauth.as_ref().expect("oauth");
+        assert_eq!(oauth.grant, OAuthGrant::ClientCredentials);
+        assert_eq!(
+            oauth.client_secret.as_ref().map(Secret::expose),
+            Some(SENTINEL)
+        );
+        let debug = format!("{plugin:?}");
+        assert!(!debug.contains(SENTINEL), "{debug}");
+        assert!(debug.contains("Secret(***)"), "{debug}");
     }
 
     // ── [host.oauth] client secret (D-12) ─────────────────────────────────────

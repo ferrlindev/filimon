@@ -22,6 +22,7 @@ pub(crate) fn oauth_config() -> OAuthConfig {
         revocation_url: None,
         redirect_port: 0,
         authorize_params: vec![],
+        user_agent: None,
     }
 }
 
