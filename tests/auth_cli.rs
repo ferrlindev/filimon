@@ -7,6 +7,7 @@
 // cluster. Every sentinel token is checked for on both output streams.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -69,9 +70,11 @@ fn squash(text: &str) -> String {
 fn write_registry(dir: &Path, sources: &[(&str, &str)], fetcher: bool) -> PathBuf {
     let mut text = String::new();
     for (name, plugin_toml) in sources {
-        text.push_str(&format!(
+        write!(
+            text,
             "[sources.{name}]\ncomponent = \"{name}.wasm\"\nconfig = \"{name}.toml\"\n\n"
-        ));
+        )
+        .expect("write to a string");
         std::fs::write(dir.join(format!("{name}.toml")), plugin_toml).expect("write plugin toml");
     }
     if fetcher {
