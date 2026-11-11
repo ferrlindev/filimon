@@ -27,7 +27,7 @@ use super::client::{DEFAULT_EXPIRES_IN_SECS, TokenClient};
 use super::error::AuthError;
 use super::pkce::{build_authorize_url, generate_state, generate_verifier, s256_challenge};
 use super::store::{AccessToken, RefreshToken, StoredTokens, TokenStore};
-use crate::plugins::config::OAuthConfig;
+use crate::plugins::config::{OAuthConfig, OAuthGrant};
 
 /// How one login behaves.
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +78,9 @@ pub struct LoginSummary {
 ///
 /// # Errors
 ///
-/// `RedirectPortInUse` for a busy port (before anything is shown), the
+/// `GrantHasNoLogin` for a `client_credentials` plugin (before anything is
+/// bound or shown), `RedirectPortInUse` for a busy port (before anything is
+/// shown), the
 /// callback errors (`StateMismatch`, `CallbackDenied`, `CallbackInvalid`,
 /// `CallbackTimeout`), the token client's errors (`TokenRequest`,
 /// `TokenRejected`, `TokenResponse`) and the store's (`TokenWrite`). Any error
@@ -89,6 +91,12 @@ pub async fn login(
     options: &LoginOptions,
     hooks: &mut dyn LoginHooks,
 ) -> Result<LoginSummary, AuthError> {
+    // 0. An app-only plugin has no user to log in, so refuse before a port is
+    // bound or a URL is built (D-03).
+    if oauth.grant == OAuthGrant::ClientCredentials {
+        return Err(AuthError::GrantHasNoLogin);
+    }
+
     // 1. A busy port fails here, before anything is shown.
     let listener = CallbackListener::bind(oauth.redirect_port).await?;
     let redirect_uri = listener.redirect_uri();
@@ -98,9 +106,7 @@ pub async fn login(
     let challenge = s256_challenge(verifier.expose());
     let state = generate_state()?;
     let Some(url) = build_authorize_url(oauth, &redirect_uri, &state, &challenge) else {
-        return Err(AuthError::CallbackInvalid {
-            reason: "no authorize url".to_string(),
-        });
+        return Err(AuthError::GrantHasNoLogin);
     };
 
     // 3. Show the URL; open the browser only when asked.

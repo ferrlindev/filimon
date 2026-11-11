@@ -148,7 +148,11 @@ struct HostSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OAuthSection {
-    authorize_url: toml::Spanned<String>,
+    /// `authorization_code` (the default) or `client_credentials` (D-03).
+    grant: Option<toml::Spanned<String>>,
+    /// Required for the authorization-code grant, not allowed for
+    /// `client_credentials`.
+    authorize_url: Option<toml::Spanned<String>>,
     token_url: toml::Spanned<String>,
     #[serde(default)]
     scopes: Vec<toml::Spanned<String>>,
@@ -259,6 +263,11 @@ pub struct PluginConfig {
     pub oauth: Option<OAuthConfig>,
 }
 
+/// The `[host.oauth] grant` value for the interactive PKCE flow (the default).
+const GRANT_AUTHORIZATION_CODE: &str = "authorization_code";
+/// The `[host.oauth] grant` value for the app-only grant (D-03).
+const GRANT_CLIENT_CREDENTIALS: &str = "client_credentials";
+
 /// Which OAuth grant a plugin's `[host.oauth]` table uses (D-03).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthGrant {
@@ -266,6 +275,18 @@ pub enum OAuthGrant {
     AuthorizationCode,
     /// The app-only `client_credentials` grant: no user, no login.
     ClientCredentials,
+}
+
+impl OAuthSection {
+    /// The grant the table names, or `None` for a value that is neither
+    /// grant. An absent `grant` is the authorization-code grant.
+    fn resolved_grant(&self) -> Option<OAuthGrant> {
+        match self.grant.as_ref().map(|value| value.get_ref().as_str()) {
+            None | Some(GRANT_AUTHORIZATION_CODE) => Some(OAuthGrant::AuthorizationCode),
+            Some(GRANT_CLIENT_CREDENTIALS) => Some(OAuthGrant::ClientCredentials),
+            Some(_) => None,
+        }
+    }
 }
 
 /// A plugin's host-managed OAuth configuration (D-11). Every endpoint is an
@@ -1070,7 +1091,15 @@ fn read_plugin(
 /// `Some` only when the table satisfies every rule `oauth_problems` reports
 /// against; the client secret is resolved later, in pass 3.
 fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
-    let authorize_url = https_endpoint(section.authorize_url.get_ref())?;
+    let grant = section.resolved_grant()?;
+    let authorize_url = match (grant, &section.authorize_url) {
+        (OAuthGrant::AuthorizationCode, Some(value)) => Some(https_endpoint(value.get_ref())?),
+        (OAuthGrant::ClientCredentials, None) => None,
+        _ => return None,
+    };
+    if grant == OAuthGrant::ClientCredentials && !client_credentials_keys_unused(section) {
+        return None;
+    }
     let token_url = https_endpoint(section.token_url.get_ref())?;
     let revocation_url = match &section.revocation_url {
         Some(value) => Some(https_endpoint(value.get_ref())?),
@@ -1087,8 +1116,8 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
         return None;
     }
     Some(OAuthConfig {
-        grant: OAuthGrant::AuthorizationCode,
-        authorize_url: Some(authorize_url),
+        grant,
+        authorize_url,
         token_url,
         scopes: section
             .scopes
@@ -1123,8 +1152,9 @@ fn scope_is_invalid(scope: &str) -> bool {
 
 /// `[host.oauth]` checks. Every problem of the table is collected, in a fixed
 /// order: the three endpoints, `client_id`, `redirect_port`, scopes by index,
-/// `client_secret_env`, then `authorize_params` in key order. A message states
-/// the rule and never repeats the value it rejects.
+/// `client_secret_env`, then `authorize_params` in key order, then the checks
+/// that depend on the grant (`grant_problems`). An unknown `grant` is reported
+/// first. A message states the rule and never repeats the value it rejects.
 fn oauth_problems(
     plugin: &str,
     path: &str,
@@ -1140,8 +1170,17 @@ fn oauth_problems(
         span: Some(span),
     };
     let mut problems = Vec::new();
+    let grant = section.resolved_grant();
+    if let (None, Some(value)) = (grant, &section.grant) {
+        problems.push(invalid(
+            "host.oauth.grant".to_string(),
+            "must be `authorization_code` or `client_credentials`",
+            value.span().into(),
+        ));
+    }
+    let grant = grant.unwrap_or(OAuthGrant::AuthorizationCode);
     for (field, value) in [
-        ("host.oauth.authorize_url", Some(&section.authorize_url)),
+        ("host.oauth.authorize_url", section.authorize_url.as_ref()),
         ("host.oauth.token_url", Some(&section.token_url)),
         ("host.oauth.revocation_url", section.revocation_url.as_ref()),
     ] {
@@ -1204,6 +1243,90 @@ fn oauth_problems(
                 "is a standard authorize parameter that the host sets itself",
                 value.span().into(),
             ));
+        }
+    }
+    problems.extend(grant_problems(grant, section, &invalid));
+    problems
+}
+
+/// `true` when none of the keys that only the authorization-code flow uses is
+/// set on `section`: `authorize_url`, `redirect_port`, a non-empty
+/// `authorize_params`, `revocation_url` and a non-empty `scopes`.
+fn client_credentials_keys_unused(section: &OAuthSection) -> bool {
+    section.authorize_url.is_none()
+        && section.redirect_port.is_none()
+        && section.authorize_params.is_empty()
+        && section.revocation_url.is_none()
+        && section.scopes.is_empty()
+}
+
+/// The checks that depend on the grant, after every grant-independent one.
+///
+/// The authorization-code grant needs an `authorize_url`. The
+/// `client_credentials` grant needs a `client_secret_env` and refuses every key
+/// that belongs to the code flow, so a table never carries a setting that is
+/// silently ignored. A missing key has no span of its own, so it is labelled
+/// at `token_url`.
+fn grant_problems(
+    grant: OAuthGrant,
+    section: &OAuthSection,
+    invalid: &dyn Fn(String, &str, SourceSpan) -> ConfigError,
+) -> Vec<ConfigError> {
+    const UNUSED: &str = "is not used by the client_credentials grant";
+    let mut problems = Vec::new();
+    match grant {
+        OAuthGrant::AuthorizationCode => {
+            if section.authorize_url.is_none() {
+                problems.push(invalid(
+                    "host.oauth.authorize_url".to_string(),
+                    "is required for the authorization_code grant",
+                    section.token_url.span().into(),
+                ));
+            }
+        }
+        OAuthGrant::ClientCredentials => {
+            if section.client_secret_env.is_none() {
+                problems.push(invalid(
+                    "host.oauth.client_secret_env".to_string(),
+                    "is required for the client_credentials grant",
+                    section.token_url.span().into(),
+                ));
+            }
+            if let Some(value) = &section.authorize_url {
+                problems.push(invalid(
+                    "host.oauth.authorize_url".to_string(),
+                    UNUSED,
+                    value.span().into(),
+                ));
+            }
+            if let Some(port) = &section.redirect_port {
+                problems.push(invalid(
+                    "host.oauth.redirect_port".to_string(),
+                    UNUSED,
+                    port.span().into(),
+                ));
+            }
+            if let Some(value) = section.authorize_params.values().next() {
+                problems.push(invalid(
+                    "host.oauth.authorize_params".to_string(),
+                    UNUSED,
+                    value.span().into(),
+                ));
+            }
+            if let Some(value) = &section.revocation_url {
+                problems.push(invalid(
+                    "host.oauth.revocation_url".to_string(),
+                    UNUSED,
+                    value.span().into(),
+                ));
+            }
+            if let Some(scope) = section.scopes.first() {
+                problems.push(invalid(
+                    "host.oauth.scopes".to_string(),
+                    UNUSED,
+                    scope.span().into(),
+                ));
+            }
         }
     }
     problems
