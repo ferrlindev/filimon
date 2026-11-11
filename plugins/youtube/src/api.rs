@@ -188,6 +188,35 @@ pub fn parse_playlist_page(body: &[u8]) -> Result<ParsedPage, ParseError> {
     Ok(ParsedPage { entries, skipped })
 }
 
+/// One `subscriptions.list` page: the subscribed channel ids it carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionsPage {
+    pub channel_ids: Vec<String>,
+    pub next_page_token: Option<String>,
+    /// Entries without a usable channel id.
+    pub skipped: usize,
+}
+
+/// `GET {API_BASE}/subscriptions?part=snippet&mine=true&maxResults=<n>&order=relevance`
+/// (plus `&pageToken=`) with the user's access token (D-07).
+pub fn subscriptions_request(
+    page_token: Option<&str>,
+    max_results: u32,
+    token: &str,
+) -> HttpRequest {
+    let _ = (page_token, max_results, token);
+    HttpRequest {
+        url: String::new(),
+        headers: Vec::new(),
+    }
+}
+
+/// Parse a `subscriptions.list` page.
+pub fn parse_subscriptions_page(body: &[u8]) -> Result<SubscriptionsPage, ParseError> {
+    let _ = body;
+    Err(ParseError::Unreadable)
+}
+
 /// The D-15 quota text, verbatim. It is the same for `quotaExceeded` and
 /// `dailyLimitExceeded`, so the operator reads one phrase for "wait for the reset".
 pub const QUOTA_EXCEEDED_TEXT: &str =
@@ -218,7 +247,8 @@ pub fn error_reason(body: &[u8]) -> Option<String> {
 /// Pattern 4). `None` for 2xx. The texts are fixed phrases plus the status,
 /// the configured channel id and a safe reason; never a body, header,
 /// credential or url.
-pub fn classify_youtube(status: u16, body: &[u8], channel_id: &str) -> Option<PollError> {
+pub fn classify_youtube(status: u16, body: &[u8], channel_id: Option<&str>) -> Option<PollError> {
+    let channel_id = channel_id.unwrap_or_default();
     if (200..300).contains(&status) {
         return None;
     }
@@ -319,7 +349,7 @@ mod tests {
             assert_eq!(error_reason(&body_with_reason(&unsafe_reason)), None);
             // And it never reaches the resulting error text.
             let error =
-                classify_youtube(500, &body_with_reason(&unsafe_reason), CHANNEL).unwrap();
+                classify_youtube(500, &body_with_reason(&unsafe_reason), Some(CHANNEL)).unwrap();
             let PollError::Transient(text) = error else {
                 panic!("expected Transient");
             };
@@ -331,10 +361,111 @@ mod tests {
         assert!(error_reason(&body_with_reason(&"a".repeat(40))).is_some());
     }
 
+    // ── Plan 07-09: subscriptions ────────────────────────────────────────────
+
+    const SUBSCRIPTIONS_FIXTURE: &str = include_str!("../tests/fixtures/subscriptions_page.json");
+
+    #[test]
+    fn subscriptions_request_is_mine_true_relevance_with_bearer_and_page_token() {
+        let request = subscriptions_request(None, 50, "TOKEN-1");
+        assert_eq!(
+            request.url,
+            "https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=50&order=relevance"
+        );
+        let header = |name: &str| crate::http::header(&request.headers, name);
+        assert_eq!(header("authorization"), Some("Bearer TOKEN-1"));
+        assert_eq!(header("accept"), Some("application/json"));
+        assert_eq!(header("x-goog-api-key"), None);
+        assert!(!request.url.contains("TOKEN-1"));
+
+        let paged = subscriptions_request(Some("CAUQAA==/x y"), 7, "TOKEN-1");
+        assert_eq!(
+            paged.url,
+            "https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=7&order=relevance&pageToken=CAUQAA%3D%3D%2Fx%20y"
+        );
+    }
+
+    #[test]
+    fn subscriptions_page_parser_reads_channel_ids_and_next_page_token() {
+        let page = parse_subscriptions_page(SUBSCRIPTIONS_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(
+            page.channel_ids,
+            [
+                "UCSubscribedChannel00001",
+                "UCSubscribedChannel00002",
+                "UCSubscribedChannel00003"
+            ]
+        );
+        assert_eq!(page.next_page_token.as_deref(), Some("CAMQAA"));
+        assert_eq!(page.skipped, 0);
+
+        // An id that is not a 24-character UC id (or is missing) is skipped and counted.
+        let body = serde_json::json!({ "items": [
+            { "snippet": { "resourceId": { "channelId": "UCSubscribedChannel00001" } } },
+            { "snippet": { "resourceId": { "channelId": "UCshort" } } },
+            { "snippet": { "resourceId": { "channelId": "@handle" } } },
+            { "snippet": { "resourceId": { "channelId": "UCSubscribedChannel0000/&" } } },
+            { "snippet": { "resourceId": { "channelId": 7 } } },
+            { "snippet": { "resourceId": {} } },
+            { "snippet": {} },
+        ]});
+        let page = parse_subscriptions_page(body.to_string().as_bytes()).unwrap();
+        assert_eq!(page.channel_ids, ["UCSubscribedChannel00001"]);
+        assert_eq!(page.skipped, 6);
+        assert_eq!(page.next_page_token, None);
+
+        // An empty or oversized token is no token, so paging stops.
+        for token in [String::new(), "x".repeat(2000)] {
+            let body = serde_json::json!({ "items": [], "nextPageToken": token });
+            let page = parse_subscriptions_page(body.to_string().as_bytes()).unwrap();
+            assert_eq!(page.next_page_token, None);
+        }
+    }
+
+    #[test]
+    fn hostile_subscription_shapes_return_errors_or_skips_never_a_panic() {
+        let nested = format!("{}{}", "[".repeat(300), "]".repeat(300));
+        let nested_in_items = format!(r#"{{"items":{nested}}}"#);
+        let bodies = [
+            "null".to_string(),
+            "[]".to_string(),
+            r#"{"items":null}"#.to_string(),
+            r#"{"items":[null,1,"x",{"snippet":3}]}"#.to_string(),
+            nested,
+            nested_in_items,
+            String::new(),
+            "{}".to_string(),
+        ];
+        for body in bodies {
+            match parse_subscriptions_page(body.as_bytes()) {
+                Ok(page) => assert!(page.channel_ids.is_empty(), "{body}"),
+                Err(error) => assert_eq!(error, ParseError::Unreadable),
+            }
+        }
+        // A body without an items array is unreadable, never an empty page.
+        assert_eq!(parse_subscriptions_page(b"{}"), Err(ParseError::Unreadable));
+        assert_eq!(
+            parse_subscriptions_page(br#"{"items":null}"#),
+            Err(ParseError::Unreadable)
+        );
+    }
+
+    #[test]
+    fn a_404_without_a_channel_is_a_generic_transient_naming_nothing() {
+        assert_eq!(
+            classify_youtube(404, b"", None),
+            Some(PollError::Transient("YouTube HTTP 404".to_string()))
+        );
+        let Some(PollError::Config(text)) = classify_youtube(404, b"", Some(CHANNEL)) else {
+            panic!("a named channel keeps the config error");
+        };
+        assert!(text.contains(CHANNEL) && text.contains("channels"), "{text}");
+    }
+
     #[test]
     fn two_hundred_range_statuses_are_not_errors() {
-        assert_eq!(classify_youtube(200, b"", CHANNEL), None);
-        assert_eq!(classify_youtube(204, b"", CHANNEL), None);
-        assert!(classify_youtube(300, b"", CHANNEL).is_some());
+        assert_eq!(classify_youtube(200, b"", Some(CHANNEL)), None);
+        assert_eq!(classify_youtube(204, b"", Some(CHANNEL)), None);
+        assert!(classify_youtube(300, b"", Some(CHANNEL)).is_some());
     }
 }

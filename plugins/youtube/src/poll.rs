@@ -99,7 +99,7 @@ pub fn poll(
         // No retry or sleep: the host's backoff waits and the next poll starts
         // clean (a quota error carries no cursor, so nothing needs resetting).
         if let Some(error) =
-            api::classify_youtube(response.status, &response.body, &playlist.channel_id)
+            api::classify_youtube(response.status, &response.body, Some(&playlist.channel_id))
         {
             return Err(error);
         }

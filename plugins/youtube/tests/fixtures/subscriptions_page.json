@@ -1,0 +1,65 @@
+{
+  "kind": "youtube#subscriptionListResponse",
+  "etag": "SyntheticEtagSubscriptionsPage",
+  "nextPageToken": "CAMQAA",
+  "pageInfo": {
+    "totalResults": 7,
+    "resultsPerPage": 3
+  },
+  "items": [
+    {
+      "kind": "youtube#subscription",
+      "etag": "SyntheticEtagSubscription1",
+      "id": "SyntheticSubscriptionId00000001",
+      "snippet": {
+        "publishedAt": "2023-01-05T09:30:00Z",
+        "title": "Synthetic Subscription Title One",
+        "description": "Synthetic description of the first subscribed channel.",
+        "resourceId": {
+          "kind": "youtube#channel",
+          "channelId": "UCSubscribedChannel00001"
+        },
+        "channelId": "UCSyntheticSubscriber001",
+        "thumbnails": {
+          "default": { "url": "https://yt3.ggpht.com/synthetic-1" }
+        }
+      }
+    },
+    {
+      "kind": "youtube#subscription",
+      "etag": "SyntheticEtagSubscription2",
+      "id": "SyntheticSubscriptionId00000002",
+      "snippet": {
+        "publishedAt": "2023-02-11T18:00:00Z",
+        "title": "Synthetic Subscription Title Two",
+        "description": "Synthetic description of the second subscribed channel.",
+        "resourceId": {
+          "kind": "youtube#channel",
+          "channelId": "UCSubscribedChannel00002"
+        },
+        "channelId": "UCSyntheticSubscriber001",
+        "thumbnails": {
+          "default": { "url": "https://yt3.ggpht.com/synthetic-2" }
+        }
+      }
+    },
+    {
+      "kind": "youtube#subscription",
+      "etag": "SyntheticEtagSubscription3",
+      "id": "SyntheticSubscriptionId00000003",
+      "snippet": {
+        "publishedAt": "2023-03-20T07:15:00Z",
+        "title": "Synthetic Subscription Title Three",
+        "description": "Synthetic description of the third subscribed channel.",
+        "resourceId": {
+          "kind": "youtube#channel",
+          "channelId": "UCSubscribedChannel00003"
+        },
+        "channelId": "UCSyntheticSubscriber001",
+        "thumbnails": {
+          "default": { "url": "https://yt3.ggpht.com/synthetic-3" }
+        }
+      }
+    }
+  ]
+}
