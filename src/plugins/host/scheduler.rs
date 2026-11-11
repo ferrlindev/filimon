@@ -324,9 +324,7 @@ pub(crate) async fn auth_for_poll(spec: &PluginSpec) -> Result<PollAuth, CycleOu
             token: None,
             hint: Some(LoginHint::NeedsLogin),
         }),
-        TokenOutcome::RefreshDue => Err(CycleOutcome::TokenRefresh(
-            "access token is due for a refresh".to_string(),
-        )),
+        TokenOutcome::RefreshFailed(text) => Err(CycleOutcome::TokenRefresh(text)),
         TokenOutcome::FileProblem(error) => Err(CycleOutcome::TokenFile(error.to_string())),
     }
 }
@@ -2295,5 +2293,179 @@ mod sched_auth {
 
         assert_eq!(factory.poll_tokens(), vec![None, None]);
         assert!(!state_dir.join("auth").exists());
+    }
+
+    // ── Refresh before a poll (D-07, D-09) ────────────────────────────────────
+    //
+    // Real time: real sockets and a paused clock do not mix.
+
+    use crate::plugins::auth::provider::TokenProvider;
+    use crate::plugins::auth::store::RefreshToken;
+    use crate::plugins::auth::testing::{oauth_config_for, token_body};
+    use crate::plugins::host::testing::{Reply, TestHttpServer};
+
+    /// Stores a login expiring `offset` seconds from now (negative: already
+    /// expired), with a refresh token.
+    fn store_login(state_dir: &Path, alias: &str, offset: i64) {
+        TokenStore::new(state_dir, alias)
+            .write(&StoredTokens {
+                access_token: AccessToken::new("AT-OLD".to_string()),
+                refresh_token: Some(RefreshToken::new("RT-OLD".to_string())),
+                expires_at: unix_now() + offset,
+                token_type: None,
+                scope: None,
+                needs_login: false,
+                obtained_at: unix_now() - 3000,
+            })
+            .expect("write the login");
+    }
+
+    /// A spec polling `interval` seconds apart with a 1 s fixed backoff and a
+    /// provider whose token endpoint is `server`.
+    fn refreshing_spec(
+        alias: &str,
+        interval: u64,
+        state_dir: &Path,
+        server: &TestHttpServer,
+    ) -> PluginSpec {
+        let mut plugin = spec(alias, interval, 1, 1, 1.0);
+        plugin.auth = Some(Arc::new(TokenProvider::new(
+            alias,
+            oauth_config_for(&server.url("/token"), None),
+            state_dir,
+        )));
+        plugin
+    }
+
+    /// Waits up to five seconds for `done`.
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..250 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn a_due_token_is_refreshed_before_poll_and_the_new_token_reaches_poll() {
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        let server = TestHttpServer::start(|_| {
+            Reply::json(200, &token_body("AT-NEW", Some("RT-NEW"), Some(3600)))
+        })
+        .await;
+        store_login(&state_dir, "due", 30);
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_plugin(
+            refreshing_spec("due", 3600, &state_dir, &server),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            shutdown.clone(),
+        ));
+
+        wait_until("the first poll", || !factory.poll_tokens().is_empty()).await;
+        shutdown.cancel();
+        let report = handle.await.expect("plugin task");
+
+        assert_eq!(factory.poll_tokens(), vec![Some("AT-NEW".to_string())]);
+        let stored = TokenStore::new(&state_dir, "due")
+            .read()
+            .expect("read")
+            .expect("a login");
+        assert_eq!(stored.access_token.expose(), "AT-NEW");
+        assert_eq!(stored.refresh_token.expect("rotated").expose(), "RT-NEW");
+        assert_eq!(server.seen().len(), 1);
+        assert_eq!(report.disabled, None);
+    }
+
+    #[tokio::test]
+    async fn a_transient_refresh_failure_backs_off_without_polling() {
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        let script = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            Reply::status(503),
+            Reply::json(200, &token_body("AT-NEW", None, Some(3600))),
+        ])));
+        let server = TestHttpServer::start(move |_| {
+            script
+                .lock()
+                .expect("script")
+                .pop_front()
+                .unwrap_or_else(|| Reply::status(500))
+        })
+        .await;
+        store_login(&state_dir, "flaky", -10);
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_plugin(
+            refreshing_spec("flaky", 3600, &state_dir, &server),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            shutdown.clone(),
+        ));
+
+        let status = status_path(&state_dir, "flaky");
+        wait_until("the failed cycle to be recorded", || {
+            std::fs::read_to_string(&status).is_ok_and(|text| text.contains("token refresh failed"))
+        })
+        .await;
+        assert!(factory.poll_tokens().is_empty(), "no poll on a failed refresh");
+        assert_eq!(server.seen().len(), 1);
+
+        // After the one second backoff the second request succeeds.
+        wait_until("the poll after the backoff", || {
+            !factory.poll_tokens().is_empty()
+        })
+        .await;
+        shutdown.cancel();
+        let report = handle.await.expect("plugin task");
+
+        assert_eq!(factory.poll_tokens(), vec![Some("AT-NEW".to_string())]);
+        assert_eq!(report.disabled, None);
+        assert_eq!(report.failures, 1);
+        assert!(
+            !TokenStore::new(&state_dir, "flaky")
+                .read()
+                .expect("read")
+                .expect("a login")
+                .needs_login
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_refresh_failure_polls_with_none_and_marks_needs_login() {
+        let dir = TempDir::new().expect("tempdir");
+        let (state_dir, cursors) = state(&dir);
+        let server =
+            TestHttpServer::start(|_| Reply::json(400, r#"{"error":"invalid_grant"}"#)).await;
+        store_login(&state_dir, "revoked", -10);
+        let factory = Arc::new(FakeFactory::new(vec![FakeStep::InitOk]));
+        let shutdown = CancellationToken::new();
+        // A 1 s interval, so the second poll comes without a long wait.
+        let handle = tokio::spawn(run_plugin(
+            refreshing_spec("revoked", 1, &state_dir, &server),
+            Arc::clone(&factory),
+            Arc::new(VecSink::default()),
+            cursors,
+            shutdown.clone(),
+        ));
+
+        wait_until("two polls", || factory.poll_tokens().len() >= 2).await;
+        shutdown.cancel();
+        let report = handle.await.expect("plugin task");
+
+        assert!(factory.poll_tokens().iter().all(Option::is_none));
+        let stored = TokenStore::new(&state_dir, "revoked")
+            .read()
+            .expect("read")
+            .expect("the file is kept");
+        assert!(stored.needs_login);
+        assert_eq!(server.seen().len(), 1, "no request after the mark");
+        assert_eq!(report.disabled, None);
     }
 }

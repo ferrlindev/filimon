@@ -11,8 +11,20 @@
 //   no file                      -> NotLoggedIn   (poll with none, hint once)
 //   file flagged `needs_login`   -> NeedsLogin    (poll with none, hint once)
 //   at least 60 s of life left   -> Token         (D-07)
-//   under 60 s of life left      -> RefreshDue    (the refresh seam)
+//   under 60 s of life left      -> refresh first (below)
 //   file unusable                -> FileProblem   (disables only that plugin)
+//
+// The refresh is lazy: it happens here, just before a poll, and never on a
+// timer (D-07). It runs under an in-process gate and the per-alias file lock,
+// re-reads the file after taking the lock, and saves the new login before its
+// access token is returned (D-08):
+//
+//   refresh ok                   -> Token         (new login on disk first)
+//   save failed                  -> RefreshFailed (no token is handed out)
+//   invalid_grant                -> NeedsLogin    (file kept, flag set; D-09)
+//   transient / rejected         -> Token(old) while it is still valid,
+//                                   else RefreshFailed; nothing is marked
+//   no refresh token, expired    -> NeedsLogin
 //
 // Expiry is judged by an injectable wall-clock function. Tokio's paused time
 // does not move the wall clock, so a test that pauses time can neither make a
@@ -20,11 +32,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use super::client::{DEFAULT_EXPIRES_IN_SECS, RefreshFailure, TokenClient, TokenSet};
 use super::error::AuthError;
-use super::store::{AccessToken, TokenStore};
+use super::store::{AccessToken, AuthLock, RefreshToken, StoredTokens, TokenStore};
 use crate::plugins::config::OAuthConfig;
+use crate::plugins::host::engine::clean_guest_text;
+
+/// Longest error text kept in an outcome, in characters.
+const ERROR_TEXT_CLIP: usize = 240;
 
 /// A token with fewer seconds than this left is due for a refresh (D-07).
 pub const REFRESH_MARGIN_SECS: i64 = 60;
@@ -47,9 +64,8 @@ pub enum TokenOutcome {
     NotLoggedIn,
     /// The stored login was flagged as needing a new login: poll with none.
     NeedsLogin,
-    /// The token has less than `REFRESH_MARGIN_SECS` left. This is the refresh
-    /// seam: the refresh itself fills this branch in a later plan.
-    RefreshDue,
+    /// A transient problem (cleaned text): no token is available this poll.
+    RefreshFailed(String),
     /// The token file cannot be used.
     FileProblem(AuthError),
 }
@@ -60,6 +76,11 @@ pub struct TokenProvider {
     oauth: OAuthConfig,
     store: TokenStore,
     clock: Clock,
+    /// One refresh in flight per plugin inside this process (D-08); the
+    /// per-alias file lock covers other processes.
+    gate: tokio::sync::Mutex<()>,
+    /// Built on first use; a build failure is kept as cleaned text.
+    client: OnceLock<Result<TokenClient, String>>,
 }
 
 impl std::fmt::Debug for TokenProvider {
@@ -80,6 +101,8 @@ impl TokenProvider {
             oauth,
             store: TokenStore::new(state_dir, plugin),
             clock: system_clock(),
+            gate: tokio::sync::Mutex::new(()),
+            client: OnceLock::new(),
         }
     }
 
@@ -91,11 +114,8 @@ impl TokenProvider {
         self
     }
 
-    /// Re-reads the token file and decides what the next poll receives.
-    #[allow(
-        clippy::unused_async,
-        reason = "the refresh path of plan 06-06 awaits the token endpoint here"
-    )]
+    /// Re-reads the token file and decides what the next poll receives,
+    /// refreshing the token first when it is due.
     pub async fn access_token(&self) -> TokenOutcome {
         let tokens = match self.store.read() {
             Ok(Some(tokens)) => tokens,
@@ -105,13 +125,135 @@ impl TokenProvider {
         if tokens.needs_login {
             return TokenOutcome::NeedsLogin;
         }
-        let left = tokens.expires_at.saturating_sub((self.clock)());
-        if left >= REFRESH_MARGIN_SECS {
-            TokenOutcome::Token(tokens.access_token)
-        } else {
-            TokenOutcome::RefreshDue
+        let now = (self.clock)();
+        if tokens.expires_at.saturating_sub(now) >= REFRESH_MARGIN_SECS {
+            return TokenOutcome::Token(tokens.access_token);
+        }
+        self.renew(tokens, now).await
+    }
+
+    /// The token is under the margin. With no refresh token to use and some
+    /// life left it is used as it is; otherwise the refresh (or the marking)
+    /// runs under the in-process gate and the per-alias lock.
+    async fn renew(&self, stored: StoredTokens, now: i64) -> TokenOutcome {
+        if stored.refresh_token.is_none() && stored.expires_at > now {
+            return TokenOutcome::Token(stored.access_token);
+        }
+        // One refresh in flight per plugin, then one writer across processes.
+        let _gate = self.gate.lock().await;
+        let lock = match self.store.lock().await {
+            Ok(lock) => lock,
+            Err(error) => return TokenOutcome::RefreshFailed(cleaned(&error)),
+        };
+
+        // A refresh or login that landed while this call waited is used as it
+        // is: decide again from what is on disk now.
+        let current = match self.store.read() {
+            Ok(Some(tokens)) => tokens,
+            Ok(None) => return TokenOutcome::NotLoggedIn,
+            Err(error) => return TokenOutcome::FileProblem(error),
+        };
+        if current.needs_login {
+            return TokenOutcome::NeedsLogin;
+        }
+        let now = (self.clock)();
+        if current.expires_at.saturating_sub(now) >= REFRESH_MARGIN_SECS {
+            return TokenOutcome::Token(current.access_token);
+        }
+        let Some(refresh_token) = current.refresh_token.clone() else {
+            if current.expires_at > now {
+                return TokenOutcome::Token(current.access_token);
+            }
+            self.mark_needs_login(&lock);
+            return TokenOutcome::NeedsLogin;
+        };
+
+        let refreshed = match self.client() {
+            Ok(client) => client.refresh(&refresh_token).await,
+            Err(text) => Err(RefreshFailure::Transient(format!(
+                "http client unavailable: {text}"
+            ))),
+        };
+        match refreshed {
+            Ok(set) => self.persist(&current, set),
+            Err(RefreshFailure::Permanent(_)) => {
+                self.mark_needs_login(&lock);
+                tracing::warn!(
+                    plugin = %self.plugin,
+                    "the provider refused the stored login; run: fili auth login {}",
+                    self.plugin
+                );
+                TokenOutcome::NeedsLogin
+            }
+            Err(RefreshFailure::Transient(text) | RefreshFailure::Rejected(text)) => {
+                // D-09: nothing is marked and nothing is deleted.
+                if current.expires_at > (self.clock)() {
+                    tracing::warn!(
+                        plugin = %self.plugin,
+                        "token refresh failed, using the current token: {text}"
+                    );
+                    TokenOutcome::Token(current.access_token)
+                } else {
+                    TokenOutcome::RefreshFailed(text)
+                }
+            }
         }
     }
+
+    /// Builds the new login from a refresh answer and saves it before its
+    /// access token is handed to anyone (D-08). A save that fails hands out no
+    /// token: using a rotated token that was never persisted could lose the
+    /// only valid refresh token.
+    fn persist(&self, current: &StoredTokens, set: TokenSet) -> TokenOutcome {
+        let obtained_at = (self.clock)();
+        let lifetime = i64::try_from(set.expires_in.unwrap_or(DEFAULT_EXPIRES_IN_SECS))
+            .unwrap_or(i64::MAX);
+        let tokens = StoredTokens {
+            access_token: AccessToken::new(set.access_token),
+            // An answer without one keeps the stored refresh token.
+            refresh_token: set
+                .refresh_token
+                .map(RefreshToken::new)
+                .or_else(|| current.refresh_token.clone()),
+            expires_at: obtained_at.saturating_add(lifetime),
+            token_type: set.token_type.or_else(|| current.token_type.clone()),
+            scope: set.scope.or_else(|| current.scope.clone()),
+            needs_login: false,
+            obtained_at,
+        };
+        match self.store.write(&tokens) {
+            Ok(()) => TokenOutcome::Token(tokens.access_token),
+            Err(error) => TokenOutcome::RefreshFailed(format!(
+                "the refreshed login could not be saved: {}",
+                cleaned(&error)
+            )),
+        }
+    }
+
+    /// Flags the stored login as needing a new login. The file is kept (D-09).
+    /// A failure to flag is logged once; the poll still runs without a token.
+    fn mark_needs_login(&self, lock: &AuthLock) {
+        if let Err(error) = self.store.mark_needs_login(lock) {
+            tracing::warn!(
+                plugin = %self.plugin,
+                "could not mark the login as needing renewal: {}",
+                cleaned(&error)
+            );
+        }
+    }
+
+    /// The token endpoint client, built on first use.
+    fn client(&self) -> Result<&TokenClient, &str> {
+        self.client
+            .get_or_init(|| TokenClient::new(&self.oauth).map_err(|error| cleaned(&error)))
+            .as_ref()
+            .map_err(String::as_str)
+    }
+}
+
+/// An error's text with control characters removed and its length capped.
+fn cleaned(error: &AuthError) -> String {
+    clean_guest_text(&error.to_string(), ERROR_TEXT_CLIP)
 }
 
 #[cfg(test)]
@@ -150,17 +292,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_token_one_second_under_the_margin_is_refresh_due() {
-        // Clock 1_000; expires at 1_059: 59 seconds left.
-        let (_dir, provider) = provider(1_000, 1_000 + REFRESH_MARGIN_SECS - 1);
-
-        assert!(matches!(
-            provider.access_token().await,
-            TokenOutcome::RefreshDue
-        ));
-    }
-
-    #[tokio::test]
     async fn the_injected_clock_decides_expiry() {
         let dir = TempDir::new().expect("tempdir");
         write_tokens(dir.path(), "stub", "AT-1", 10_000);
@@ -169,11 +300,12 @@ mod tests {
         let early = TokenProvider::new("stub", oauth_config(), dir.path()).with_clock(fixed(1_000));
         assert!(matches!(early.access_token().await, TokenOutcome::Token(_)));
 
-        // Clock 9_990: 10 seconds left. Same file, no sleeping.
-        let late = TokenProvider::new("stub", oauth_config(), dir.path()).with_clock(fixed(9_990));
+        // Clock 10_010: expired, and the login holds no refresh token. Same
+        // file, no sleeping.
+        let late = TokenProvider::new("stub", oauth_config(), dir.path()).with_clock(fixed(10_010));
         assert!(matches!(
             late.access_token().await,
-            TokenOutcome::RefreshDue
+            TokenOutcome::NeedsLogin
         ));
     }
 
@@ -247,6 +379,443 @@ mod tests {
         match provider.access_token().await {
             TokenOutcome::Token(token) => assert_eq!(token.expose(), "AT-1"),
             other => panic!("expected a token, got {other:?}"),
+        }
+    }
+
+    // ── The refresh path (D-07, D-08, D-09) ───────────────────────────────────
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::Duration;
+
+    use crate::plugins::auth::store::RefreshToken;
+    use crate::plugins::auth::testing::{form_pairs, oauth_config_for, token_body};
+    use crate::plugins::host::testing::{Reply, TestHttpServer};
+
+    /// A fake token endpoint that answers from a script, a temporary state
+    /// directory and a clock the test owns.
+    struct Rig {
+        dir: TempDir,
+        server: TestHttpServer,
+        now: Arc<AtomicI64>,
+    }
+
+    impl Rig {
+        async fn new(replies: Vec<Reply>) -> Self {
+            let script = Arc::new(Mutex::new(VecDeque::from(replies)));
+            let server = TestHttpServer::start(move |_| {
+                script
+                    .lock()
+                    .expect("script")
+                    .pop_front()
+                    .unwrap_or_else(|| Reply::json(500, r#"{"error":"script exhausted"}"#))
+            })
+            .await;
+            Self {
+                dir: TempDir::new().expect("tempdir"),
+                server,
+                now: Arc::new(AtomicI64::new(1_000)),
+            }
+        }
+
+        fn store(&self) -> TokenStore {
+            TokenStore::new(self.dir.path(), "stub")
+        }
+
+        fn provider(&self) -> TokenProvider {
+            let now = Arc::clone(&self.now);
+            TokenProvider::new(
+                "stub",
+                oauth_config_for(&self.server.url("/token"), None),
+                self.dir.path(),
+            )
+            .with_clock(Arc::new(move || now.load(Ordering::SeqCst)))
+        }
+
+        /// Stores a login; `refresh` is its refresh token.
+        fn login(&self, access: &str, refresh: Option<&str>, expires_at: i64) {
+            self.store()
+                .write(&StoredTokens {
+                    access_token: AccessToken::new(access.to_string()),
+                    refresh_token: refresh.map(|r| RefreshToken::new(r.to_string())),
+                    expires_at,
+                    token_type: Some("Bearer".to_string()),
+                    scope: Some("read".to_string()),
+                    needs_login: false,
+                    obtained_at: 1,
+                })
+                .expect("write the login");
+        }
+
+        fn stored(&self) -> StoredTokens {
+            self.store().read().expect("read").expect("a login")
+        }
+
+        fn requests(&self) -> usize {
+            self.server.seen().len()
+        }
+
+        fn file_bytes(&self) -> Vec<u8> {
+            std::fs::read(self.dir.path().join("auth").join("stub.json")).expect("bytes")
+        }
+    }
+
+    fn good(access: &str, refresh: Option<&str>, expires_in: Option<u64>) -> Reply {
+        Reply::json(200, &token_body(access, refresh, expires_in))
+    }
+
+    /// The access token of a `Token` outcome; panics on any other outcome.
+    fn token_text(outcome: TokenOutcome) -> String {
+        match outcome {
+            TokenOutcome::Token(token) => token.expose().to_string(),
+            other => panic!("expected a token, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_with_60_seconds_left_is_not_refreshed() {
+        let rig = Rig::new(vec![good("AT-NEW", None, Some(3600))]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 1_000 + 60);
+
+        assert_eq!(token_text(rig.provider().access_token().await), "AT-OLD");
+        assert_eq!(rig.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_token_with_59_seconds_left_is_refreshed_and_persisted() {
+        let rig = Rig::new(vec![good("AT-NEW", None, Some(7200))]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 1_000 + 59);
+
+        assert_eq!(token_text(rig.provider().access_token().await), "AT-NEW");
+
+        let stored = rig.stored();
+        assert_eq!(stored.access_token.expose(), "AT-NEW");
+        assert_eq!(stored.expires_at, 8_200);
+        assert_eq!(
+            stored.refresh_token.expect("kept").expose(),
+            "RT-OLD",
+            "the old refresh token is kept"
+        );
+        assert!(!stored.needs_login);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(rig.dir.path().join("auth").join("stub.json"))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let seen = rig.server.seen();
+        assert_eq!(seen.len(), 1);
+        let form = form_pairs(&seen[0].body);
+        assert!(form.contains(&("grant_type".to_string(), "refresh_token".to_string())));
+        assert!(form.contains(&("refresh_token".to_string(), "RT-OLD".to_string())));
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_refreshed() {
+        let rig = Rig::new(vec![good("AT-NEW", None, Some(7200))]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+
+        assert_eq!(token_text(rig.provider().access_token().await), "AT-NEW");
+        assert_eq!(rig.stored().access_token.expose(), "AT-NEW");
+        assert_eq!(rig.stored().expires_at, 8_200);
+        assert_eq!(rig.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_omitted_refresh_token_keeps_the_stored_one() {
+        let rig = Rig::new(vec![good("AT-NEW", None, Some(3600))]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+
+        rig.provider().access_token().await;
+
+        assert_eq!(
+            rig.stored().refresh_token.expect("kept").expose(),
+            "RT-OLD"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotated_refresh_token_replaces_the_stored_one() {
+        let rig = Rig::new(vec![good("AT-NEW", Some("RT-NEW"), Some(3600))]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+
+        rig.provider().access_token().await;
+
+        assert_eq!(
+            rig.stored().refresh_token.expect("rotated").expose(),
+            "RT-NEW"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_lifetime_is_3600_when_expires_in_is_absent() {
+        let rig = Rig::new(vec![good("AT-NEW", None, None)]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+
+        rig.provider().access_token().await;
+
+        assert_eq!(rig.stored().expires_at, 1_000 + 3_600);
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_marks_needs_login_and_keeps_the_file() {
+        let rig = Rig::new(vec![Reply::json(400, r#"{"error":"invalid_grant"}"#)]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+        let before = rig.stored();
+        let provider = rig.provider();
+
+        assert!(matches!(
+            provider.access_token().await,
+            TokenOutcome::NeedsLogin
+        ));
+
+        let after = rig.stored();
+        assert!(after.needs_login);
+        assert_eq!(
+            after,
+            StoredTokens {
+                needs_login: true,
+                ..before
+            }
+        );
+        assert!(matches!(
+            provider.access_token().await,
+            TokenOutcome::NeedsLogin
+        ));
+        assert_eq!(rig.requests(), 1, "no further request after the mark");
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_with_a_valid_token_hands_the_old_token_and_does_not_mark_needs_login()
+     {
+        let rig = Rig::new(vec![Reply::status(503)]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 1_000 + 30);
+
+        assert_eq!(token_text(rig.provider().access_token().await), "AT-OLD");
+
+        assert!(!rig.stored().needs_login);
+        assert_eq!(rig.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_with_an_expired_token_is_refresh_failed_without_marking() {
+        let rig = Rig::new(vec![Reply::status(503)]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+        let before = rig.file_bytes();
+
+        match rig.provider().access_token().await {
+            TokenOutcome::RefreshFailed(text) => assert!(!text.is_empty()),
+            other => panic!("expected a refresh failure, got {other:?}"),
+        }
+
+        assert_eq!(rig.requests(), 1);
+        assert_eq!(rig.file_bytes(), before, "the file is byte-identical");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_failure_does_not_mark_needs_login() {
+        let rig = Rig::new(vec![Reply::json(401, r#"{"error":"invalid_client"}"#)]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+
+        match rig.provider().access_token().await {
+            TokenOutcome::RefreshFailed(text) => assert!(text.contains("invalid_client"), "{text}"),
+            other => panic!("expected a refresh failure, got {other:?}"),
+        }
+
+        assert!(!rig.stored().needs_login);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failure_to_save_the_refreshed_login_hands_out_no_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rig = Rig::new(vec![good("AT-NEW", Some("RT-NEW"), Some(3600))]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+        // Make the lock file exist first: only the write must fail.
+        drop(rig.store().lock().await.expect("lock"));
+        let auth_dir = rig.dir.path().join("auth");
+        std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod 500");
+        if std::fs::File::create(auth_dir.join("probe")).is_ok() {
+            // A process that ignores directory permissions (root) cannot
+            // provoke the failure.
+            std::fs::remove_file(auth_dir.join("probe")).expect("remove probe");
+            std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 700");
+            return;
+        }
+
+        let outcome = rig.provider().access_token().await;
+        std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 700");
+
+        match outcome {
+            TokenOutcome::RefreshFailed(text) => {
+                assert!(text.contains("could not be saved"), "{text}");
+                assert!(!text.contains("AT-NEW"), "{text}");
+                assert!(!text.contains("RT-NEW"), "{text}");
+            }
+            other => panic!("expected a refresh failure, got {other:?}"),
+        }
+        assert_eq!(rig.requests(), 1);
+        assert_eq!(
+            rig.stored().access_token.expose(),
+            "AT-OLD",
+            "the old login is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_without_a_refresh_token_marks_needs_login() {
+        let rig = Rig::new(vec![]).await;
+        rig.login("AT-OLD", None, 900);
+
+        assert!(matches!(
+            rig.provider().access_token().await,
+            TokenOutcome::NeedsLogin
+        ));
+
+        assert!(rig.stored().needs_login);
+        assert_eq!(rig.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_token_under_the_margin_without_a_refresh_token_is_still_used_while_valid() {
+        let rig = Rig::new(vec![]).await;
+        rig.login("AT-OLD", None, 1_000 + 30);
+        let before = rig.file_bytes();
+
+        assert_eq!(token_text(rig.provider().access_token().await), "AT-OLD");
+
+        assert_eq!(rig.requests(), 0);
+        assert_eq!(rig.file_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_login_flagged_needs_login_is_not_refreshed() {
+        let rig = Rig::new(vec![good("AT-NEW", None, Some(3600))]).await;
+        rig.store()
+            .write(&StoredTokens {
+                access_token: AccessToken::new("AT-OLD".to_string()),
+                refresh_token: Some(RefreshToken::new("RT-OLD".to_string())),
+                expires_at: 900,
+                token_type: None,
+                scope: None,
+                needs_login: true,
+                obtained_at: 1,
+            })
+            .expect("write");
+
+        assert!(matches!(
+            rig.provider().access_token().await,
+            TokenOutcome::NeedsLogin
+        ));
+        assert_eq!(rig.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_re_reads_after_taking_the_lock_and_skips_when_another_process_already_refreshed()
+     {
+        let rig = Rig::new(vec![good("AT-NEW", None, Some(3600))]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+        let held = rig.store().lock().await.expect("the test holds the lock");
+        let provider = Arc::new(rig.provider());
+        let task = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move { provider.access_token().await })
+        };
+
+        // The call decided the token is due and now waits for the lock.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!task.is_finished());
+        rig.login("AT-OTHER", Some("RT-OTHER"), 1_000 + 3_600);
+        drop(held);
+
+        let outcome = task.await.expect("task");
+        assert_eq!(token_text(outcome), "AT-OTHER");
+        assert_eq!(rig.requests(), 0, "someone else already refreshed");
+    }
+
+    #[tokio::test]
+    async fn a_login_during_a_refresh_is_not_overwritten() {
+        let rig = Rig::new(vec![
+            good("AT-NEW", Some("RT-NEW"), Some(3600)).delayed(Duration::from_millis(300)),
+        ])
+        .await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+        let provider = Arc::new(rig.provider());
+        let refresh = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move { provider.access_token().await })
+        };
+        // Wait until the endpoint has the request, then log in meanwhile.
+        for _ in 0..500 {
+            if rig.requests() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(rig.requests(), 1);
+        let store = rig.store();
+        let login = tokio::spawn(async move {
+            let _lock = store.lock().await.expect("login lock");
+            store
+                .write(&StoredTokens {
+                    access_token: AccessToken::new("AT-LOGIN".to_string()),
+                    refresh_token: Some(RefreshToken::new("RT-LOGIN".to_string())),
+                    expires_at: 1_000 + 3_600,
+                    token_type: None,
+                    scope: None,
+                    needs_login: false,
+                    obtained_at: 1_000,
+                })
+                .expect("login write");
+        });
+
+        assert_eq!(token_text(refresh.await.expect("refresh")), "AT-NEW");
+        login.await.expect("login");
+
+        let stored = rig.stored();
+        assert_eq!(stored.access_token.expose(), "AT-LOGIN");
+        assert_eq!(stored.refresh_token.expect("rt").expose(), "RT-LOGIN");
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_calls_make_one_refresh_request() {
+        let rig = Rig::new(vec![
+            good("AT-NEW", None, Some(3600)).delayed(Duration::from_millis(100)),
+        ])
+        .await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+        let provider = rig.provider();
+
+        let (first, second) = tokio::join!(provider.access_token(), provider.access_token());
+
+        assert_eq!(token_text(first), "AT-NEW");
+        assert_eq!(token_text(second), "AT-NEW");
+        assert_eq!(rig.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_text_never_contains_the_tokens() {
+        let rig = Rig::new(vec![Reply::json(503, "BODY-SENTINEL AT-NEW RT-OLD")]).await;
+        rig.login("AT-OLD", Some("RT-OLD"), 900);
+        let provider = rig.provider();
+
+        let outcome = provider.access_token().await;
+
+        let text = match outcome {
+            TokenOutcome::RefreshFailed(text) => text,
+            other => panic!("expected a refresh failure, got {other:?}"),
+        };
+        for hidden in ["AT-OLD", "RT-OLD", "AT-NEW", "BODY-SENTINEL"] {
+            assert!(!text.contains(hidden), "{text}");
+            assert!(!format!("{provider:?}").contains(hidden));
         }
     }
 }
