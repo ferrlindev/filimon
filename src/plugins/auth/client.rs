@@ -1,8 +1,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // plugins/auth/client.rs - The host's token endpoint client
 //
-// Three form POSTs on the async `reqwest::Client`: exchange an authorization
-// code (with its PKCE verifier), refresh an access token and revoke a token.
+// Four form POSTs on the async `reqwest::Client`: exchange an authorization
+// code (with its PKCE verifier), refresh an access token, request an app-only
+// token (`client_credentials`) and revoke a token.
 // It is the host's own client, outside the plugin fetch allowlist and its
 // egress policy, so a plugin's allowlist need not list login hosts.
 //
@@ -122,11 +123,17 @@ impl TokenClient {
     }
 
     fn build(oauth: &OAuthConfig, timeout: Duration) -> Result<Self, AuthError> {
+        // The operator's `[host.oauth] user_agent` (research T4), else the
+        // default. Token and revocation requests share this client.
+        let user_agent = oauth
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| concat!("fili/", env!("CARGO_PKG_VERSION")).to_string());
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("fili/", env!("CARGO_PKG_VERSION")))
+            .user_agent(user_agent.as_str())
             .build()
             .map_err(|error| AuthError::TokenRequest {
                 reason: describe_transport_error(error),
@@ -198,12 +205,32 @@ impl TokenClient {
         Err(classify_refresh_error(status, &body))
     }
 
-    /// Requests an app-only access token with the `client_credentials` grant.
+    /// Requests an app-only access token with the `client_credentials` grant
+    /// (D-03): the form is exactly `grant_type=client_credentials` and the
+    /// client authenticates with HTTP Basic, so no secret is in the body.
     ///
     /// # Errors
-    /// A [`RefreshFailure`] classifying why no token was obtained.
+    /// A [`RefreshFailure`] classifying why no token was obtained: a transport
+    /// failure, an oversized answer, a 5xx, 408 or 429 and an answer without
+    /// a usable token are `Transient`; a rejection (401, another 4xx, a
+    /// redirect, or a success status carrying an OAuth `error`) is `Rejected`.
     pub async fn client_credentials(&self) -> Result<TokenSet, RefreshFailure> {
-        Err(RefreshFailure::Transient("not implemented".to_string()))
+        let form = vec![("grant_type", "client_credentials")];
+        let (status, body) = match self.post_form(&self.oauth.token_url, form).await {
+            Ok(answer) => answer,
+            Err(SendFailure::Transport(text)) => return Err(RefreshFailure::Transient(text)),
+            Err(SendFailure::TooLarge) => return Err(RefreshFailure::Transient(too_large_text())),
+        };
+        if status.is_success() {
+            // Reddit has answered a bad app-token request with a 2xx status
+            // and an `error` body: a permanent misconfiguration must not look
+            // like a transient fault.
+            return parse_token_set(&body).map_err(|_| match parse_oauth_error(&body) {
+                Some(text) => RefreshFailure::Rejected(text),
+                None => RefreshFailure::Transient("answer has no usable access token".to_string()),
+            });
+        }
+        Err(classify_refresh_error(status, &body))
     }
 
     /// Revokes `token` at the provider's revocation endpoint. `Ok(false)` when
@@ -1138,7 +1165,12 @@ mod tests {
         config.revocation_url = Some(url::Url::parse(&server.url("/revoke")).expect("url"));
         config.user_agent = Some(REDDIT_USER_AGENT.to_string());
         let client = TokenClient::new(&config).expect("client");
-        assert!(client.revoke("AT-1", TokenKind::Access).await.expect("revoke"));
+        assert!(
+            client
+                .revoke("AT-1", TokenKind::Access)
+                .await
+                .expect("revoke")
+        );
         let seen = server.seen();
         assert_eq!(seen[0].target, "/revoke");
         assert_eq!(seen[0].header("user-agent"), Some(REDDIT_USER_AGENT));
