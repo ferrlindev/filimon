@@ -213,7 +213,7 @@ Plans:
   3. `fili plugins run-once youtube` returns new uploads from the channels in its TOML, read from their uploads playlists. After `fili auth login youtube`, it also returns new uploads from the user's subscriptions.
   4. YouTube polls use only low-cost Data API endpoints (no 100-unit search calls). A quota-exceeded response shows up as a clear, named error, not a silently empty poll.
   5. Each plugin's unit tests pass against recorded API fixtures with no network access and no API keys.
-**Plans:** 2/12 plans executed
+**Plans:** 5/12 plans executed
 
 Plans:
 **Wave 1**
@@ -221,9 +221,9 @@ Plans:
 - [x] 07-02-PLAN.md — Host config for `[host.oauth] grant = "client_credentials"` and the optional token-request `user_agent`, with the login-flow ripple (RDDT-01, RDDT-03)
 
 **Wave 2** *(blocked on Wave 1)*
-- [ ] 07-03-PLAN.md — Host token client request for the app grant and the in-memory single-flight token cache in the provider (RDDT-01, RDDT-03)
-- [ ] 07-04-PLAN.md — Reddit item mapping, `new` versus `hot` sticky rule, multi-feed `created_utc` marks, D-18 page fixtures (RDDT-01, TEST-01)
-- [ ] 07-05-PLAN.md — YouTube plugin crate: channel IDs to uploads playlists with an API key, per-playlist marks, placeholders, time edge cases (YTUB-01, TEST-01)
+- [x] 07-03-PLAN.md — Host token client request for the app grant and the in-memory single-flight token cache in the provider (RDDT-01, RDDT-03)
+- [x] 07-04-PLAN.md — Reddit item mapping, `new` versus `hot` sticky rule, multi-feed `created_utc` marks, D-18 page fixtures (RDDT-01, TEST-01)
+- [x] 07-05-PLAN.md — YouTube plugin crate: channel IDs to uploads playlists with an API key, per-playlist marks, placeholders, time edge cases (YTUB-01, TEST-01)
 
 **Wave 3** *(blocked on Wave 2)*
 - [ ] 07-06-PLAN.md — Reddit rate-limit headers, status classification, compliance sweep and fixture manifest (RDDT-03, TEST-01)
@@ -265,5 +265,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 4. Plugin CLI | 6/6 | Complete    | 2026-11-10 |
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
 | 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
-| 7. Reddit & YouTube Plugins | 2/12 | In Progress | - |
+| 7. Reddit & YouTube Plugins | 5/12 | In Progress | - |
 | 8. Integration, Live E2E & Authoring | 0/TBD | Not started | - |
