@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use youtube_source::cursor::{self, MAX_CURSOR_BYTES};
 use youtube_source::http::{Http, HttpError, HttpRequest, HttpResponse};
-use youtube_source::poll::{PollOutcome, poll};
+use youtube_source::poll::{PollError, PollOutcome, poll};
 use youtube_source::settings::Settings;
 
 /// A scripted `Http`: answers from a queue and records every request.
@@ -216,7 +216,7 @@ fn second_poll_with_the_same_page_emits_nothing() {
 fn a_missing_credential_is_auth_required_without_any_request() {
     let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page"))]);
     let result = poll(&http, &one_channel(), None, None, None);
-    assert_eq!(result.unwrap_err(), youtube_source::poll::PollError::AuthRequired);
+    assert_eq!(result.unwrap_err(), PollError::AuthRequired);
     assert!(http.requests().is_empty());
 }
 
@@ -230,4 +230,348 @@ fn youtube_poll_is_deterministic_for_the_same_inputs() {
     let b = run();
     assert_eq!(a.items, b.items);
     assert_eq!(a.next_cursor, b.next_cursor);
+}
+
+// ── Task 2: later polls, marks, placeholders, capacity ───────────────────────
+
+/// A status 200 response carrying `body`.
+fn json_page(body: &Value) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: serde_json::to_vec(body).expect("json"),
+    }
+}
+
+/// One schema-shaped playlist entry for the inline pages.
+fn entry(video_id: &str, title: &str, published_at: &str) -> Value {
+    serde_json::json!({
+        "snippet": {
+            "publishedAt": published_at,
+            "title": title,
+            "description": "d",
+            "channelTitle": "C",
+            "resourceId": { "videoId": video_id }
+        },
+        "contentDetails": { "videoId": video_id }
+    })
+}
+
+fn page(entries: Vec<Value>) -> HttpResponse {
+    json_page(&serde_json::json!({ "items": entries }))
+}
+
+fn channel_b() -> String {
+    format!("UC{}", "b".repeat(22))
+}
+
+fn playlist_b() -> String {
+    format!("UU{}", "b".repeat(22))
+}
+
+fn two_channels() -> Settings {
+    settings(&format!(
+        "channels = [\"{CHANNEL}\", \"{}\"]\n",
+        channel_b()
+    ))
+}
+
+fn later_poll(http: &ScriptedHttp, settings: &Settings, cursor: Option<&[u8]>) -> PollOutcome {
+    poll(http, settings, Some(KEY), cursor, None).expect("poll")
+}
+
+fn urls(http: &ScriptedHttp) -> Vec<String> {
+    http.requests().into_iter().map(|r| r.url).collect()
+}
+
+fn mark_of(outcome: &PollOutcome, playlist: &str) -> Option<(i64, String)> {
+    let (cursor, undecodable) = cursor::decode(outcome.next_cursor.as_deref());
+    assert!(!undecodable);
+    cursor.mark(playlist).cloned()
+}
+
+#[test]
+fn later_poll_emits_only_videos_strictly_newer_than_the_mark() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("playlist_page")),
+        Ok(fixture("playlist_newer")),
+    ]);
+    let first = first_poll(&http);
+    let second = later_poll(&http, &one_channel(), first.next_cursor.as_deref());
+    let ids: Vec<&str> = second.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["vidNew00004", "vidNew00005"]);
+    assert_eq!(
+        mark_of(&second, PLAYLIST),
+        Some((1_710_936_000_000, "vidNew00005".to_string()))
+    );
+    // A playlist with a mark takes the later page size: min(50, 1000 / 1).
+    assert_eq!(
+        urls(&http),
+        [
+            "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet%2CcontentDetails&playlistId=UU_x5XG1OV2P6uZZ5FSM9Ttw&maxResults=10",
+            "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet%2CcontentDetails&playlistId=UU_x5XG1OV2P6uZZ5FSM9Ttw&maxResults=50",
+        ]
+    );
+}
+
+#[test]
+fn a_video_published_at_the_mark_instant_with_a_different_id_is_not_re_emitted() {
+    let http = ScriptedHttp::new(vec![
+        Ok(page(vec![entry("vidA", "A", "2024-05-01T00:00:00Z")])),
+        Ok(page(vec![entry("vidB", "B", "2024-05-01T00:00:00Z")])),
+    ]);
+    let first = first_poll(&http);
+    assert_eq!(first.items.len(), 1);
+    let second = later_poll(&http, &one_channel(), first.next_cursor.as_deref());
+    assert!(second.items.is_empty());
+    assert_eq!(second.next_cursor, first.next_cursor);
+}
+
+#[test]
+fn the_mark_is_the_max_publication_time_not_the_first_item() {
+    let http = ScriptedHttp::new(vec![Ok(page(vec![
+        entry("vidA", "A", "2024-05-01T00:00:00Z"),
+        entry("vidB", "B", "2024-05-03T00:00:00Z"),
+        entry("vidC", "C", "2024-05-02T00:00:00Z"),
+    ]))]);
+    let outcome = first_poll(&http);
+    assert_eq!(
+        mark_of(&outcome, PLAYLIST),
+        Some((1_714_694_400_000, "vidB".to_string()))
+    );
+}
+
+#[test]
+fn private_and_deleted_placeholders_are_skipped_but_still_advance_the_mark() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_placeholders"))]);
+    let outcome = first_poll(&http);
+    let ids: Vec<&str> = outcome.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["vidOk000001"]);
+    // Three skipped entries are counted, in fixed text.
+    assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+    let warning = &outcome.warnings[0];
+    assert!(warning.contains('3'), "{warning}");
+    assert!(!warning.contains("Private") && !warning.contains("Deleted"));
+    // The mark is the newest entry's time, placeholders included.
+    let mark = mark_of(&outcome, PLAYLIST).expect("mark");
+    assert_eq!(mark.0, 1_712_275_200_000);
+}
+
+#[test]
+fn an_empty_playlist_page_yields_no_items_and_writes_no_mark() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_empty"))]);
+    let outcome = first_poll(&http);
+    assert!(outcome.items.is_empty());
+    assert_eq!(mark_of(&outcome, PLAYLIST), None);
+}
+
+#[test]
+fn a_json_body_without_an_items_array_is_an_unreadable_page_not_an_empty_one() {
+    for body in ["{}", r#"{"pageInfo":{}}"#] {
+        let http = ScriptedHttp::new(vec![Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        })]);
+        let error = poll(&http, &one_channel(), Some(KEY), None, None).unwrap_err();
+        let PollError::Transient(text) = error else {
+            panic!("expected Transient, got {error:?}");
+        };
+        assert!(text.contains("not a readable playlist page"), "{text}");
+        assert!(!text.contains("pageInfo"));
+    }
+}
+
+#[test]
+fn hostile_shapes_return_errors_or_skips_never_a_panic() {
+    let nested = format!("{}{}", "[".repeat(300), "]".repeat(300));
+    let nested_in_items = format!(r#"{{"items":{nested}}}"#);
+    let bodies = [
+        "null".to_string(),
+        "[]".to_string(),
+        r#"{"items":null}"#.to_string(),
+        r#"{"items":[null,1,"x",{"snippet":3}]}"#.to_string(),
+        nested,
+        nested_in_items,
+    ];
+    for body in bodies {
+        let http = ScriptedHttp::new(vec![Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.clone().into_bytes(),
+        })]);
+        match poll(&http, &one_channel(), Some(KEY), None, None) {
+            Ok(outcome) => assert!(outcome.items.is_empty(), "{body}"),
+            Err(PollError::Transient(_)) => {}
+            Err(other) => panic!("unexpected {other:?} for {body}"),
+        }
+    }
+}
+
+#[test]
+fn channels_have_independent_marks() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("playlist_page")),
+        Ok(page(vec![entry("vidB1", "B1", "2024-06-01T00:00:00Z")])),
+        Ok(fixture("playlist_page")),
+        Ok(page(vec![
+            entry("vidB2", "B2", "2024-06-02T00:00:00Z"),
+            entry("vidB1", "B1", "2024-06-01T00:00:00Z"),
+        ])),
+    ]);
+    let both = two_channels();
+    let first = later_poll(&http, &both, None);
+    let second = later_poll(&http, &both, first.next_cursor.as_deref());
+    let ids: Vec<&str> = second.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["vidB2"]);
+    assert_eq!(mark_of(&second, PLAYLIST), mark_of(&first, PLAYLIST));
+    assert_ne!(
+        mark_of(&second, &playlist_b()),
+        mark_of(&first, &playlist_b())
+    );
+    assert_eq!(
+        mark_of(&second, &playlist_b()),
+        Some((1_717_286_400_000, "vidB2".to_string()))
+    );
+    // Two channels: the later page size is min(50, 1000 / 2).
+    assert!(urls(&http)[2].ends_with("maxResults=50"));
+}
+
+#[test]
+fn duplicate_channels_collapse_keeping_order() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page")), Ok(fixture("playlist_empty"))]);
+    let repeated = settings(&format!(
+        "channels = [\"{CHANNEL}\", \"{}\", \"{CHANNEL}\"]\n",
+        channel_b()
+    ));
+    later_poll(&http, &repeated, None);
+    let requested = urls(&http);
+    assert_eq!(requested.len(), 2);
+    assert!(requested[0].contains(&format!("playlistId={PLAYLIST}")));
+    assert!(requested[1].contains(&format!("playlistId={}", playlist_b())));
+}
+
+#[test]
+fn output_is_oldest_first_with_ties_broken_by_video_id() {
+    let http = ScriptedHttp::new(vec![Ok(page(vec![
+        entry("vidC", "C", "2024-05-02T00:00:00Z"),
+        entry("vidB", "B", "2024-05-01T00:00:00Z"),
+        entry("vidA", "A", "2024-05-01T00:00:00Z"),
+    ]))]);
+    let outcome = first_poll(&http);
+    let ids: Vec<&str> = outcome.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["vidA", "vidB", "vidC"]);
+}
+
+#[test]
+fn an_all_empty_first_poll_still_returns_a_cursor_not_none() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_empty"))]);
+    let outcome = first_poll(&http);
+    let bytes = outcome.next_cursor.expect("a None cursor would reset the host's mark");
+    let (decoded, undecodable) = cursor::decode(Some(&bytes));
+    assert!(!undecodable);
+    assert!(decoded.0.is_empty());
+}
+
+#[test]
+fn marks_for_playlists_no_longer_configured_are_dropped() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page"))]);
+    let mut previous = cursor::Cursor::default();
+    previous.set(&playlist_b(), 1_717_286_400_000, "vidB2");
+    previous.set(PLAYLIST, 1_709_000_000_000, "vidOld");
+    let bytes = cursor::encode(&previous).unwrap();
+    let outcome = later_poll(&http, &one_channel(), Some(&bytes));
+    let (decoded, _) = cursor::decode(outcome.next_cursor.as_deref());
+    assert_eq!(decoded.mark(&playlist_b()), None);
+    assert!(decoded.mark(PLAYLIST).is_some());
+    assert_eq!(decoded.0.len(), 1);
+}
+
+#[test]
+fn an_undecodable_cursor_is_a_first_poll_with_a_warning() {
+    let http = ScriptedHttp::new(vec![Ok(fixture("playlist_page"))]);
+    let outcome = later_poll(&http, &one_channel(), Some(b"not json"));
+    assert_eq!(outcome.items.len(), 3);
+    assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+    assert!(outcome.warnings[0].contains("cursor"));
+    assert!(urls(&http)[0].ends_with("maxResults=10"));
+}
+
+#[test]
+fn a_failed_channel_fails_the_whole_poll_with_no_items_and_no_new_cursor() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("playlist_page")),
+        Err(HttpError::Timeout),
+    ]);
+    let result = poll(&http, &two_channels(), Some(KEY), None, None);
+    assert!(matches!(result, Err(PollError::Transient(_))), "{result:?}");
+}
+
+#[test]
+fn fetch_level_errors_map_to_the_poll_error_variants() {
+    let run = |error: HttpError| {
+        let http = ScriptedHttp::new(vec![Err(error)]);
+        poll(&http, &one_channel(), Some(KEY), None, None).unwrap_err()
+    };
+    assert!(matches!(
+        run(HttpError::Denied("secret-detail".to_string())),
+        PollError::Config(_)
+    ));
+    assert!(matches!(run(HttpError::NotConfigured), PollError::Config(_)));
+    assert!(matches!(run(HttpError::Timeout), PollError::Transient(_)));
+    assert!(matches!(
+        run(HttpError::Transport("secret-detail".to_string())),
+        PollError::Transient(_)
+    ));
+    assert_eq!(
+        run(HttpError::RateLimited(Some(30))),
+        PollError::RateLimited(Some(30))
+    );
+    assert!(matches!(
+        run(HttpError::InvalidRequest("secret-detail".to_string())),
+        PollError::Fatal(_)
+    ));
+    for error in [
+        run(HttpError::Denied("secret-detail".to_string())),
+        run(HttpError::Transport("secret-detail".to_string())),
+        run(HttpError::InvalidRequest("secret-detail".to_string())),
+    ] {
+        let (PollError::Config(text) | PollError::Transient(text) | PollError::Fatal(text)) = error
+        else {
+            unreachable!()
+        };
+        assert!(!text.contains("secret-detail"), "{text}");
+    }
+}
+
+#[test]
+fn a_video_listed_by_two_playlists_is_emitted_once() {
+    let shared = entry("vidShared", "S", "2024-05-01T00:00:00Z");
+    let http = ScriptedHttp::new(vec![
+        Ok(page(vec![shared.clone()])),
+        Ok(page(vec![shared])),
+    ]);
+    let outcome = later_poll(&http, &two_channels(), None);
+    assert_eq!(outcome.items.len(), 1);
+}
+
+#[test]
+fn only_the_official_api_host_and_playlist_items_are_ever_requested() {
+    let http = ScriptedHttp::new(vec![
+        Ok(fixture("playlist_page")),
+        Ok(fixture("playlist_page")),
+        Ok(fixture("playlist_newer")),
+    ]);
+    let first = first_poll(&http);
+    later_poll(&http, &one_channel(), first.next_cursor.as_deref());
+    for request in http.requests() {
+        assert!(
+            request
+                .url
+                .starts_with("https://www.googleapis.com/youtube/v3/playlistItems?"),
+            "{}",
+            request.url
+        );
+        assert!(!request.url.contains("/search") && !request.url.contains("/videos"));
+    }
 }

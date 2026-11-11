@@ -213,3 +213,20 @@ pub fn video_to_item(entry: &Entry) -> Option<Item> {
             .and_then(|snippet| serde_json::to_string(snippet).ok()),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_at_parsing_handles_fractions_offsets_and_garbage() {
+        assert_eq!(parse_rfc3339_ms("2024-01-01T00:00:00Z"), Some(1_704_067_200_000));
+        assert_eq!(parse_rfc3339_ms("2024-01-01T00:00:00.123Z"), Some(1_704_067_200_123));
+        assert_eq!(parse_rfc3339_ms("2024-01-01T02:00:00+02:00"), Some(1_704_067_200_000));
+        assert_eq!(parse_rfc3339_ms("not a date"), None);
+        assert_eq!(parse_rfc3339_ms(""), None);
+        // Outside 1970 to year 2286: skipped rather than breaking the cursor size.
+        assert_eq!(parse_rfc3339_ms("1969-12-31T23:59:59Z"), None);
+        assert_eq!(parse_rfc3339_ms("9999-12-31T23:59:59Z"), None);
+    }
+}

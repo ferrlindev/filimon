@@ -1,0 +1,124 @@
+{
+  "kind": "youtube#playlistItemListResponse",
+  "etag": "syntheticEtagPage0002",
+  "items": [
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagItem0005",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZE5ldzAwMDA1",
+      "snippet": {
+        "publishedAt": "2024-03-20T12:05:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Release day",
+        "description": "Version 1.0 is out.",
+        "thumbnails": {
+          "default": { "url": "https://i.ytimg.com/vi/vidNew00005/default.jpg", "width": 120, "height": 90 }
+        },
+        "channelTitle": "Synthetic Channel",
+        "videoOwnerChannelTitle": "Synthetic Channel",
+        "videoOwnerChannelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 0,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidNew00005" }
+      },
+      "contentDetails": {
+        "videoId": "vidNew00005",
+        "videoPublishedAt": "2024-03-20T12:00:00Z"
+      }
+    },
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagItem0004",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZE5ldzAwMDA0",
+      "snippet": {
+        "publishedAt": "2024-03-15T06:35:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Release candidate walkthrough",
+        "description": "What changed since the last build.",
+        "thumbnails": {
+          "default": { "url": "https://i.ytimg.com/vi/vidNew00004/default.jpg", "width": 120, "height": 90 }
+        },
+        "channelTitle": "Synthetic Channel",
+        "videoOwnerChannelTitle": "Synthetic Channel",
+        "videoOwnerChannelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 1,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidNew00004" }
+      },
+      "contentDetails": {
+        "videoId": "vidNew00004",
+        "videoPublishedAt": "2024-03-15T06:30:00Z"
+      }
+    },
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagItem0001",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZE5ldzAwMDAx",
+      "snippet": {
+        "publishedAt": "2024-03-12T10:00:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Building a plugin host in Rust",
+        "description": "A walk through sandboxing WebAssembly plugins.\nSecond line of the description.",
+        "thumbnails": {
+          "default": { "url": "https://i.ytimg.com/vi/vidNew00001/default.jpg", "width": 120, "height": 90 }
+        },
+        "channelTitle": "Synthetic Channel",
+        "videoOwnerChannelTitle": "Synthetic Channel Owner",
+        "videoOwnerChannelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 2,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidNew00001" }
+      },
+      "contentDetails": {
+        "videoId": "vidNew00001",
+        "videoPublishedAt": "2024-03-10T09:00:00Z"
+      }
+    },
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagItem0002",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZE1pZDAwMDAy",
+      "snippet": {
+        "publishedAt": "2024-03-05T08:30:15.250Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Cursor design notes",
+        "description": "Why a per-playlist mark beats a page token.",
+        "thumbnails": {
+          "default": { "url": "https://i.ytimg.com/vi/vidMid00002/default.jpg", "width": 120, "height": 90 }
+        },
+        "channelTitle": "Synthetic Channel",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 3,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidMid00002" }
+      },
+      "contentDetails": {
+        "videoId": "vidMid00002"
+      }
+    },
+    {
+      "kind": "youtube#playlistItem",
+      "etag": "syntheticEtagItem0003",
+      "id": "VVVfeDVYRzFPVjJQNnVaWjVGU005VHR3LnZpZE9sZDAwMDAz",
+      "snippet": {
+        "publishedAt": "2024-03-01T07:00:00Z",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "title": "Channel trailer",
+        "description": "",
+        "thumbnails": {
+          "default": { "url": "https://i.ytimg.com/vi/vidOld00003/default.jpg", "width": 120, "height": 90 }
+        },
+        "channelTitle": "Synthetic Channel",
+        "videoOwnerChannelTitle": "Synthetic Channel",
+        "videoOwnerChannelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "playlistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        "position": 4,
+        "resourceId": { "kind": "youtube#video", "videoId": "vidOld00003" }
+      },
+      "contentDetails": {
+        "videoId": "vidOld00003",
+        "videoPublishedAt": "2024-03-01T07:00:00Z"
+      }
+    }
+  ],
+  "pageInfo": { "totalResults": 5, "resultsPerPage": 50 }
+}
