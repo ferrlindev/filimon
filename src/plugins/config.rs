@@ -150,13 +150,6 @@ pub struct LoadedSource {
     )]
     pub config_path: PathBuf,
     pub enabled: bool,
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "Phase 5 routes a source's HTTP through this fetcher"
-        )
-    )]
     pub fetcher: Option<String>,
     pub plugin: Option<PluginConfig>,
 }

@@ -34,10 +34,11 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use self::cursor::CursorStore;
-use self::engine::HostEngine;
+use self::engine::{HostEngine, clean_guest_text};
 use self::error::HostError;
+use self::fetch::{FetchPolicy, FetchRoute};
 use self::instance::{InstanceFactory, WasmtimeFactory};
-use self::loader::{LoadFailure, load_components};
+use self::loader::{LoadFailure, PluginKind, load_components};
 use self::scheduler::{PluginReport, PluginSpec, run_plugin};
 use self::sink::ItemSink;
 use crate::plugins::config::LoadedRegistry;
@@ -127,13 +128,40 @@ impl Host {
         let report = load_components(registry, &host_engine);
         let mut plugins = Vec::new();
         let mut loaded_sources = Vec::new();
+        let mut load_failures = report.failures;
         for (name, pre) in report.sources {
             let Some(spec) = registry.sources.get(&name).and_then(PluginSpec::from_loaded) else {
                 continue;
             };
-            let factory = Arc::new(WasmtimeFactory::new(host_engine.engine().clone(), pre));
+            let mut factory = WasmtimeFactory::new(host_engine.engine().clone(), pre);
+            // No `fetcher` key: no route, every `fetch` answers `not-configured`
+            // (there is no implicit default fetcher).
+            if let Some(assigned) = registry.sources.get(&name).and_then(|s| s.fetcher.as_deref())
+            {
+                // A source never runs without the fetcher it was told to use.
+                let Some(fetcher_pre) = report.fetchers.get(assigned) else {
+                    let reason = fetcher_failure_reason(&load_failures, assigned);
+                    load_failures.push(LoadFailure {
+                        kind: PluginKind::Source,
+                        name: name.clone(),
+                        error: HostError::FetcherUnavailable {
+                            plugin: name,
+                            fetcher: assigned.to_string(),
+                            reason,
+                        },
+                    });
+                    continue;
+                };
+                let route = Arc::new(FetchRoute::new(
+                    assigned,
+                    Arc::clone(fetcher_pre),
+                    host_engine.engine().clone(),
+                    Arc::new(FetchPolicy::for_source(&name, &spec.host)),
+                ));
+                factory = factory.with_route(Some(route));
+            }
             loaded_sources.push(name);
-            plugins.push((spec, factory));
+            plugins.push((spec, Arc::new(factory)));
         }
 
         Ok(Self {
@@ -142,7 +170,7 @@ impl Host {
             plugins,
             loaded_sources,
             loaded_fetchers: report.fetcher_names,
-            load_failures: report.failures,
+            load_failures,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         })
     }
@@ -224,6 +252,18 @@ impl Host {
             plugins: reports,
         }
     }
+}
+
+/// Why the fetcher `fetcher` is not loaded: its own load failure text, or a
+/// plain statement when there is none (for example it is disabled).
+fn fetcher_failure_reason(failures: &[LoadFailure], fetcher: &str) -> String {
+    failures
+        .iter()
+        .find(|f| f.kind == PluginKind::Fetcher && f.name == fetcher)
+        .map_or_else(
+            || "it is not loaded".to_string(),
+            |f| clean_guest_text(&f.error.to_string(), 512),
+        )
 }
 
 /// Runs one task per plugin and joins them all.
