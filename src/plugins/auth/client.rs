@@ -25,7 +25,6 @@ use std::time::Duration;
 use super::callback::AuthCode;
 use super::error::AuthError;
 use super::pkce::Verifier;
-use super::store::RefreshToken;
 use crate::plugins::config::OAuthConfig;
 use crate::plugins::host::engine::clean_guest_text;
 
@@ -147,9 +146,29 @@ impl TokenClient {
         verifier: &Verifier,
         redirect_uri: &str,
     ) -> Result<TokenSet, AuthError> {
-        let _ = (code, verifier, redirect_uri);
-        Err(AuthError::TokenRequest {
-            reason: "not implemented".to_string(),
+        let form = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code.expose()),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier.expose()),
+        ];
+        let (status, body) = match self.post_form(&self.oauth.token_url, form).await {
+            Ok(answer) => answer,
+            Err(SendFailure::Transport(reason)) => return Err(AuthError::TokenRequest { reason }),
+            Err(SendFailure::TooLarge) => {
+                return Err(AuthError::TokenResponse {
+                    reason: too_large_text(),
+                });
+            }
+        };
+        if !status.is_success() {
+            return Err(AuthError::TokenRejected {
+                error: parse_oauth_error(&body)
+                    .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
+            });
+        }
+        parse_token_set(&body).map_err(|reason| AuthError::TokenResponse {
+            reason: reason.to_string(),
         })
     }
 
@@ -157,11 +176,158 @@ impl TokenClient {
     /// no `revocation_url` is configured (no request is made).
     ///
     /// # Errors
-    /// `RevokeFailed` for a transport failure or a non-2xx status.
+    /// `RevokeFailed` for a transport failure or a non-2xx status. The
+    /// provider's answer text is not carried, only the status.
     pub async fn revoke(&self, token: &str, kind: TokenKind) -> Result<bool, AuthError> {
-        let _ = (token, kind);
-        Ok(false)
+        let Some(url) = &self.oauth.revocation_url else {
+            return Ok(false);
+        };
+        let hint = match kind {
+            TokenKind::Access => "access_token",
+            TokenKind::Refresh => "refresh_token",
+        };
+        match self
+            .post_form(url, vec![("token", token), ("token_type_hint", hint)])
+            .await
+        {
+            Ok((status, _)) if status.is_success() => Ok(true),
+            Ok((status, _)) => Err(AuthError::RevokeFailed {
+                reason: format!("HTTP {}", status.as_u16()),
+            }),
+            Err(SendFailure::Transport(reason)) => Err(AuthError::RevokeFailed { reason }),
+            Err(SendFailure::TooLarge) => Err(AuthError::RevokeFailed {
+                reason: too_large_text(),
+            }),
+        }
     }
+
+    /// Posts `form` to `url` with the client's authentication and reads the
+    /// answer, never more than [`MAX_RESPONSE_BYTES`] of it.
+    ///
+    /// A client with a secret authenticates with HTTP Basic and the secret
+    /// stays out of the form; a public client sends `client_id` in the form.
+    async fn post_form<'a>(
+        &'a self,
+        url: &url::Url,
+        mut form: Vec<(&'a str, &'a str)>,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), SendFailure> {
+        let mut request = self
+            .http
+            .post(url.clone())
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(secret) = &self.oauth.client_secret {
+            request = request.basic_auth(&self.oauth.client_id, Some(secret.expose()));
+        } else {
+            form.push(("client_id", self.oauth.client_id.as_str()));
+        }
+        // One `.form` call: a second one replaces the body.
+        let mut response = request
+            .form(&form)
+            .send()
+            .await
+            .map_err(|error| SendFailure::Transport(describe_transport_error(error)))?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(SendFailure::TooLarge);
+        }
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                        return Err(SendFailure::TooLarge);
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(SendFailure::Transport(describe_transport_error(error)));
+                }
+            }
+        }
+        Ok((status, body))
+    }
+}
+
+/// Why a request produced no answer.
+enum SendFailure {
+    /// A connection, DNS, TLS, timeout or body-read failure, as cleaned text.
+    Transport(String),
+    /// The answer is larger than [`MAX_RESPONSE_BYTES`].
+    TooLarge,
+}
+
+fn too_large_text() -> String {
+    format!("answer is larger than {MAX_RESPONSE_BYTES} bytes")
+}
+
+/// Reads a success answer. The `Err` text is fixed and carries nothing from
+/// the body.
+fn parse_token_set(body: &[u8]) -> Result<TokenSet, &'static str> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "the answer is not JSON")?;
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let access_token = text("access_token").ok_or("no access_token in the answer")?;
+    Ok(TokenSet {
+        access_token,
+        refresh_token: text("refresh_token"),
+        expires_in: value.get("expires_in").and_then(parse_expires_in),
+        scope: text("scope"),
+        token_type: text("token_type"),
+    })
+}
+
+/// `expires_in` as a JSON number (truncated to whole seconds) or a numeric
+/// string; anything else, and a negative number, is `None`.
+fn parse_expires_in(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "checked finite and non-negative; the cast saturates"
+                    )]
+                    let whole = seconds.trunc() as u64;
+                    whole
+                })
+        }),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// The OAuth error of a JSON error body as `error` or `error: description`,
+/// each part cleaned and clipped. `None` when the body is not a JSON object
+/// with a string `error`; a body that is not JSON is never echoed.
+fn parse_oauth_error(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.as_str()?;
+    let code = clean_guest_text(code, ERROR_TEXT_CLIP);
+    if code.is_empty() {
+        return None;
+    }
+    let description = value
+        .get("error_description")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| clean_guest_text(text, ERROR_TEXT_CLIP))
+        .filter(|text| !text.is_empty());
+    Some(match description {
+        Some(description) => format!("{code}: {description}"),
+        None => code,
+    })
 }
 
 /// The error's own text joined with its `source()` chain, with the url
