@@ -7,13 +7,14 @@ use std::sync::Arc;
 
 use super::provider::TokenProvider;
 use super::store::{AccessToken, StoredTokens, TokenStore};
-use crate::plugins::config::OAuthConfig;
+use crate::plugins::config::{OAuthConfig, OAuthGrant};
 use crate::plugins::secrets::Secret;
 
 /// An OAuth config over example https endpoints.
 pub(crate) fn oauth_config() -> OAuthConfig {
     OAuthConfig {
-        authorize_url: url::Url::parse("https://auth.example/authorize").expect("url"),
+        grant: OAuthGrant::AuthorizationCode,
+        authorize_url: Some(url::Url::parse("https://auth.example/authorize").expect("url")),
         token_url: url::Url::parse("https://auth.example/token").expect("url"),
         scopes: vec!["read".to_string()],
         client_id: "client-1".to_string(),
@@ -21,6 +22,7 @@ pub(crate) fn oauth_config() -> OAuthConfig {
         revocation_url: None,
         redirect_port: 0,
         authorize_params: vec![],
+        user_agent: None,
     }
 }
 
@@ -30,6 +32,18 @@ pub(crate) fn oauth_config_for(token_url: &str, secret: Option<&str>) -> OAuthCo
     OAuthConfig {
         token_url: url::Url::parse(token_url).expect("token url"),
         client_secret: secret.map(Secret::for_test),
+        ..oauth_config()
+    }
+}
+
+/// An app-only (`client_credentials`) config whose token endpoint is
+/// `token_url` (a loopback test server) and whose client secret is `secret`.
+pub(crate) fn client_credentials_config_for(token_url: &str, secret: &str) -> OAuthConfig {
+    OAuthConfig {
+        grant: OAuthGrant::ClientCredentials,
+        authorize_url: None,
+        token_url: url::Url::parse(token_url).expect("token url"),
+        client_secret: Some(Secret::for_test(secret)),
         ..oauth_config()
     }
 }

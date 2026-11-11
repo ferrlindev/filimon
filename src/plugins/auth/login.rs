@@ -27,7 +27,7 @@ use super::client::{DEFAULT_EXPIRES_IN_SECS, TokenClient};
 use super::error::AuthError;
 use super::pkce::{build_authorize_url, generate_state, generate_verifier, s256_challenge};
 use super::store::{AccessToken, RefreshToken, StoredTokens, TokenStore};
-use crate::plugins::config::OAuthConfig;
+use crate::plugins::config::{OAuthConfig, OAuthGrant};
 
 /// How one login behaves.
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +78,9 @@ pub struct LoginSummary {
 ///
 /// # Errors
 ///
-/// `RedirectPortInUse` for a busy port (before anything is shown), the
+/// `GrantHasNoLogin` for a `client_credentials` plugin (before anything is
+/// bound or shown), `RedirectPortInUse` for a busy port (before anything is
+/// shown), the
 /// callback errors (`StateMismatch`, `CallbackDenied`, `CallbackInvalid`,
 /// `CallbackTimeout`), the token client's errors (`TokenRequest`,
 /// `TokenRejected`, `TokenResponse`) and the store's (`TokenWrite`). Any error
@@ -89,6 +91,12 @@ pub async fn login(
     options: &LoginOptions,
     hooks: &mut dyn LoginHooks,
 ) -> Result<LoginSummary, AuthError> {
+    // 0. An app-only plugin has no user to log in, so refuse before a port is
+    // bound or a URL is built (D-03).
+    if oauth.grant == OAuthGrant::ClientCredentials {
+        return Err(AuthError::GrantHasNoLogin);
+    }
+
     // 1. A busy port fails here, before anything is shown.
     let listener = CallbackListener::bind(oauth.redirect_port).await?;
     let redirect_uri = listener.redirect_uri();
@@ -97,7 +105,9 @@ pub async fn login(
     let verifier = generate_verifier()?;
     let challenge = s256_challenge(verifier.expose());
     let state = generate_state()?;
-    let url = build_authorize_url(oauth, &redirect_uri, &state, &challenge);
+    let Some(url) = build_authorize_url(oauth, &redirect_uri, &state, &challenge) else {
+        return Err(AuthError::GrantHasNoLogin);
+    };
 
     // 3. Show the URL; open the browser only when asked.
     hooks.authorize_url(url.as_str());
@@ -144,7 +154,8 @@ pub async fn login(
 mod tests {
     use super::*;
     use crate::plugins::auth::testing::{
-        form_pairs, oauth_config_for, token_body, unix_now, write_tokens,
+        client_credentials_config_for, form_pairs, oauth_config_for, token_body, unix_now,
+        write_tokens,
     };
     use crate::plugins::host::testing::{Reply, TestHttpServer};
     use tempfile::TempDir;
@@ -480,6 +491,30 @@ mod tests {
         assert_eq!(hooks.opener_calls, 0);
         assert_eq!(hooks.urls.len(), 1);
         assert!(token_path(&state).exists());
+    }
+
+    #[tokio::test]
+    async fn login_refuses_a_client_credentials_config_before_binding_the_port() {
+        let server = good_endpoint().await;
+        // A held port would make a bind attempt fail with `RedirectPortInUse`,
+        // so `GrantHasNoLogin` proves the refusal came first.
+        let holder = CallbackListener::bind(0).await.expect("hold a port");
+        let mut oauth = client_credentials_config_for(&server.url("/token"), "SECRET-1");
+        oauth.redirect_port = holder.port();
+        let state = TempDir::new().expect("tempdir");
+        let store = TokenStore::new(state.path(), ALIAS);
+        let mut hooks = TestHooks::new(Visit::Good);
+
+        let result = login(&oauth, &store, &options(), &mut hooks).await;
+
+        assert!(
+            matches!(result, Err(AuthError::GrantHasNoLogin)),
+            "expected GrantHasNoLogin, got {result:?}"
+        );
+        assert!(hooks.urls.is_empty(), "no authorize URL was shown");
+        assert_eq!(hooks.opener_calls, 0);
+        assert_eq!(server.seen().len(), 0);
+        assert!(!state.path().join("auth").exists(), "no token file");
     }
 
     #[tokio::test]

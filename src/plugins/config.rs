@@ -148,7 +148,11 @@ struct HostSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OAuthSection {
-    authorize_url: toml::Spanned<String>,
+    /// `authorization_code` (the default) or `client_credentials` (D-03).
+    grant: Option<toml::Spanned<String>>,
+    /// Required for the authorization-code grant, not allowed for
+    /// `client_credentials`.
+    authorize_url: Option<toml::Spanned<String>>,
     token_url: toml::Spanned<String>,
     #[serde(default)]
     scopes: Vec<toml::Spanned<String>>,
@@ -161,6 +165,8 @@ struct OAuthSection {
     /// Extra authorize-request parameters (D-14), iterated in key order.
     #[serde(default)]
     authorize_params: BTreeMap<String, toml::Spanned<String>>,
+    /// The User-Agent of the host's token and revocation requests.
+    user_agent: Option<toml::Spanned<String>>,
 }
 
 /// The `[host.backoff]` table. Each value keeps its span when it is given, so
@@ -259,12 +265,42 @@ pub struct PluginConfig {
     pub oauth: Option<OAuthConfig>,
 }
 
+/// The `[host.oauth] grant` value for the interactive PKCE flow (the default).
+const GRANT_AUTHORIZATION_CODE: &str = "authorization_code";
+/// The `[host.oauth] grant` value for the app-only grant (D-03).
+const GRANT_CLIENT_CREDENTIALS: &str = "client_credentials";
+
+/// Which OAuth grant a plugin's `[host.oauth]` table uses (D-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthGrant {
+    /// The interactive PKCE authorization-code flow. The default.
+    AuthorizationCode,
+    /// The app-only `client_credentials` grant: no user, no login.
+    ClientCredentials,
+}
+
+impl OAuthSection {
+    /// The grant the table names, or `None` for a value that is neither
+    /// grant. An absent `grant` is the authorization-code grant.
+    fn resolved_grant(&self) -> Option<OAuthGrant> {
+        match self.grant.as_ref().map(|value| value.get_ref().as_str()) {
+            None | Some(GRANT_AUTHORIZATION_CODE) => Some(OAuthGrant::AuthorizationCode),
+            Some(GRANT_CLIENT_CREDENTIALS) => Some(OAuthGrant::ClientCredentials),
+            Some(_) => None,
+        }
+    }
+}
+
 /// A plugin's host-managed OAuth configuration (D-11). Every endpoint is an
 /// `https://` URL with a host and no user-info (D-13). `client_secret` is the
 /// only secret; it is never part of `PluginConfig::secrets` (D-12).
+///
+/// `authorize_url` is `Some` exactly for the authorization-code grant, and
+/// `redirect_port` is only used by it.
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
-    pub authorize_url: url::Url,
+    pub grant: OAuthGrant,
+    pub authorize_url: Option<url::Url>,
     pub token_url: url::Url,
     pub scopes: Vec<String>,
     pub client_id: String,
@@ -276,6 +312,14 @@ pub struct OAuthConfig {
     pub redirect_port: u16,
     /// Extra authorize parameters, in key order.
     pub authorize_params: Vec<(String, String)>,
+    /// The User-Agent for the host's token and revocation requests (both
+    /// grants); `None` keeps the host's default. The plugin's own requests are
+    /// unaffected.
+    #[allow(
+        dead_code,
+        reason = "loaded and validated here; the token client reads it from plan 07-03"
+    )]
+    pub user_agent: Option<String>,
 }
 
 /// Host-enforced values for one plugin.
@@ -1057,8 +1101,21 @@ fn read_plugin(
 /// `Some` only when the table satisfies every rule `oauth_problems` reports
 /// against; the client secret is resolved later, in pass 3.
 fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
-    let authorize_url = https_endpoint(section.authorize_url.get_ref())?;
+    let grant = section.resolved_grant()?;
+    let authorize_url = match (grant, &section.authorize_url) {
+        (OAuthGrant::AuthorizationCode, Some(value)) => Some(https_endpoint(value.get_ref())?),
+        (OAuthGrant::ClientCredentials, None) => None,
+        _ => return None,
+    };
+    if grant == OAuthGrant::ClientCredentials && !client_credentials_keys_unused(section) {
+        return None;
+    }
     let token_url = https_endpoint(section.token_url.get_ref())?;
+    let user_agent = match &section.user_agent {
+        Some(value) if user_agent_is_valid(value.get_ref()) => Some(value.get_ref().clone()),
+        Some(_) => return None,
+        None => None,
+    };
     let revocation_url = match &section.revocation_url {
         Some(value) => Some(https_endpoint(value.get_ref())?),
         None => None,
@@ -1074,6 +1131,7 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
         return None;
     }
     Some(OAuthConfig {
+        grant,
         authorize_url,
         token_url,
         scopes: section
@@ -1090,6 +1148,7 @@ fn build_oauth(section: &OAuthSection) -> Option<OAuthConfig> {
             .iter()
             .map(|(key, value)| (key.clone(), value.get_ref().clone()))
             .collect(),
+        user_agent,
     })
 }
 
@@ -1101,6 +1160,12 @@ fn https_endpoint(text: &str) -> Option<url::Url> {
     (url.scheme() == "https" && url.host_str().is_some() && plain).then_some(url)
 }
 
+/// `true` when `text` is 1 to 200 printable ASCII characters (0x20 to 0x7E),
+/// which keeps a User-Agent a safe single-line header value.
+fn user_agent_is_valid(text: &str) -> bool {
+    (1..=200).contains(&text.len()) && text.chars().all(|c| matches!(c, ' '..='~'))
+}
+
 /// `true` when `scope` is empty or contains whitespace: a joined scope list
 /// splits on spaces, so one entry must be one scope.
 fn scope_is_invalid(scope: &str) -> bool {
@@ -1109,8 +1174,9 @@ fn scope_is_invalid(scope: &str) -> bool {
 
 /// `[host.oauth]` checks. Every problem of the table is collected, in a fixed
 /// order: the three endpoints, `client_id`, `redirect_port`, scopes by index,
-/// `client_secret_env`, then `authorize_params` in key order. A message states
-/// the rule and never repeats the value it rejects.
+/// `client_secret_env`, `user_agent`, then `authorize_params` in key order, then the checks
+/// that depend on the grant (`grant_problems`). An unknown `grant` is reported
+/// first. A message states the rule and never repeats the value it rejects.
 fn oauth_problems(
     plugin: &str,
     path: &str,
@@ -1126,8 +1192,17 @@ fn oauth_problems(
         span: Some(span),
     };
     let mut problems = Vec::new();
+    let grant = section.resolved_grant();
+    if let (None, Some(value)) = (grant, &section.grant) {
+        problems.push(invalid(
+            "host.oauth.grant".to_string(),
+            "must be `authorization_code` or `client_credentials`",
+            value.span().into(),
+        ));
+    }
+    let grant = grant.unwrap_or(OAuthGrant::AuthorizationCode);
     for (field, value) in [
-        ("host.oauth.authorize_url", Some(&section.authorize_url)),
+        ("host.oauth.authorize_url", section.authorize_url.as_ref()),
         ("host.oauth.token_url", Some(&section.token_url)),
         ("host.oauth.revocation_url", section.revocation_url.as_ref()),
     ] {
@@ -1174,6 +1249,15 @@ fn oauth_problems(
             env_var.span().into(),
         ));
     }
+    if let Some(value) = &section.user_agent
+        && !user_agent_is_valid(value.get_ref())
+    {
+        problems.push(invalid(
+            "host.oauth.user_agent".to_string(),
+            "must be 1 to 200 printable ASCII characters",
+            value.span().into(),
+        ));
+    }
     for (key, value) in &section.authorize_params {
         if key.is_empty() {
             problems.push(invalid(
@@ -1190,6 +1274,90 @@ fn oauth_problems(
                 "is a standard authorize parameter that the host sets itself",
                 value.span().into(),
             ));
+        }
+    }
+    problems.extend(grant_problems(grant, section, &invalid));
+    problems
+}
+
+/// `true` when none of the keys that only the authorization-code flow uses is
+/// set on `section`: `authorize_url`, `redirect_port`, a non-empty
+/// `authorize_params`, `revocation_url` and a non-empty `scopes`.
+fn client_credentials_keys_unused(section: &OAuthSection) -> bool {
+    section.authorize_url.is_none()
+        && section.redirect_port.is_none()
+        && section.authorize_params.is_empty()
+        && section.revocation_url.is_none()
+        && section.scopes.is_empty()
+}
+
+/// The checks that depend on the grant, after every grant-independent one.
+///
+/// The authorization-code grant needs an `authorize_url`. The
+/// `client_credentials` grant needs a `client_secret_env` and refuses every key
+/// that belongs to the code flow, so a table never carries a setting that is
+/// silently ignored. A missing key has no span of its own, so it is labelled
+/// at `token_url`.
+fn grant_problems(
+    grant: OAuthGrant,
+    section: &OAuthSection,
+    invalid: &dyn Fn(String, &str, SourceSpan) -> ConfigError,
+) -> Vec<ConfigError> {
+    const UNUSED: &str = "is not used by the client_credentials grant";
+    let mut problems = Vec::new();
+    match grant {
+        OAuthGrant::AuthorizationCode => {
+            if section.authorize_url.is_none() {
+                problems.push(invalid(
+                    "host.oauth.authorize_url".to_string(),
+                    "is required for the authorization_code grant",
+                    section.token_url.span().into(),
+                ));
+            }
+        }
+        OAuthGrant::ClientCredentials => {
+            if section.client_secret_env.is_none() {
+                problems.push(invalid(
+                    "host.oauth.client_secret_env".to_string(),
+                    "is required for the client_credentials grant",
+                    section.token_url.span().into(),
+                ));
+            }
+            if let Some(value) = &section.authorize_url {
+                problems.push(invalid(
+                    "host.oauth.authorize_url".to_string(),
+                    UNUSED,
+                    value.span().into(),
+                ));
+            }
+            if let Some(port) = &section.redirect_port {
+                problems.push(invalid(
+                    "host.oauth.redirect_port".to_string(),
+                    UNUSED,
+                    port.span().into(),
+                ));
+            }
+            if let Some(value) = section.authorize_params.values().next() {
+                problems.push(invalid(
+                    "host.oauth.authorize_params".to_string(),
+                    UNUSED,
+                    value.span().into(),
+                ));
+            }
+            if let Some(value) = &section.revocation_url {
+                problems.push(invalid(
+                    "host.oauth.revocation_url".to_string(),
+                    UNUSED,
+                    value.span().into(),
+                ));
+            }
+            if let Some(scope) = section.scopes.first() {
+                problems.push(invalid(
+                    "host.oauth.scopes".to_string(),
+                    UNUSED,
+                    scope.span().into(),
+                ));
+            }
         }
     }
     problems
@@ -1972,8 +2140,8 @@ fetcher = "nope"
         let plugin = registry.sources["alpha"].plugin.as_ref().expect("loaded");
         let oauth = plugin.oauth.as_ref().expect("the oauth table");
         assert_eq!(
-            oauth.authorize_url.as_str(),
-            "https://auth.example/authorize"
+            oauth.authorize_url.as_ref().map(url::Url::as_str),
+            Some("https://auth.example/authorize")
         );
         assert_eq!(oauth.token_url.as_str(), "https://auth.example/token");
         assert_eq!(oauth.scopes, ["read"]);
@@ -2058,7 +2226,10 @@ fetcher = "nope"
             .as_ref()
             .and_then(|p| p.oauth.as_ref())
             .expect("oauth");
-        assert_eq!(oauth.authorize_url.scheme(), "https");
+        assert_eq!(
+            oauth.authorize_url.as_ref().map(url::Url::scheme),
+            Some("https")
+        );
     }
 
     // ── [host.oauth] remaining keys (D-04, D-11, D-13, D-14) ──────────────────
@@ -2314,6 +2485,306 @@ fetcher = "nope"
                 "host.oauth.redirect_port"
             ]
         );
+    }
+
+    // ── [host.oauth] grant (D-03) ─────────────────────────────────────────────
+
+    /// A plugin file whose `[host.oauth]` uses the `client_credentials` grant
+    /// with a https `token_url` and `client_id`, followed by `extra` lines
+    /// (which must stay inside the table, so they come last).
+    fn client_credentials_file(extra: &str) -> String {
+        format!(
+            "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
+             grant = \"client_credentials\"\n\
+             token_url = \"https://auth.example/token\"\n\
+             client_id = \"client-1\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn grant_defaults_to_authorization_code_and_requires_authorize_url() {
+        for extra in ["", "grant = \"authorization_code\"\n"] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(&dir, &oauth_file("[\"read\"]", extra));
+
+            let oauth = loaded_oauth(&dir);
+
+            assert_eq!(oauth.grant, OAuthGrant::AuthorizationCode, "{extra:?}");
+            assert_eq!(
+                oauth.authorize_url.as_ref().map(url::Url::as_str),
+                Some("https://auth.example/authorize"),
+                "{extra:?}"
+            );
+            assert_eq!(oauth.redirect_port, DEFAULT_REDIRECT_PORT, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_grant_is_rejected_naming_the_field_without_echoing_the_value() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", "grant = \"password\"\n"));
+
+        let problems = invalid_problems(&dir);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].0, "host.oauth.grant");
+        assert!(
+            problems[0].1.contains("authorization_code"),
+            "{}",
+            problems[0].1
+        );
+        assert!(
+            problems[0].1.contains("client_credentials"),
+            "{}",
+            problems[0].1
+        );
+        assert!(!problems[0].1.contains("password"), "{}", problems[0].1);
+    }
+
+    #[test]
+    fn client_credentials_loads_with_a_secret_and_no_authorize_url() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file("client_secret_env = \"STUB_CLIENT_SECRET\"\n"),
+        );
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(|| SENTINEL.to_string());
+
+        let registry = load_with(&dir, &env).expect("a client_credentials table loads");
+
+        let oauth = plugin_of(&registry)
+            .oauth
+            .as_ref()
+            .expect("the oauth table");
+        assert_eq!(oauth.grant, OAuthGrant::ClientCredentials);
+        assert!(oauth.authorize_url.is_none());
+        assert_eq!(oauth.token_url.as_str(), "https://auth.example/token");
+        assert_eq!(oauth.client_id, "client-1");
+        assert_eq!(
+            oauth.client_secret.as_ref().map(Secret::expose),
+            Some(SENTINEL)
+        );
+    }
+
+    #[test]
+    fn client_credentials_without_client_secret_env_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &client_credentials_file(""));
+
+        let problems = invalid_problems(&dir);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].0, "host.oauth.client_secret_env");
+        assert!(
+            problems[0].1.contains("client_credentials"),
+            "{}",
+            problems[0].1
+        );
+    }
+
+    #[test]
+    fn client_credentials_rejects_keys_that_belong_to_the_code_flow() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file(
+                "client_secret_env = \"STUB_CLIENT_SECRET\"\n\
+                 authorize_url = \"https://auth.example/authorize\"\n\
+                 redirect_port = 8123\n\
+                 revocation_url = \"https://auth.example/revoke\"\n\
+                 scopes = [\"read\"]\n\
+                 authorize_params = { prompt = \"consent\" }\n",
+            ),
+        );
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(|| SENTINEL.to_string());
+
+        let errors = load_with(&dir, &env).expect_err("code-flow keys are an error");
+
+        let problems: Vec<(String, String)> = errors
+            .problems
+            .iter()
+            .map(|problem| match problem {
+                ConfigError::InvalidValue {
+                    plugin,
+                    field,
+                    message,
+                    span,
+                    ..
+                } => {
+                    assert_eq!(plugin, "alpha");
+                    assert!(span.is_some(), "{field} is labelled");
+                    (field.clone(), message.clone())
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            })
+            .collect();
+        let fields: Vec<&str> = problems.iter().map(|(field, _)| field.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                "host.oauth.authorize_url",
+                "host.oauth.redirect_port",
+                "host.oauth.authorize_params",
+                "host.oauth.revocation_url",
+                "host.oauth.scopes",
+            ]
+        );
+        for (field, message) in &problems {
+            assert!(
+                message.contains("not used by the client_credentials grant"),
+                "{field}: {message}"
+            );
+            for value in ["auth.example", "8123", "consent", "read", "revoke"] {
+                assert!(
+                    !message.contains(value),
+                    "{field} echoes {value}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authorization_code_without_authorize_url_is_an_invalid_value_naming_the_field() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            "[host]\npoll_interval_secs = 60\n\n[host.oauth]\n\
+             token_url = \"https://auth.example/token\"\nclient_id = \"client-1\"\n",
+        );
+
+        let problems = invalid_problems(&dir);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].0, "host.oauth.authorize_url");
+        assert!(
+            problems[0].1.contains("authorization_code"),
+            "{}",
+            problems[0].1
+        );
+    }
+
+    // ── [host.oauth] user_agent (research T4) ─────────────────────────────────
+
+    const REDDIT_USER_AGENT: &str = "filimon:reddit:0.1.0 (by /u/tester)";
+
+    #[test]
+    fn user_agent_loads_for_both_grants() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", ""));
+        assert_eq!(loaded_oauth(&dir).user_agent, None);
+
+        let line = format!("user_agent = \"{REDDIT_USER_AGENT}\"\n");
+        alpha_with_plugin(&dir, &oauth_file("[\"read\"]", &line));
+        assert_eq!(
+            loaded_oauth(&dir).user_agent.as_deref(),
+            Some(REDDIT_USER_AGENT)
+        );
+
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file(&format!(
+                "client_secret_env = \"STUB_CLIENT_SECRET\"\n{line}"
+            )),
+        );
+        let env = |key: &str| (key == "STUB_CLIENT_SECRET").then(|| SENTINEL.to_string());
+        let registry = load_with(&dir, &env).expect("a client_credentials table loads");
+        let oauth = plugin_of(&registry).oauth.as_ref().expect("oauth");
+        assert_eq!(oauth.user_agent.as_deref(), Some(REDDIT_USER_AGENT));
+    }
+
+    #[test]
+    fn user_agent_with_control_characters_is_rejected_naming_the_field() {
+        for value in [
+            "bad\\nvalue",
+            "bad\\rvalue",
+            "bad\\tvalue",
+            "bad\\u0000value",
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(
+                &dir,
+                &oauth_file("[\"read\"]", &format!("user_agent = \"{value}\"\n")),
+            );
+
+            let problems = invalid_problems(&dir);
+
+            assert_eq!(problems.len(), 1, "{value}: {problems:?}");
+            assert_eq!(problems[0].0, "host.oauth.user_agent");
+            assert!(
+                problems[0].1.contains("printable ASCII"),
+                "{}",
+                problems[0].1
+            );
+            assert!(!problems[0].1.contains("bad"), "{}", problems[0].1);
+        }
+    }
+
+    #[test]
+    fn user_agent_empty_or_over_200_characters_is_rejected() {
+        for value in [String::new(), "a".repeat(201)] {
+            let dir = TempDir::new().expect("tempdir");
+            alpha_with_plugin(
+                &dir,
+                &oauth_file("[\"read\"]", &format!("user_agent = \"{value}\"\n")),
+            );
+
+            let problems = invalid_problems(&dir);
+
+            assert_eq!(problems.len(), 1, "{} chars: {problems:?}", value.len());
+            assert_eq!(problems[0].0, "host.oauth.user_agent");
+            assert!(problems[0].1.contains("1 to 200"), "{}", problems[0].1);
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        let longest = "a".repeat(200);
+        alpha_with_plugin(
+            &dir,
+            &oauth_file("[\"read\"]", &format!("user_agent = \"{longest}\"\n")),
+        );
+        assert_eq!(
+            loaded_oauth(&dir).user_agent.as_deref(),
+            Some(longest.as_str())
+        );
+    }
+
+    #[test]
+    fn client_credentials_secret_is_a_client_secret_not_a_plugin_secret() {
+        let dir = TempDir::new().expect("tempdir");
+        alpha_with_plugin(
+            &dir,
+            &client_credentials_file(
+                "client_secret_env = \"STUB_CLIENT_SECRET\"\n\n\
+                 [host.secrets]\ntoken = \"STUB_TOKEN\"\n\n\
+                 [settings]\ngreeting = \"hi\"\n",
+            ),
+        );
+        let env = |key: &str| match key {
+            "STUB_CLIENT_SECRET" => Some(SENTINEL.to_string()),
+            "STUB_TOKEN" => Some("tok-1".to_string()),
+            _ => None,
+        };
+
+        let registry = load_with(&dir, &env).expect("both secrets resolve");
+
+        let plugin = plugin_of(&registry);
+        let keys: Vec<&str> = plugin.secrets.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["token"],
+            "only the [host.secrets] alias reaches init"
+        );
+        assert!(plugin.secrets.values().all(|s| s.expose() != SENTINEL));
+        assert!(!plugin.settings_toml.contains(SENTINEL));
+        assert!(!plugin.settings_toml.contains("client-1"));
+        let oauth = plugin.oauth.as_ref().expect("oauth");
+        assert_eq!(oauth.grant, OAuthGrant::ClientCredentials);
+        assert_eq!(
+            oauth.client_secret.as_ref().map(Secret::expose),
+            Some(SENTINEL)
+        );
+        let debug = format!("{plugin:?}");
+        assert!(!debug.contains(SENTINEL), "{debug}");
+        assert!(debug.contains("Secret(***)"), "{debug}");
     }
 
     // ── [host.oauth] client secret (D-12) ─────────────────────────────────────
