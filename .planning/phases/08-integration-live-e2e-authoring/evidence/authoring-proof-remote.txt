@@ -1,0 +1,27 @@
+step 1: record
+step 2: workdir
+mode: remote wit-v0.1.0
+step 3: wit
+step 4: copy
+step 5: rewrite
+step 6: build
+step 7: conformance
+step 8: register
+step 9: check
+step 10: run-once
+step 11: fetcher-copy
+step 12: fetcher-rewrite
+step 13: fetcher-source
+step 14: fetcher-build
+step 15: fetcher-conformance
+step 16: fetcher-register
+step 17: fetcher-check
+step 18: fetcher-canned
+step 19: fetcher-unmatched
+step 20: fetcher-unassigned
+no fetcher key: run-once exited 1 and printed no canned answer
+step 21: hash
+step 22: tree-untouched
+PASS: source leg
+PASS: fetcher leg
+AUTHORING PROOF: PASS (legs: source fetcher)
