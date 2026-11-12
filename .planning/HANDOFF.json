@@ -1,20 +1,82 @@
 {
   "version": "1.0",
-  "timestamp": "2026-11-11T16:22:40.530Z",
-  "phase": "8",
+  "timestamp": "2026-11-12T11:38:28.800Z",
+  "phase": "08",
   "phase_name": "Integration, Live E2E & Authoring",
-  "phase_dir": null,
-  "plan": null,
-  "task": null,
-  "total_tasks": 0,
+  "phase_dir": "/Users/jferrolino/Devs/portfolio/filimon/.planning/phases/08-integration-live-e2e-authoring",
+  "plan": 6,
+  "task": 1,
+  "total_tasks": 3,
   "status": "paused",
   "completed_tasks": [],
-  "remaining_tasks": [{"id": 1, "name": "Discuss/plan Phase 8", "status": "not_started"}],
-  "blockers": [],
+  "remaining_tasks": [
+    {
+      "id": 1,
+      "name": "Provide live prerequisites: Reddit app, YouTube key, GLiNER model, .env (D-07, D-09)",
+      "status": "blocked_on_human"
+    },
+    {
+      "id": 2,
+      "name": "Decide wait or waive Reddit (only if reddit-unavailable) (D-09)",
+      "status": "not_started"
+    },
+    {
+      "id": 3,
+      "name": "Run live-e2e.sh run and credentialed tests, then commit sanitised evidence",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    {
+      "description": "No .env; REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, YOUTUBE_API_KEY unset; GLiNER tokenizer.json and onnx/model.onnx missing",
+      "type": "human_action",
+      "workaround": "Reply reddit-unavailable to trigger the D-09 wait/waive decision"
+    }
+  ],
   "async_jobs": [],
-  "human_actions_pending": [],
-  "decisions": [],
-  "uncommitted_files": [" M .planning/config.json", " M .planning/phases/06-host-managed-oauth/06-VERIFICATION.md", "?? .agents/", "?? .bg-shell/", "?? .claude/", "?? .cursor/", "?? .gsd-path/", "?? .planning/state.json", "?? AGENTS.md", "?? WORKFLOW.md", "?? test_config_panic.json"],
-  "next_action": "Run /gsd-discuss-phase 8 (or /gsd-plan-phase 8) to start Phase 8",
-  "context_notes": "Phases 1-7 complete (58/58 plans, 88%). Phase 07 UAT 4/4 passed and security verified. No Phase 8 directory exists yet. Session contained no in-progress work beyond the phase transition."
+  "human_actions_pending": [
+    {
+      "action": "Create Reddit web app and note client id/secret",
+      "context": "https://www.reddit.com/prefs/apps; approval may take days",
+      "blocking": true
+    },
+    {
+      "action": "Create YouTube Data API v3 key",
+      "context": "Google Cloud console",
+      "blocking": true
+    },
+    {
+      "action": "Download GLiNER model into models/gliner_small-v2.1/",
+      "context": "docker compose --profile setup up model-downloader, or README recipe",
+      "blocking": true
+    },
+    {
+      "action": "Put keys in repo-root .env (never paste values in chat, never commit)",
+      "context": "key names in .env.example",
+      "blocking": true
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "Ran 08-06 sequentially on the main working tree, not in a worktree",
+      "rationale": "Human-run evidence, .env, models/ and target/ live in the main checkout; 08-07 lost worktree output for this reason",
+      "phase": "08"
+    }
+  ],
+  "uncommitted_files": [
+    " M .planning/STATE.md",
+    " M .planning/config.json",
+    " M .planning/phases/06-host-managed-oauth/06-VERIFICATION.md",
+    "?? .agents/",
+    "?? .bg-shell/",
+    "?? .claude/",
+    "?? .cursor/",
+    "?? .gsd-path/",
+    "?? .planning/state.json",
+    "?? AGENTS.md",
+    "?? WORKFLOW.md",
+    "?? test_config_panic.json"
+  ],
+  "next_action": "After prerequisites exist, run /gsd-execute-phase 8 (plan 08-06 has no commits or SUMMARY; it restarts at the Task 1 checkpoint). Automation already passed: builds, selftest.",
+  "context_notes": "Executor ran cargo builds, component builds and selftest (PASS). Preflight exit 3: only the 5 prerequisite FAILs remain; Fluvio, topics, SmartModules, components ok. Other phase 8 plans (01-05, 07) are complete. After 08-06, the phase needs verification."
 }
