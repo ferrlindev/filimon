@@ -1,0 +1,30 @@
+[package]
+name = "template-source"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "filimon source plugin template: copy it, rename it, build it with cargo component"
+authors = ["filimon"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+# EDIT: the component package name, `<namespace>:<name>`.
+[package.metadata.component]
+package = "filimon:template-source"
+
+# EDIT: `path` points at the published WIT. Here it climbs two directories to
+# the repository's wit/ so the template builds in the filimon repository as it
+# is; after you copy the crate out, put the `wit/` directory beside Cargo.toml
+# and use `path = "wit"`.
+[package.metadata.component.target]
+path = "../../wit"
+world = "source"
+
+# Own workspace, so a surrounding workspace does not capture this crate.
+[workspace]
