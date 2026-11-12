@@ -94,7 +94,7 @@ status: complete
 ## Decisions Made
 
 - The tag name `wit-v0.1.0` stays fixed; the prohibition against moving, deleting or force-pushing it stands. Outside authors pin the name.
-- The fetcher leg is built from `plugins/stub-fetcher`; `plugins/replay-fetcher` named in the plan does not exist in the tagged commit.
+- The fetcher leg is built from `plugins/stub-fetcher`; `plugins/replay-fetcher` is also present in the tagged commit (verified by the orchestrator with `git ls-tree`) but is not part of the authoring walkthrough or the tag message.
 
 ## Deviations from Plan
 
@@ -106,7 +106,7 @@ status: complete
 **2. [Plan 08-05 effect] plugins/stub-fetcher instead of plugins/replay-fetcher**
 - **Found during:** Task 1 / Task 2 context
 - **Issue:** Plan 08-05 Task 1 was answered "walkthrough fresh-from-stub", so the fetcher fixture is `plugins/stub-fetcher`. This plan's truths, the tag message text and the must-have file list name `plugins/replay-fetcher`. The tag message actually reads `filimon:plugin@0.1.0 authoring contract: wit/, plugins/template, plugins/stub-fetcher, docs/plugin-guide.md`, and the tag contents were checked against `plugins/stub-fetcher`.
-- **Impact:** None on the proof; the script's fetcher leg passed from the tag with this fixture. Literal reading of the plan truth "contains plugins/replay-fetcher" is not met, by design of the 08-05 decision.
+- **Impact:** None on the proof; the script's fetcher leg passed from the tag with this fixture. The plan truth "contains plugins/replay-fetcher" is literally met, because the directory exists at the tag; it is simply no longer the fixture the guide and script use (corrected by the orchestrator: an earlier version of this line wrongly said it was absent).
 
 **3. [Evidence provenance] The remote proof was run more than once**
 - The previous executor ran the remote proof once, and the user ran it once. The SC4 evidence is the user's own run (the two committed transcripts); this run did not re-execute `scripts/verify-authoring.sh` (the transcripts are the user's and were not regenerated). The plan's Task 1 automated verify (remote run from the tag) was therefore satisfied by the user's and the earlier executor's runs, not re-run here.
