@@ -1,0 +1,25 @@
+# Plugin TOML for the template source plugin. Register it in filimon.toml:
+#
+#   [sources.my-source]
+#   component = "path/to/my_source.wasm"
+#   config = "my-source.toml"
+
+[host]
+# Seconds between polls.
+poll_interval_secs = 60
+# The hosts the plugin's `fetch` calls may reach. Empty means none.
+allowlist = []
+
+# Optional backoff after a failed poll.
+# [host.backoff]
+# initial_secs = 60
+# max_secs = 3600
+# multiplier = 2.0
+
+# Passed raw to the plugin's `init`; the plugin parses and validates it.
+[settings]
+greeting = "hello from my first plugin"
+# When set, `poll` GETs this url through the source's assigned fetcher. A
+# source with no `fetcher` key in filimon.toml gets `not-configured`, so set
+# the `fetcher` key and the allowlist above before you enable this line.
+# fetch_url = "https://example.com/"
