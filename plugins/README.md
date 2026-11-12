@@ -26,6 +26,16 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
   allowlist, the timeout, redirects and size limits. It is a normal registry
   entry (`[fetchers.http]` in `examples/plugins/filimon.toml`), not part of the
   `fili` binary.
+- `replay-fetcher/`: a plugin for the `fetcher` world. `fetch` answers from the
+  compiled-in table `src/fixtures.rs` by url substring, returns a `404` with a
+  fixed body on a miss, logs fixed texts only and holds no state. It is the
+  fetcher the end-to-end replay tests use and the worked example of the
+  authoring guide (`docs/plugin-guide.md`). Frozen fixtures served as live data
+  are misleading, so never register it for a real source and never reference it
+  from `examples/plugins/`.
+- `template/`: a copy-and-rename source plugin derived from `stub-source`. It
+  shows the settings, the imported `fetch`, the cursor and the item; see
+  `docs/plugin-guide.md`.
 - `fault-source/`: a fault-injection plugin for the `source` world and a
   Phase 3 test fixture, not a registry example. Its `[settings]` `mode`
   selects `ok`, `rate-limited`, `transient`, `auth-required`, `fatal`,
@@ -43,9 +53,9 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
   fixtures of the host (see
   [Reddit and YouTube source plugins](#reddit-and-youtube-source-plugins)).
 
-Both stubs and the fault source double as test fixtures for the Phase 3 host.
-The default fetcher and the Reddit and YouTube plugins are not fixtures: they
-are what ships.
+Both stubs, the fault source and the replay fetcher double as test fixtures for
+the host. The default fetcher, the Reddit and YouTube plugins and the template
+are not fixtures: they are what ships or what authors copy.
 
 These crates are not members of the root filimon workspace. Each has its own
 empty `[workspace]` table, its own `Cargo.lock`, and its own toolchain pin.
@@ -77,6 +87,8 @@ From the repository root:
 (cd plugins/http-fetcher && cargo component build --release)
 (cd plugins/reddit && cargo component build --release)
 (cd plugins/youtube && cargo component build --release)
+(cd plugins/replay-fetcher && cargo component build --release)
+(cd plugins/template && cargo component build --release)
 ```
 
 The build must run from the crate directory, which the subshells handle:
@@ -90,6 +102,8 @@ components land at:
 - `plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm`
 - `plugins/reddit/target/wasm32-unknown-unknown/release/reddit_source.wasm`
 - `plugins/youtube/target/wasm32-unknown-unknown/release/youtube_source.wasm`
+- `plugins/replay-fetcher/target/wasm32-unknown-unknown/release/replay_fetcher.wasm`
+- `plugins/template/target/wasm32-unknown-unknown/release/template_source.wasm`
 
 ### Native tests of the Reddit and YouTube plugins
 
@@ -122,6 +136,12 @@ wasm-tools component targets ../../wit -w source target/wasm32-unknown-unknown/r
 
 # in plugins/youtube
 wasm-tools component targets ../../wit -w source target/wasm32-unknown-unknown/release/youtube_source.wasm
+
+# in plugins/replay-fetcher
+wasm-tools component targets ../../wit -w fetcher target/wasm32-unknown-unknown/release/replay_fetcher.wasm
+
+# in plugins/template
+wasm-tools component targets ../../wit -w source target/wasm32-unknown-unknown/release/template_source.wasm
 ```
 
 Each command exits 0 on success. Checking a component against the wrong world
@@ -382,8 +402,8 @@ From the repository root. A group that cannot run is not a pass: report it as
 not run.
 
 ```sh
-# 1. No wasm, no cluster.
-cargo test -p filimon plugins::host
+# 1. No wasm, no cluster. The `e2e_` tests build components: they are groups 6 and 7.
+cargo test -p filimon plugins::host -- --skip e2e_
 
 # 2. Real components. Needs the four fixtures built with the build lines above.
 cargo test -p filimon -- --ignored wasm_
@@ -396,7 +416,36 @@ cargo test -p filimon -- --ignored tls_
 
 # 5. Public internet. Needs outbound access to the network.
 cargo test -p filimon -- --ignored net_
+
+# 6. Replay end to end. No network, no keys.
+cargo test -p filimon e2e_replay_ -- --nocapture
+
+# 7. Live end to end. Needs keys in the environment or in the repository-root .env.
+cargo test -p filimon e2e_credentialed_ -- --nocapture
 ```
+
+Group 6 replays the Reddit and YouTube fixtures through the real components and
+the replay fetcher into a scratch Fluvio topic. The cluster-backed tests print
+`skipped: no reachable Fluvio cluster (start one with `fluvio cluster start`)`
+and pass when no cluster is reachable, so a green run on a machine without a
+cluster is not a pass of the replay end to end and must be reported as not run.
+`FILI_TEST_REQUIRE_FLUVIO=1` turns that skip into a failure.
+
+Group 7 polls the app-only `reddit` and `youtube` instances once each (one
+first poll, interval 3600 s, cancelled after the first delivered batch) into a
+scratch topic and checks structure only. It reads `REDDIT_CLIENT_ID`,
+`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY` (and optionally
+`REDDIT_USER_AGENT_CONTACT`) from the process environment and then from the
+repository-root `.env` (copy `.env.example`); values are read literally, never
+expanded. A missing or empty key prints `skipped: missing <KEY>` and the test
+passes, which is not a pass of the live check: report it as not run.
+`FILI_TEST_ENV_FILE` points the lookup at another dotenv file. The PKCE
+instances (`reddit-user`, `youtube-user`) are never part of this group.
+
+Groups 6 and 7 build the components they need with
+`cargo component build --release` when a `.wasm` is missing or stale, so a first
+run takes minutes and needs `cargo-component` installed. They are plain tests,
+not `--ignored` ones, so a full `cargo test -p filimon` also runs them.
 
 The live group creates its own `filimon-test-...` topics and deletes them, also
 when a test fails. It never touches `filimon-social-items` or the other real
@@ -407,6 +456,7 @@ not run rather than passed. Group 5 reaches real sites, so it is off by default 
 the network and on those sites staying up. Each group filter is a single
 substring on purpose: libtest ORs several filters, so adding a path filter
 beside `wasm_`, `live_`, `tls_` or `net_` would run another group as well.
+`e2e_` is a prefix filter distinct from those four.
 
 ## Fetcher layer
 
