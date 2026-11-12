@@ -33,8 +33,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::sink::live_support::{delete_topic, ready_sink, scratch_topic};
-use super::sink::{FluvioSink, ItemSink, SinkError, SinkRecord};
-use super::testing::{ExtSource, ensure_built, repo_root, write_registry_ext};
+use super::sink::{FluvioSink, ItemSink, SinkError, SinkRecord, VecSink};
+use super::testing::{ExtSource, ensure_built, is_stale, repo_root, write_registry_ext};
 use super::{Host, HostOptions};
 use crate::models::{SourceItem, SourceType};
 use crate::plugins::auth::testing::{unix_now, write_tokens};
@@ -73,6 +73,7 @@ async fn fluvio_or_skip() -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Platform {
     Reddit,
+    YouTube,
 }
 
 impl Platform {
@@ -80,6 +81,7 @@ impl Platform {
     fn name(self) -> &'static str {
         match self {
             Self::Reddit => "reddit",
+            Self::YouTube => "youtube",
         }
     }
 }
@@ -95,6 +97,14 @@ fn reddit_fixture() -> PathBuf {
     repo_root().join("plugins/reddit/tests/fixtures/listing_new.json")
 }
 
+fn youtube_fixture() -> PathBuf {
+    repo_root().join("plugins/youtube/tests/fixtures/playlist_page.json")
+}
+
+/// The API key the YouTube source receives through the env closure. It is
+/// fake and never written to a file.
+const FAKE_YOUTUBE_KEY: &str = "replay-fake-key";
+
 /// Writes the registry for `platforms` into `dir` and returns its path and the
 /// environment the loader reads secrets from (so no secret file is written).
 fn build_registry(
@@ -103,9 +113,14 @@ fn build_registry(
     dir: &Path,
 ) -> (PathBuf, HashMap<String, String>) {
     let Backend::Replay = backend;
-    let env = HashMap::new();
+    let mut env = HashMap::new();
 
-    let replay = ensure_built("replay-fetcher", "replay_fetcher.wasm", &[reddit_fixture()]);
+    // Both fixtures are inputs: editing either one rebuilds the component.
+    let replay = ensure_built(
+        "replay-fetcher",
+        "replay_fetcher.wasm",
+        &[reddit_fixture(), youtube_fixture()],
+    );
     let mut sources = Vec::new();
     for platform in platforms {
         match platform {
@@ -131,6 +146,19 @@ fn build_registry(
                            user_agent_contact = \"u/tester\""
                     .to_string(),
             }),
+            Platform::YouTube => {
+                env.insert("YOUTUBE_API_KEY".to_string(), FAKE_YOUTUBE_KEY.to_string());
+                sources.push(ExtSource {
+                    name: "youtube".to_string(),
+                    component: ensure_built("youtube", "youtube_source.wasm", &[]),
+                    interval_secs: 3600,
+                    fetcher: Some("replay".to_string()),
+                    allowlist: vec!["www.googleapis.com".to_string()],
+                    secrets: vec![("api_key".to_string(), "YOUTUBE_API_KEY".to_string())],
+                    oauth: None,
+                    settings: "channels = [\"UC_x5XG1OV2P6uZZ5FSM9Ttw\"]".to_string(),
+                });
+            }
         }
     }
     let path = write_registry_ext(dir, &sources, &[("replay".to_string(), replay)]);
@@ -142,7 +170,11 @@ fn provision_tokens(backend: &Backend, platforms: &[Platform], state_dir: &Path)
     let Backend::Replay = backend;
     for platform in platforms {
         match platform {
-            Platform::Reddit => write_tokens(state_dir, "reddit", "replay-token", unix_now() + 86_400),
+            Platform::Reddit => {
+                write_tokens(state_dir, "reddit", "replay-token", unix_now() + 86_400);
+            }
+            // The API-key instance needs no login.
+            Platform::YouTube => {}
         }
     }
 }
@@ -257,8 +289,30 @@ fn expected_count(platforms: &[Platform]) -> usize {
         .iter()
         .map(|platform| match platform {
             Platform::Reddit => reddit_expected().len(),
+            Platform::YouTube => youtube_expected().len(),
         })
         .sum()
+}
+
+/// A loaded replay registry in a temp directory, with its state directory.
+struct Prepared {
+    _tmp: tempfile::TempDir,
+    registry: LoadedRegistry,
+    state_dir: PathBuf,
+}
+
+/// Builds the components, writes the registry and the stored tokens, loads it.
+fn prepare(backend: &Backend, platforms: &[Platform]) -> miette::Result<Prepared> {
+    let tmp = tempfile::TempDir::new().map_err(|e| miette::miette!("tempdir: {e}"))?;
+    let (path, env) = build_registry(backend, platforms, tmp.path());
+    let state_dir = tmp.path().join(".fili-state");
+    provision_tokens(backend, platforms, &state_dir);
+    let registry = load_registry(&path, &env);
+    Ok(Prepared {
+        _tmp: tmp,
+        registry,
+        state_dir,
+    })
 }
 
 /// Runs the host over `platforms` into a unique scratch Fluvio topic, reads
@@ -270,17 +324,18 @@ async fn drive_fluvio(
 ) -> miette::Result<Vec<(String, SourceItem)>> {
     let topic = scratch_topic("replay").await?;
     let body = AssertUnwindSafe(async {
-        let tmp = tempfile::TempDir::new().map_err(|e| miette::miette!("tempdir: {e}"))?;
-        let (path, env) = build_registry(backend, platforms, tmp.path());
-        let state_dir = tmp.path().join(".fili-state");
-        provision_tokens(backend, platforms, &state_dir);
-        let registry = load_registry(&path, &env);
-
+        let prepared = prepare(backend, platforms)?;
         let want = expected_count(platforms);
         let sink = Arc::new(CountingSink::new(ready_sink(&topic).await?));
         let counted = Arc::clone(&sink);
-        let delivered =
-            run_host_until(&registry, &state_dir, sink, move || counted.delivered(), want).await?;
+        let delivered = run_host_until(
+            &prepared.registry,
+            &prepared.state_dir,
+            sink,
+            move || counted.delivered(),
+            want,
+        )
+        .await?;
         read_back(&topic, delivered).await
     })
     .catch_unwind()
@@ -294,6 +349,31 @@ async fn drive_fluvio(
         }
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// Like `drive_fluvio`, into an in-memory sink: no cluster, no topic. It runs
+/// the same host loop and the same per-plugin `disabled` check.
+async fn drive_memory(
+    backend: &Backend,
+    platforms: &[Platform],
+) -> miette::Result<Vec<(String, SourceItem)>> {
+    let prepared = prepare(backend, platforms)?;
+    let want = expected_count(platforms);
+    let sink = Arc::new(VecSink::default());
+    let counted = Arc::clone(&sink);
+    run_host_until(
+        &prepared.registry,
+        &prepared.state_dir,
+        Arc::clone(&sink),
+        move || counted.records().len(),
+        want,
+    )
+    .await?;
+    Ok(sink
+        .records()
+        .into_iter()
+        .map(|record| (record.key, record.item))
+        .collect())
 }
 
 // ── Expected Items, Computed From The Fixtures ───────────────────────────────
@@ -357,6 +437,48 @@ fn reddit_expected() -> Vec<Want> {
         .collect()
 }
 
+/// The YouTube items the playlist fixture must produce, oldest first by
+/// publication. Computed at test time from the fixture. The published value
+/// prefers `contentDetails.videoPublishedAt` over `snippet.publishedAt`.
+fn youtube_expected() -> Vec<Want> {
+    let page = read_json(&youtube_fixture());
+    let mut wanted: Vec<Want> = page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|entry| {
+            let snippet = &entry["snippet"];
+            let id = entry["contentDetails"]["videoId"]
+                .as_str()
+                .expect("videoId")
+                .to_string();
+            let published = entry["contentDetails"]["videoPublishedAt"]
+                .as_str()
+                .or_else(|| snippet["publishedAt"].as_str())
+                .expect("a publication time");
+            Want {
+                url: format!("https://www.youtube.com/watch?v={id}"),
+                id,
+                title: snippet["title"].as_str().map(str::to_string),
+                author: snippet["videoOwnerChannelTitle"]
+                    .as_str()
+                    .or_else(|| snippet["channelTitle"].as_str())
+                    .map(str::to_string),
+                published: crate::models::rfc3339_to_utc(published)
+                    .expect("fixture time is RFC 3339"),
+                text: snippet["description"]
+                    .as_str()
+                    .expect("description")
+                    .to_string(),
+                raw: snippet.clone(),
+            }
+        })
+        .collect();
+    // RFC 3339 UTC with fixed millisecond precision sorts as text.
+    wanted.sort_by(|a, b| a.published.cmp(&b.published));
+    wanted
+}
+
 /// Checks one landed record against `want` for `platform`.
 fn assert_item(platform: Platform, key: &str, item: &SourceItem, want: &Want) {
     let id = &want.id;
@@ -372,6 +494,7 @@ fn assert_item(platform: Platform, key: &str, item: &SourceItem, want: &Want) {
     let raw = item.raw.as_ref().unwrap_or_else(|| panic!("{id} has no raw"));
     match platform {
         Platform::Reddit => assert_eq!(raw["name"], want.raw["name"], "raw name of {id}"),
+        Platform::YouTube => assert_eq!(raw, &want.raw, "raw snippet of {id}"),
     }
 }
 
@@ -399,6 +522,7 @@ fn assert_replay_items(records: &[(String, SourceItem)], platforms: &[Platform])
             .collect();
         let wanted = match platform {
             Platform::Reddit => reddit_expected(),
+            Platform::YouTube => youtube_expected(),
         };
         assert_eq!(landed.len(), wanted.len(), "{} item count", platform.name());
         // Oldest first: `wanted` is sorted that way and landing order must match.
@@ -421,4 +545,127 @@ async fn e2e_replay_reddit_poll_lands_exact_items_in_a_scratch_topic() -> miette
     let records = drive_fluvio(&Backend::Replay, &platforms).await?;
     assert_replay_items(&records, &platforms);
     Ok(())
+}
+
+/// Both platforms in one host run: six records in one scratch topic, exact
+/// items per platform, no assertion on the order across platforms.
+#[tokio::test]
+async fn e2e_replay_reddit_and_youtube_land_exact_items_in_a_scratch_topic() -> miette::Result<()> {
+    if !fluvio_or_skip().await {
+        return Ok(());
+    }
+    let platforms = [Platform::Reddit, Platform::YouTube];
+    let records = drive_fluvio(&Backend::Replay, &platforms).await?;
+    assert_replay_items(&records, &platforms);
+    Ok(())
+}
+
+/// The same two-platform host run into an in-memory sink: no cluster and no
+/// skip. It needs the toolchain and runs wherever the components can be built.
+#[tokio::test]
+async fn e2e_replay_host_path_needs_no_cluster() -> miette::Result<()> {
+    let platforms = [Platform::Reddit, Platform::YouTube];
+    let records = drive_memory(&Backend::Replay, &platforms).await?;
+    assert_replay_items(&records, &platforms);
+    Ok(())
+}
+
+// ── Staleness Rule ────────────────────────────────────────────────────────────
+
+/// A crate laid out like `plugins/<name>` under a temp root, with the WIT at
+/// `<root>/wit`, every input at `base` and the wasm 100 s newer.
+struct StaleFixture {
+    _tmp: tempfile::TempDir,
+    crate_dir: PathBuf,
+    wasm: PathBuf,
+    wit: PathBuf,
+    extra: PathBuf,
+    base: std::time::SystemTime,
+}
+
+impl StaleFixture {
+    fn new() -> Self {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let crate_dir = tmp.path().join("plugins/demo");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("src dir");
+        std::fs::create_dir_all(tmp.path().join("wit")).expect("wit dir");
+        std::fs::create_dir_all(crate_dir.join("target/release")).expect("target dir");
+        let wasm = crate_dir.join("target/release/demo.wasm");
+        let wit = tmp.path().join("wit/host.wit");
+        let extra = tmp.path().join("fixture.json");
+        let base = std::time::SystemTime::now() - Duration::from_secs(10_000);
+        let inputs = [
+            crate_dir.join("src/lib.rs"),
+            crate_dir.join("src/bindings.rs"),
+            crate_dir.join("Cargo.toml"),
+            crate_dir.join("Cargo.lock"),
+            wit.clone(),
+            extra.clone(),
+        ];
+        for file in inputs.iter().chain([&wasm]) {
+            std::fs::write(file, b"x").expect("write file");
+        }
+        let fixture = Self {
+            _tmp: tmp,
+            crate_dir,
+            wasm,
+            wit,
+            extra,
+            base,
+        };
+        for file in &inputs {
+            fixture.touch(file, 0);
+        }
+        fixture.touch(&fixture.wasm, 100);
+        fixture
+    }
+
+    /// Sets the modification time of `file` to `base` plus `secs`.
+    fn touch(&self, file: &Path, secs: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file)
+            .expect("open for write")
+            .set_modified(self.base + Duration::from_secs(secs))
+            .expect("set modified time");
+    }
+
+    fn stale(&self) -> bool {
+        is_stale(&self.crate_dir, &self.wasm, std::slice::from_ref(&self.extra))
+    }
+}
+
+#[test]
+fn e2e_replay_staleness_ignores_generated_bindings() {
+    let fixture = StaleFixture::new();
+    assert!(!fixture.stale(), "a fresh wasm is not stale");
+
+    // cargo-component rewrites `src/bindings.rs` on every build: newer than
+    // the wasm must still read as fresh.
+    fixture.touch(&fixture.crate_dir.join("src/bindings.rs"), 200);
+    assert!(!fixture.stale(), "only src/bindings.rs is newer");
+}
+
+#[test]
+fn e2e_replay_staleness_sees_a_newer_source_or_fixture() {
+    let fixture = StaleFixture::new();
+    std::fs::remove_file(&fixture.wasm).expect("remove wasm");
+    assert!(fixture.stale(), "a missing wasm is stale");
+
+    let newer_inputs = |fixture: &StaleFixture| {
+        vec![
+            fixture.crate_dir.join("src/lib.rs"),
+            fixture.crate_dir.join("Cargo.toml"),
+            fixture.crate_dir.join("Cargo.lock"),
+            fixture.wit.clone(),
+            fixture.extra.clone(),
+        ]
+    };
+    for index in 0..newer_inputs(&fixture).len() {
+        let fixture = StaleFixture::new();
+        assert!(!fixture.stale());
+        let newer = newer_inputs(&fixture).remove(index);
+        fixture.touch(&newer, 300);
+        assert!(fixture.stale(), "{} is newer than the wasm", newer.display());
+    }
 }
