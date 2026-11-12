@@ -1,0 +1,1 @@
+No external API integration: Phase 8 adds no Reddit or YouTube API capability; it replays recorded fixtures and, only when credentials exist, exercises the listing and playlist endpoints the finished Phase 7 plugins already integrate, and it adds authoring documentation, a template crate and a replay fetcher component.

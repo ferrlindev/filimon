@@ -38,17 +38,25 @@ created: "2026-11-12"
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 08-XX-XX | — | — | TEST-02 | — | Reddit + YouTube replay lands exact `SourceItem`s in a scratch Fluvio topic | integration (needs cluster, skips otherwise) | `cargo test -p filimon e2e_replay_ -- --nocapture` | ❌ W0 | ⬜ pending |
-| 08-XX-XX | — | — | TEST-02 | — | Missing cluster skips with a clear message | integration | same, run with Fluvio stopped (manual) | ❌ W0 | ⬜ pending |
-| 08-XX-XX | — | — | TEST-03 | — | Same body against real APIs; skips with `skipped: missing <KEY>` | integration | `cargo test -p filimon e2e_credentialed_ -- --nocapture` | ❌ W0 | ⬜ pending |
-| 08-XX-XX | — | — | TEST-04 | — | Enriched social + news JSON from a real run | manual-only (D-07) | `scripts/live-e2e.sh` | ❌ W0 | ⬜ pending |
-| 08-XX-XX | — | — | WIT-03 | — | Out-of-repo plugin builds against only the WIT and runs in an unmodified `fili` | script | `scripts/verify-authoring.sh` | ❌ W0 | ⬜ pending |
-| 08-XX-XX | — | — | DOCS-01 | — | Template builds in-repo as-is and via guide steps | build | `(cd plugins/template && cargo component build --release)` and the script | ❌ W0 | ⬜ pending |
-| 08-XX-XX | — | — | DOCS-02 | — | Fetcher built by following the guide serves a source's requests | script | `scripts/verify-authoring.sh` (fetcher leg) | ❌ W0 | ⬜ pending |
+| 08-01-01 | 01 | 1 | TEST-02 | T-08-01, T-08-02 | Reddit replay through the replay fetcher lands the exact `SourceItem`s in a scratch Fluvio topic; replay fetcher logs fixed text only | integration (needs cluster, skips otherwise) | `FILI_TEST_REQUIRE_FLUVIO=1 cargo test -p filimon e2e_replay_reddit` | ❌ W0 | ⬜ pending |
+| 08-01-02 | 01 | 1 | TEST-02 | T-08-01 | Reddit and YouTube replay in one host run; same assertion on a Fluvio sink and an in-memory sink; staleness rule | integration + unit | `FILI_TEST_REQUIRE_FLUVIO=1 cargo test -p filimon e2e_replay_` | ❌ W0 | ⬜ pending |
+| 08-01-02 | 01 | 1 | TEST-02 | — | Missing cluster skips with a clear message | manual (`<human-check>`: stop the cluster, run `cargo test -p filimon e2e_replay_ -- --nocapture`) | same, run with Fluvio stopped (manual) | ❌ W0 | ⬜ pending |
+| 08-04-01 | 04 | 2 | TEST-03 | T-08-14, T-08-17 | Gate names the first missing key with `skipped: missing <KEY>`; env layering; literal `.env` values | unit (no cluster, no network) | `env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY -u REDDIT_USER_AGENT_CONTACT cargo test -p filimon e2e_credentialed_` | ❌ W0 | ⬜ pending |
+| 08-04-02 | 04 | 2 | TEST-03 | T-08-14, T-08-15, T-08-16 | Same host body against real APIs with credentials; skips cleanly without them; no secret in the temp registry | integration (credential-gated) | `env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY -u REDDIT_USER_AGENT_CONTACT FILI_TEST_ENV_FILE=/dev/null cargo test -p filimon e2e_credentialed_ -- --nocapture` (skip path); live path is run by 08-06-03 | ❌ W0 | ⬜ pending |
+| 08-04-03 | 04 | 2 | TEST-02, TEST-03 | — | Test groups, env vars, replay-fetcher and template documented in `plugins/README.md` | doc gate | grep chain in the task's verify block | ❌ W0 | ⬜ pending |
+| 08-03-01 | 03 | 1 | TEST-04 | T-08-10, T-08-13 | Preflight names unmet prerequisites; D-09 stop with exit 3; no secret printed | script | `ENV_FILE=<empty file> scripts/live-e2e.sh preflight` (exit 3) | ❌ W0 | ⬜ pending |
+| 08-03-02 | 03 | 1 | TEST-04 | T-08-10 | Sanitiser, secret scan, evidence check and waiver rule proven on synthetic data | script (hermetic) | `scripts/live-e2e.sh selftest` | ❌ W0 | ⬜ pending |
+| 08-06-03 | 06 | 3 | TEST-04, TEST-03 | T-08-22, T-08-23 | Enriched social + news JSON from a real run; credentialed tests pass with real keys | manual-only (D-07) | `scripts/live-e2e.sh run`, then `scripts/live-e2e.sh check-evidence <evidence dir>` | ❌ W0 | ⬜ pending |
+| 08-02-01 | 02 | 1 | WIT-03, DOCS-01 | T-08-08 | Template builds in-repo as-is; out-of-repo build against only the WIT runs in an unmodified `fili` | build + script | `(cd plugins/template && cargo component build --release)` and `scripts/verify-authoring.sh` | ❌ W0 | ⬜ pending |
+| 08-02-02 | 02 | 1 | WIT-03 | T-08-06, T-08-07 | Remote distribution path (sparse clone at a ref), cleanup and refusal guards | script (hermetic remote via a throwaway bare clone) | `WIT_REPO=file://<bare clone> WIT_REF=<tag> scripts/verify-authoring.sh` (command in the task) | ❌ W0 | ⬜ pending |
+| 08-05-02 | 05 | 2 | DOCS-02 | T-08-18 | Fetcher built by following the guide serves a source's requests; unmatched 404; assignment removed gives no canned answer | script | `scripts/verify-authoring.sh` (fetcher leg) | ❌ W0 | ⬜ pending |
+| 08-05-03 | 05 | 2 | DOCS-01, DOCS-02 | T-08-18, T-08-19 | Guide headings, tag line, identical sparse-checkout command, trust statement, no dead links | doc gate | grep and link-check commands in the task's verify block | ❌ W0 | ⬜ pending |
+| 08-07-01 | 07 | 3 | WIT-03 | T-08-26 | Tag exists locally and on origin; the proof runs from the tag | script (network) | `WIT_REF=<tag> scripts/verify-authoring.sh` | ❌ W0 | ⬜ pending |
+| 08-07-02 | 07 | 3 | WIT-03 | — | The user runs the authoring proof once (SC4, D-12) | manual-only | `scripts/verify-authoring.sh` run by the user; transcripts committed | ❌ W0 | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
-*Task IDs are filled in by the planner once plans exist.*
+*Task IDs are `08-<plan>-<task>`; filled in by the planner on 2026-11-12. Task 08-01-03 (build-tool policy), 08-05-01 (tag name and walkthrough shape) and 08-06-02 (Reddit waiver) are decision checkpoints with nothing to run.*
 
 ---
 
