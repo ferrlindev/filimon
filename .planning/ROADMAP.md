@@ -250,7 +250,7 @@ Plans:
   3. A live end-to-end run works: `fili` loads the Reddit and YouTube plugins, polls the real APIs, and records flow through Fluvio. The consumer writes NER-enriched social records alongside news articles in the same JSON output.
   4. Using only the plugin template and guide, a source plugin built with `cargo component` in a directory outside the filimon repo, against only the published WIT, is registered in `filimon.toml` and runs in an unmodified `fili` binary.
   5. The guide covers writing a fetcher plugin and assigning it to a source, and a fetcher built by following it serves that source's requests.
-**Plans:** 3/7 plans executed
+**Plans:** 4/7 plans executed
 
 Plans:
 **Wave 1**
@@ -259,7 +259,7 @@ Plans:
 - [x] 08-03-PLAN.md — `scripts/live-e2e.sh` runbook for the human-run live E2E: preflight with the D-09 Reddit stop, sanitiser, secret scan, evidence check and a hermetic self-test (TEST-04)
 
 **Wave 2** *(blocked on Wave 1 completion)*
-- [ ] 08-04-PLAN.md — Credential-gated live mode on the same test body (`skipped: missing <KEY>`), root `.env.example`, and the README test-group documentation (TEST-03)
+- [x] 08-04-PLAN.md — Credential-gated live mode on the same test body (`skipped: missing <KEY>`), root `.env.example`, and the README test-group documentation (TEST-03)
 - [ ] 08-05-PLAN.md — Fetcher leg of the authoring proof, and `docs/plugin-guide.md` for source and fetcher plugins pinned to a confirmed WIT tag; contains a decision checkpoint (DOCS-01, DOCS-02, WIT-03)
 
 **Wave 3** *(blocked on Wave 2; human-action checkpoints)*
@@ -280,4 +280,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
 | 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
 | 7. Reddit & YouTube Plugins | 12/12 | Complete    | 2026-11-12 |
-| 8. Integration, Live E2E & Authoring | 3/7 | In Progress | - |
+| 8. Integration, Live E2E & Authoring | 4/7 | In Progress | - |
