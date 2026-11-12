@@ -64,6 +64,68 @@ async fn fluvio_or_skip() -> bool {
     false
 }
 
+// ── Credential Gating ─────────────────────────────────────────────────────────
+
+/// The environment variable that points the credential lookup at another
+/// dotenv file (a verification run can force the skip path with it).
+const ENV_FILE_VAR: &str = "FILI_TEST_ENV_FILE";
+
+/// The credential keys the live tests read.
+const LIVE_KEYS: [&str; 4] = [
+    "REDDIT_CLIENT_ID",
+    "REDDIT_CLIENT_SECRET",
+    "REDDIT_USER_AGENT_CONTACT",
+    "YOUTUBE_API_KEY",
+];
+
+/// The first of `keys` whose value is absent or the empty string.
+fn missing_key<'a>(keys: &[&'a str], env: &dyn Fn(&str) -> Option<String>) -> Option<&'a str> {
+    keys.iter()
+        .copied()
+        .find(|key| env(key).is_none_or(|value| value.is_empty()))
+}
+
+/// The line a credentialed test prints when it skips. It names the key only.
+fn skip_line(key: &str) -> String {
+    format!("skipped: missing {key}")
+}
+
+/// The non-empty process value of `key`, else the non-empty dotenv value.
+fn lookup_env(
+    key: &str,
+    process: &dyn Fn(&str) -> Option<String>,
+    dotenv: &HashMap<String, String>,
+) -> Option<String> {
+    process(key)
+        .filter(|value| !value.is_empty())
+        .or_else(|| dotenv.get(key).filter(|value| !value.is_empty()).cloned())
+}
+
+/// The live credentials: the process environment over the dotenv file at
+/// `path`. The file is read by the repository's literal parser; a file it
+/// rejects counts as absent and only a fixed note is printed, because the
+/// parser's diagnostics name lines.
+fn load_live_env_from(path: &Path) -> HashMap<String, String> {
+    let dotenv = crate::plugins::secrets::read_dotenv(path).unwrap_or_else(|_| {
+        eprintln!("note: the dotenv file could not be read; using the process environment only");
+        HashMap::new()
+    });
+    let process = |key: &str| std::env::var(key).ok();
+    LIVE_KEYS
+        .iter()
+        .filter_map(|key| lookup_env(key, &process, &dotenv).map(|value| ((*key).to_string(), value)))
+        .collect()
+}
+
+/// `load_live_env_from` over `FILI_TEST_ENV_FILE`, else `<repo root>/.env`.
+fn load_live_env() -> HashMap<String, String> {
+    let path = match std::env::var(ENV_FILE_VAR) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => repo_root().join(".env"),
+    };
+    load_live_env_from(&path)
+}
+
 // ── Platforms And Backends ────────────────────────────────────────────────────
 
 /// A source platform under test.
@@ -685,4 +747,93 @@ fn e2e_replay_staleness_sees_a_newer_source_or_fixture() {
             newer.display()
         );
     }
+}
+
+// ── Credential Gating Tests ───────────────────────────────────────────────────
+
+fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+#[test]
+fn e2e_credentialed_gate_names_the_first_missing_key() {
+    let keys = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"];
+    let none = env_of(&[]);
+    assert_eq!(
+        missing_key(&keys, &|key| none.get(key).cloned()),
+        Some("REDDIT_CLIENT_ID")
+    );
+    let only_id = env_of(&[("REDDIT_CLIENT_ID", "id")]);
+    assert_eq!(
+        missing_key(&keys, &|key| only_id.get(key).cloned()),
+        Some("REDDIT_CLIENT_SECRET")
+    );
+}
+
+#[test]
+fn e2e_credentialed_gate_treats_an_empty_value_as_missing() {
+    let keys = ["YOUTUBE_API_KEY"];
+    let empty = env_of(&[("YOUTUBE_API_KEY", "")]);
+    assert_eq!(
+        missing_key(&keys, &|key| empty.get(key).cloned()),
+        Some("YOUTUBE_API_KEY")
+    );
+}
+
+#[test]
+fn e2e_credentialed_gate_passes_when_every_key_is_present() {
+    let keys = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"];
+    let full = env_of(&[("REDDIT_CLIENT_ID", "id"), ("REDDIT_CLIENT_SECRET", "secret")]);
+    assert_eq!(missing_key(&keys, &|key| full.get(key).cloned()), None);
+}
+
+#[test]
+fn e2e_credentialed_skip_line_has_the_documented_text() {
+    assert_eq!(
+        skip_line("REDDIT_CLIENT_ID"),
+        "skipped: missing REDDIT_CLIENT_ID"
+    );
+}
+
+#[test]
+fn e2e_credentialed_process_env_wins_over_dotenv_and_an_empty_value_falls_back() {
+    let dotenv = env_of(&[("A", "from-dotenv"), ("B", "from-dotenv")]);
+    let process_values = env_of(&[("A", "from-process"), ("B", "")]);
+    let process = |key: &str| process_values.get(key).cloned();
+    assert_eq!(
+        lookup_env("A", &process, &dotenv).as_deref(),
+        Some("from-process")
+    );
+    assert_eq!(
+        lookup_env("B", &process, &dotenv).as_deref(),
+        Some("from-dotenv")
+    );
+    assert_eq!(lookup_env("C", &process, &dotenv), None);
+}
+
+#[test]
+fn e2e_credentialed_dotenv_values_are_taken_literally() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let good = dir.path().join("good.env");
+    std::fs::write(&good, "FILI_TEST_LITERAL_KEY='a$b'\n").expect("write dotenv");
+    let dotenv = crate::plugins::secrets::read_dotenv(&good).expect("literal dotenv parses");
+    assert_eq!(
+        dotenv.get("FILI_TEST_LITERAL_KEY").map(String::as_str),
+        Some("a$b")
+    );
+    // The layering keeps the literal value when the process has none.
+    let layered = lookup_env("FILI_TEST_LITERAL_KEY", &|_| None, &dotenv);
+    assert_eq!(layered.as_deref(), Some("a$b"));
+
+    // A file the parser rejects loads as an empty map (and prints a fixed note).
+    let bad = dir.path().join("bad.env");
+    std::fs::write(&bad, "YOUTUBE_API_KEY=a$b\n").expect("write dotenv");
+    let env = load_live_env_from(&bad);
+    assert!(
+        !env.values().any(|value| value.contains("a$b")),
+        "a rejected dotenv file contributes nothing"
+    );
 }
