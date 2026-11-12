@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -88,6 +88,178 @@ pub fn write_registry(dir: &Path, sources: &[TestSource]) -> PathBuf {
     let path = dir.join("filimon.toml");
     std::fs::write(&path, registry).expect("write registry");
     path
+}
+
+/// One source for `write_registry_ext`: a `TestSource` that can also name an
+/// assigned fetcher, an allowlist, secrets and a `[host.oauth]` table.
+pub(crate) struct ExtSource {
+    pub(crate) name: String,
+    pub(crate) component: PathBuf,
+    pub(crate) interval_secs: u64,
+    /// The `[fetchers.<name>]` entry this source is assigned to, if any.
+    pub(crate) fetcher: Option<String>,
+    pub(crate) allowlist: Vec<String>,
+    /// `(alias, env var)` pairs placed under `[host.secrets]`.
+    pub(crate) secrets: Vec<(String, String)>,
+    /// Raw TOML placed under `[host.oauth]`, when set.
+    pub(crate) oauth: Option<String>,
+    /// Text placed under `[settings]`.
+    pub(crate) settings: String,
+}
+
+/// Writes `filimon.toml` and one `<name>.toml` per source into `dir`, plus one
+/// `[fetchers.<name>]` table per entry of `fetchers` (`(name, component)`).
+pub(crate) fn write_registry_ext(
+    dir: &Path,
+    sources: &[ExtSource],
+    fetchers: &[(String, PathBuf)],
+) -> PathBuf {
+    let mut registry = String::new();
+    for source in sources {
+        registry.push_str(&format!(
+            "[sources.{name}]\ncomponent = {component:?}\nconfig = \"{name}.toml\"\nenabled = true\n",
+            name = source.name,
+            component = source.component.display().to_string(),
+        ));
+        if let Some(fetcher) = &source.fetcher {
+            registry.push_str(&format!("fetcher = {fetcher:?}\n"));
+        }
+        registry.push('\n');
+
+        let allowlist: Vec<String> = source
+            .allowlist
+            .iter()
+            .map(|host| format!("{host:?}"))
+            .collect();
+        let mut plugin = format!(
+            "[host]\npoll_interval_secs = {}\nallowlist = [{}]\n",
+            source.interval_secs,
+            allowlist.join(", ")
+        );
+        if !source.secrets.is_empty() {
+            plugin.push_str("\n[host.secrets]\n");
+            for (alias, env_var) in &source.secrets {
+                plugin.push_str(&format!("{alias} = {env_var:?}\n"));
+            }
+        }
+        if let Some(oauth) = &source.oauth {
+            plugin.push_str(&format!("\n[host.oauth]\n{oauth}\n"));
+        }
+        plugin.push_str(&format!("\n[settings]\n{}\n", source.settings));
+        std::fs::write(dir.join(format!("{}.toml", source.name)), plugin)
+            .expect("write plugin toml");
+    }
+    for (name, component) in fetchers {
+        registry.push_str(&format!(
+            "[fetchers.{name}]\ncomponent = {:?}\n\n",
+            component.display().to_string()
+        ));
+    }
+    let path = dir.join("filimon.toml");
+    std::fs::write(&path, registry).expect("write registry");
+    path
+}
+
+/// The newest modification time of `path`: the file's own, or for a directory
+/// the newest of its files (recursively), skipping `skip` by file name at any
+/// depth. `None` when nothing under `path` can be read.
+fn newest_mtime(path: &Path, skip: &str) -> Option<std::time::SystemTime> {
+    if path.file_name().is_some_and(|name| name == skip) {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return meta.modified().ok();
+    }
+    std::fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| newest_mtime(&entry.path(), skip))
+        .max()
+}
+
+/// True when `wasm` is missing or older than the newest input of its crate:
+/// every file under `src/` except the generated `src/bindings.rs`,
+/// `Cargo.toml`, `Cargo.lock`, every file under `../../wit` and `extra_inputs`
+/// (for example the fixtures a component embeds).
+///
+/// `src/bindings.rs` is excluded on purpose: cargo-component rewrites it on
+/// every build, so counting it would report stale forever.
+pub(crate) fn is_stale(crate_dir: &Path, wasm: &Path, extra_inputs: &[PathBuf]) -> bool {
+    let Ok(built) = std::fs::metadata(wasm).and_then(|meta| meta.modified()) else {
+        return true;
+    };
+    let mut inputs = vec![
+        crate_dir.join("src"),
+        crate_dir.join("Cargo.toml"),
+        crate_dir.join("Cargo.lock"),
+        crate_dir.join("../../wit"),
+    ];
+    inputs.extend(extra_inputs.iter().cloned());
+    inputs
+        .iter()
+        .filter_map(|input| newest_mtime(input, "bindings.rs"))
+        .any(|modified| modified > built)
+}
+
+/// The component `plugins/<crate_dir>/target/wasm32-unknown-unknown/release/<wasm>`,
+/// built with `cargo component build --release` when it is missing or stale
+/// (D-03), so `cargo test` does not depend on a hand-run build step.
+///
+/// Builds are serialised process-wide: the parallel test runner would
+/// otherwise start two builds of one crate at once. A missing toolchain is a
+/// loud failure naming the install command, never a skip: a skipped test reads
+/// as a pass, so a broken environment would hide.
+pub(crate) fn ensure_built(crate_dir: &str, wasm: &str, extra_inputs: &[PathBuf]) -> PathBuf {
+    static VERIFIED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{crate_dir}/{wasm}");
+    let crate_path = repo_root().join("plugins").join(crate_dir);
+    let wasm_path = crate_path
+        .join("target/wasm32-unknown-unknown/release")
+        .join(wasm);
+
+    // The guard is held across the build.
+    let mut verified = VERIFIED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if verified.contains(&key) && wasm_path.is_file() {
+        return wasm_path;
+    }
+    if is_stale(&crate_path, &wasm_path, extra_inputs) {
+        let install = "cargo +stable install cargo-component@0.21.1 --locked";
+        let status = std::process::Command::new("cargo")
+            .args(["component", "build", "--release"])
+            .current_dir(&crate_path)
+            // The test run exports toolchain and target settings that would
+            // override the crate's own pin and target directory.
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .status()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "could not start `cargo component build --release` in {}: {e}; \
+                     install the tool with `{install}` (see plugins/README.md)",
+                    crate_path.display()
+                )
+            });
+        assert!(
+            status.success(),
+            "`cargo component build --release` failed in {} ({status}); \
+             the tool is installed with `{install}` (see plugins/README.md)",
+            crate_path.display()
+        );
+    }
+    assert!(
+        wasm_path.is_file(),
+        "the build in {} did not produce {}",
+        crate_path.display(),
+        wasm_path.display()
+    );
+    verified.insert(key);
+    wasm_path
 }
 
 /// Loads a test registry, panicking with the rendered error on failure.
