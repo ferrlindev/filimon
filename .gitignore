@@ -26,6 +26,7 @@ Thumbs.db
 
 # ── Plugin host cursor state (written next to a registry) ──────────────────────
 .fili-state/
+.live-e2e/
 
 # ── Docker ─────────────────────────────────────────────────────────────────────
 docker-compose.override.yaml
