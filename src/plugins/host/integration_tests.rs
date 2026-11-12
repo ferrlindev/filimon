@@ -113,7 +113,9 @@ fn load_live_env_from(path: &Path) -> HashMap<String, String> {
     let process = |key: &str| std::env::var(key).ok();
     LIVE_KEYS
         .iter()
-        .filter_map(|key| lookup_env(key, &process, &dotenv).map(|value| ((*key).to_string(), value)))
+        .filter_map(|key| {
+            lookup_env(key, &process, &dotenv).map(|value| ((*key).to_string(), value))
+        })
         .collect()
 }
 
@@ -150,7 +152,29 @@ impl Platform {
 enum Backend {
     /// Frozen fixtures served by the replay-fetcher component.
     Replay,
+    /// The real APIs, reached through the http fetcher component. Carries the
+    /// live credentials (see `load_live_env`).
+    Live(HashMap<String, String>),
 }
+
+impl Backend {
+    /// The scratch-topic label of this backend.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Replay => "replay",
+            Self::Live(_) => "live",
+        }
+    }
+}
+
+/// The contact the live Reddit source puts in its User-Agent by default.
+const DEFAULT_CONTACT: &str = "u/filimon-integration-test";
+
+/// The Reddit token endpoint the host calls for the app-only grant.
+const REDDIT_TOKEN_URL: &str = "https://www.reddit.com/api/v1/access_token";
+
+/// A YouTube channel the live poll reads.
+const LIVE_YOUTUBE_CHANNEL: &str = "UC_x5XG1OV2P6uZZ5FSM9Ttw";
 
 fn reddit_fixture() -> PathBuf {
     repo_root().join("plugins/reddit/tests/fixtures/listing_new.json")
@@ -171,7 +195,9 @@ fn build_registry(
     platforms: &[Platform],
     dir: &Path,
 ) -> (PathBuf, HashMap<String, String>) {
-    let Backend::Replay = backend;
+    if let Backend::Live(live) = backend {
+        return build_live_registry(live, platforms, dir);
+    }
     let mut env = HashMap::new();
 
     // Both fixtures are inputs: editing either one rebuilds the component.
@@ -224,9 +250,76 @@ fn build_registry(
     (path, env)
 }
 
+/// The live registry: the http fetcher component, one app-only source per
+/// platform. The public client id is the only credential-derived value written
+/// to a file; the secrets travel only in the returned env map, which the
+/// loader reads through its closure. No stored token is written: the host
+/// fetches the app token itself.
+fn build_live_registry(
+    live: &HashMap<String, String>,
+    platforms: &[Platform],
+    dir: &Path,
+) -> (PathBuf, HashMap<String, String>) {
+    let mut env = HashMap::new();
+    let http = ensure_built("http-fetcher", "http_fetcher.wasm", &[]);
+    let mut sources = Vec::new();
+    for platform in platforms {
+        match platform {
+            Platform::Reddit => {
+                let client_id = live.get("REDDIT_CLIENT_ID").cloned().unwrap_or_default();
+                let contact = live
+                    .get("REDDIT_USER_AGENT_CONTACT")
+                    .filter(|value| !value.is_empty())
+                    .map_or(DEFAULT_CONTACT, String::as_str);
+                if let Some(secret) = live.get("REDDIT_CLIENT_SECRET") {
+                    env.insert("REDDIT_CLIENT_SECRET".to_string(), secret.clone());
+                }
+                sources.push(ExtSource {
+                    name: "reddit".to_string(),
+                    component: ensure_built("reddit", "reddit_source.wasm", &[]),
+                    interval_secs: 3600,
+                    fetcher: Some("http".to_string()),
+                    allowlist: vec!["oauth.reddit.com".to_string()],
+                    secrets: vec![],
+                    oauth: Some(format!(
+                        "grant = \"client_credentials\"\n\
+                         token_url = \"{REDDIT_TOKEN_URL}\"\n\
+                         client_id = {client_id:?}\n\
+                         client_secret_env = \"REDDIT_CLIENT_SECRET\""
+                    )),
+                    settings: format!(
+                        "subreddits = [\"rust\"]\n\
+                         listings = [\"new\"]\n\
+                         user_agent_contact = {contact:?}"
+                    ),
+                });
+            }
+            Platform::YouTube => {
+                if let Some(key) = live.get("YOUTUBE_API_KEY") {
+                    env.insert("YOUTUBE_API_KEY".to_string(), key.clone());
+                }
+                sources.push(ExtSource {
+                    name: "youtube".to_string(),
+                    component: ensure_built("youtube", "youtube_source.wasm", &[]),
+                    interval_secs: 3600,
+                    fetcher: Some("http".to_string()),
+                    allowlist: vec!["www.googleapis.com".to_string()],
+                    secrets: vec![("api_key".to_string(), "YOUTUBE_API_KEY".to_string())],
+                    oauth: None,
+                    settings: format!("channels = [\"{LIVE_YOUTUBE_CHANNEL}\"]"),
+                });
+            }
+        }
+    }
+    let path = write_registry_ext(dir, &sources, &[("http".to_string(), http)]);
+    (path, env)
+}
+
 /// Pre-writes the stored tokens the replayed sources are handed.
 fn provision_tokens(backend: &Backend, platforms: &[Platform], state_dir: &Path) {
-    let Backend::Replay = backend;
+    if matches!(backend, Backend::Live(_)) {
+        return;
+    }
     for platform in platforms {
         match platform {
             Platform::Reddit => {
@@ -238,13 +331,27 @@ fn provision_tokens(backend: &Backend, platforms: &[Platform], state_dir: &Path)
     }
 }
 
-fn load_registry(path: &Path, env: &HashMap<String, String>) -> LoadedRegistry {
+fn load_registry(backend: &Backend, path: &Path, env: &HashMap<String, String>) -> LoadedRegistry {
     load_registry_with_env(path, &|key| env.get(key).cloned()).unwrap_or_else(|e| {
+        // A live registry carries credentials: its failure text is fixed.
+        assert!(
+            !matches!(backend, Backend::Live(_)),
+            "the live registry failed to load"
+        );
         panic!(
             "replay registry failed to load: {:?}",
             miette::Report::new(e)
         );
     })
+}
+
+/// The number of records a run waits for: the whole fixture for a replay, the
+/// first page (at least one record) for a live poll.
+fn want_count(backend: &Backend, platforms: &[Platform]) -> usize {
+    match backend {
+        Backend::Replay => expected_count(platforms),
+        Backend::Live(_) => 1,
+    }
 }
 
 // ── Host Run ──────────────────────────────────────────────────────────────────
@@ -369,7 +476,7 @@ fn prepare(backend: &Backend, platforms: &[Platform]) -> miette::Result<Prepared
     let (path, env) = build_registry(backend, platforms, tmp.path());
     let state_dir = tmp.path().join(".fili-state");
     provision_tokens(backend, platforms, &state_dir);
-    let registry = load_registry(&path, &env);
+    let registry = load_registry(backend, &path, &env);
     Ok(Prepared {
         _tmp: tmp,
         registry,
@@ -384,10 +491,10 @@ async fn drive_fluvio(
     backend: &Backend,
     platforms: &[Platform],
 ) -> miette::Result<Vec<(String, SourceItem)>> {
-    let topic = scratch_topic("replay").await?;
+    let topic = scratch_topic(backend.label()).await?;
     let body = AssertUnwindSafe(async {
         let prepared = prepare(backend, platforms)?;
-        let want = expected_count(platforms);
+        let want = want_count(backend, platforms);
         let sink = Arc::new(CountingSink::new(ready_sink(&topic).await?));
         let counted = Arc::clone(&sink);
         let delivered = run_host_until(
@@ -603,6 +710,55 @@ fn assert_replay_items(records: &[(String, SourceItem)], platforms: &[Platform])
     }
 }
 
+// ── Live Structure Check ──────────────────────────────────────────────────────
+
+/// The earliest `published` a live item may carry (Reddit's launch).
+const PUBLISHED_FLOOR: &str = "2005-06-23T00:00:00Z";
+
+/// How far past now a `published` value may lie (clock skew allowance).
+const PUBLISHED_CEILING_HOURS: i64 = 6;
+
+/// The structure-only assertion for live records: the first problem found, as
+/// a fixed text naming the platform and at most an index, never a record, a
+/// request, a response or a header. `None` when every record is well formed.
+fn live_structure_problem(records: &[(String, SourceItem)], platform: Platform) -> Option<String> {
+    let name = platform.name();
+    if records.is_empty() {
+        return Some(format!("{name}: no records were delivered"));
+    }
+    let floor = chrono::DateTime::parse_from_rfc3339(PUBLISHED_FLOOR).expect("floor is RFC 3339");
+    let ceiling = chrono::Utc::now() + chrono::Duration::hours(PUBLISHED_CEILING_HOURS);
+    for (index, (key, item)) in records.iter().enumerate() {
+        if item.platform != name {
+            return Some(format!("{name}: record {index} has the wrong platform"));
+        }
+        if item.source_type != SourceType::Social {
+            return Some(format!("{name}: record {index} is not a social item"));
+        }
+        if item.id.is_empty() || *key != format!("{name}:{}", item.id) {
+            return Some(format!("{name}: record {index} has a wrong key or id"));
+        }
+        if platform == Platform::Reddit && !item.id.starts_with("t3_") {
+            return Some(format!("{name}: record {index} id lacks the t3_ prefix"));
+        }
+        if !item.url.starts_with("https://") {
+            return Some(format!("{name}: record {index} url is not https"));
+        }
+        if let Some(published) = &item.published {
+            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(published) else {
+                return Some(format!("{name}: record {index} published is malformed"));
+            };
+            if parsed < floor {
+                return Some(format!("{name}: record {index} published is too early"));
+            }
+            if parsed > ceiling {
+                return Some(format!("{name}: record {index} published is in the future"));
+            }
+        }
+    }
+    None
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// The tracer: one Reddit poll, replayed, lands exactly the fixture's three
@@ -639,6 +795,160 @@ async fn e2e_replay_host_path_needs_no_cluster() -> miette::Result<()> {
     let records = drive_memory(&Backend::Replay, &platforms).await?;
     assert_replay_items(&records, &platforms);
     Ok(())
+}
+
+// ── Live Tests ────────────────────────────────────────────────────────────────
+
+/// The credential keys a platform's live poll needs, in the order the gate
+/// reports them.
+fn live_keys(platform: Platform) -> &'static [&'static str] {
+    match platform {
+        Platform::Reddit => &["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"],
+        Platform::YouTube => &["YOUTUBE_API_KEY"],
+    }
+}
+
+/// One first poll of `platform` against the real API into a scratch topic.
+/// Skips (returns before anything is built or any cluster is touched) when a
+/// key is missing. The failure text is fixed: it never carries a request, a
+/// response, a header or an item.
+async fn run_live_poll(platform: Platform) -> miette::Result<()> {
+    let env = load_live_env();
+    if let Some(key) = missing_key(live_keys(platform), &|key| env.get(key).cloned()) {
+        eprintln!("{}", skip_line(key));
+        return Ok(());
+    }
+    if !fluvio_or_skip().await {
+        return Ok(());
+    }
+    let name = platform.name();
+    let records = drive_fluvio(&Backend::Live(env), &[platform])
+        .await
+        .map_err(|_| miette::miette!("the live {name} poll failed"))?;
+    if let Some(problem) = live_structure_problem(&records, platform) {
+        return Err(miette::miette!("{problem}"));
+    }
+    Ok(())
+}
+
+/// One live first poll of the app-only Reddit instance.
+#[tokio::test]
+async fn e2e_credentialed_reddit_live_poll_has_the_expected_structure() -> miette::Result<()> {
+    run_live_poll(Platform::Reddit).await
+}
+
+/// One live first poll of the API-key `YouTube` instance.
+#[tokio::test]
+async fn e2e_credentialed_youtube_live_poll_has_the_expected_structure() -> miette::Result<()> {
+    run_live_poll(Platform::YouTube).await
+}
+
+/// No file of the live registry holds a secret; the public client id may be
+/// there. Needs no network and no cluster.
+#[test]
+fn e2e_credentialed_registry_files_hold_no_secret_value() {
+    const FAKE_ID: &str = "fake-public-client-id";
+    const FAKE_SECRET: &str = "fake-client-secret-value";
+    const FAKE_KEY: &str = "fake-api-key-value";
+    let live = env_of(&[
+        ("REDDIT_CLIENT_ID", FAKE_ID),
+        ("REDDIT_CLIENT_SECRET", FAKE_SECRET),
+        ("REDDIT_USER_AGENT_CONTACT", "u/tester"),
+        ("YOUTUBE_API_KEY", FAKE_KEY),
+    ]);
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (_, env) = build_registry(
+        &Backend::Live(live),
+        &[Platform::Reddit, Platform::YouTube],
+        tmp.path(),
+    );
+    // The secrets reach the loader only through this map.
+    assert_eq!(
+        env.get("REDDIT_CLIENT_SECRET").map(String::as_str),
+        Some(FAKE_SECRET)
+    );
+    assert_eq!(
+        env.get("YOUTUBE_API_KEY").map(String::as_str),
+        Some(FAKE_KEY)
+    );
+    assert!(!env.contains_key("REDDIT_CLIENT_ID"));
+
+    let mut reddit_toml_has_id = false;
+    for entry in std::fs::read_dir(tmp.path()).expect("read dir") {
+        let path = entry.expect("dir entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read file");
+        assert!(
+            !text.contains(FAKE_SECRET) && !text.contains(FAKE_KEY),
+            "a registry file holds a secret value"
+        );
+        if path.file_name().is_some_and(|name| name == "reddit.toml") {
+            reddit_toml_has_id = text.contains(FAKE_ID);
+        }
+    }
+    assert!(reddit_toml_has_id, "the public client id is in reddit.toml");
+}
+
+/// A well-formed record of `platform` with `id` and `published`.
+fn live_record(platform: Platform, id: &str, published: Option<&str>) -> (String, SourceItem) {
+    let name = platform.name();
+    (
+        format!("{name}:{id}"),
+        SourceItem {
+            source_type: SourceType::Social,
+            platform: name.to_string(),
+            id: id.to_string(),
+            url: format!("https://example.test/{id}"),
+            title: None,
+            text: String::new(),
+            author: None,
+            published: published.map(str::to_string),
+            raw: None,
+            html: None,
+        },
+    )
+}
+
+#[test]
+fn e2e_credentialed_structure_check_accepts_wellformed_records_and_names_each_problem() {
+    let recent = chrono::Utc::now().to_rfc3339();
+    let reddit_ok = [
+        live_record(Platform::Reddit, "t3_abc", Some(&recent)),
+        live_record(Platform::Reddit, "t3_def", None),
+    ];
+    assert_eq!(live_structure_problem(&reddit_ok, Platform::Reddit), None);
+    let youtube_ok = [live_record(Platform::YouTube, "vid1", Some(&recent))];
+    assert_eq!(live_structure_problem(&youtube_ok, Platform::YouTube), None);
+
+    // Each problem is named, and the text carries no item content.
+    assert!(live_structure_problem(&[], Platform::Reddit).is_some());
+
+    let wrong_platform = [live_record(Platform::YouTube, "t3_abc", None)];
+    assert!(live_structure_problem(&wrong_platform, Platform::Reddit).is_some());
+
+    let mut wrong_key = live_record(Platform::Reddit, "t3_abc", None);
+    wrong_key.0 = "reddit:other".to_string();
+    assert!(live_structure_problem(&[wrong_key], Platform::Reddit).is_some());
+
+    let bad_prefix = [live_record(Platform::Reddit, "abc", None)];
+    assert!(live_structure_problem(&bad_prefix, Platform::Reddit).is_some());
+
+    let mut not_https = live_record(Platform::YouTube, "vid1", None);
+    not_https.1.url = "http://example.test/secret-content".to_string();
+    let problem = live_structure_problem(&[not_https], Platform::YouTube).expect("a problem");
+    assert!(!problem.contains("secret-content"));
+
+    for published in [
+        "not a time",
+        "2005-06-22T23:59:59Z",
+        &(chrono::Utc::now() + chrono::Duration::hours(7)).to_rfc3339(),
+    ] {
+        let bad = [live_record(Platform::YouTube, "vid1", Some(published))];
+        let problem = live_structure_problem(&bad, Platform::YouTube).expect("a published problem");
+        assert!(!problem.contains(published), "no item content in the text");
+    }
 }
 
 // ── Staleness Rule ────────────────────────────────────────────────────────────
@@ -786,7 +1096,10 @@ fn e2e_credentialed_gate_treats_an_empty_value_as_missing() {
 #[test]
 fn e2e_credentialed_gate_passes_when_every_key_is_present() {
     let keys = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"];
-    let full = env_of(&[("REDDIT_CLIENT_ID", "id"), ("REDDIT_CLIENT_SECRET", "secret")]);
+    let full = env_of(&[
+        ("REDDIT_CLIENT_ID", "id"),
+        ("REDDIT_CLIENT_SECRET", "secret"),
+    ]);
     assert_eq!(missing_key(&keys, &|key| full.get(key).cloned()), None);
 }
 
