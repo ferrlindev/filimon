@@ -14,24 +14,52 @@
 # The script never builds `fili`: build it first with
 #   cargo build -p filimon
 #
+# Where the template and the WIT come from (no registry, no wkg/warg):
+#   local   (default) the working-tree template and `git archive HEAD wit`;
+#           nothing touches the network and no tag is needed.
+#   remote  with WIT_REF set, a sparse clone of the template and wit/ at that
+#           ref from a git remote. This is what an outside author gets from a
+#           tagged release. Nothing in the clone is run, sourced or evaluated:
+#           the script only copies files out of it and builds the copied crate.
+#
 # Environment:
-#   FILI_BIN   the fili binary (default: <repo>/target/debug/fili)
+#   FILI_BIN          the fili binary (default: <repo>/target/debug/fili)
+#   WIT_REF           a tag or branch; selects remote mode
+#   WIT_REPO          the remote to clone in remote mode (default: the url of
+#                     this repository's `origin`)
+#   KEEP_WORK=1       keep the temporary directory (its path is printed)
+#   PROOF_TRANSCRIPT  append everything the script prints to this file too
+#
+# The script prints paths and fixed texts only, never an environment value.
 #
 # Exit codes: 0 pass, 1 a step failed, 2 the fili binary is missing.
 # ─────────────────────────────────────────────────────────────────────────────
-set -euo pipefail
+set -Eeuo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 FILI_BIN=${FILI_BIN:-$REPO/target/debug/fili}
+WIT_REF=${WIT_REF:-}
+KEEP_WORK=${KEEP_WORK:-0}
 
 STEP=setup
 STEP_NO=0
 WORK=""
+WORK_PREFIX=""
 
+# A transcript records the whole run so the user's run can be committed as
+# evidence. It carries what this script prints, which is paths and fixed texts.
+if [ -n "${PROOF_TRANSCRIPT:-}" ]; then
+    exec > >(tee -a "$PROOF_TRANSCRIPT") 2>&1
+fi
+
+# Every failure goes through here, so a failure always names its step.
 fail() {
     echo "FAIL: step \"$STEP\": $1" >&2
     exit 1
 }
+
+# An unexpected failing command still names the step it happened in.
+trap 'echo "FAIL: step \"$STEP\": a command failed (line $LINENO)" >&2' ERR
 
 step() {
     STEP=$1
@@ -40,8 +68,25 @@ step() {
 }
 
 cleanup() {
+    # Delete only a directory this script created: it must carry the prefix of
+    # the mktemp template. KEEP_WORK=1 keeps it.
     if [ -n "$WORK" ] && [ -d "$WORK" ]; then
-        rm -rf "$WORK"
+        case "$WORK" in
+        "$WORK_PREFIX"?*)
+            if [ "$KEEP_WORK" = "1" ]; then
+                echo "kept work directory: $WORK"
+            else
+                rm -rf "$WORK"
+            fi
+            ;;
+        *)
+            echo "not removing $WORK: it does not carry the script's temporary prefix" >&2
+            ;;
+        esac
+    fi
+    if [ -n "${PROOF_TRANSCRIPT:-}" ]; then
+        # Let the tee behind the transcript drain before the shell exits.
+        sleep 1
     fi
 }
 trap cleanup EXIT
@@ -63,6 +108,24 @@ sha256_of() {
     fi
 }
 
+# ── Preflight: every tool the proof needs ────────────────────────────────────
+STEP=preflight
+require_tool() {
+    command -v "$1" >/dev/null 2>&1 ||
+        fail "$1 not found; see the install lines in plugins/README.md"
+}
+require_tool cargo
+cargo component --version >/dev/null 2>&1 ||
+    fail "cargo component not found; see the install lines in plugins/README.md"
+wasm-tools --version >/dev/null 2>&1 ||
+    fail "wasm-tools not found; see the install lines in plugins/README.md"
+require_tool git
+require_tool tar
+require_tool jq
+if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+    fail "no SHA-256 tool (shasum or sha256sum) found"
+fi
+
 # ── Step 1: record the starting state ────────────────────────────────────────
 step "record"
 HASH_BEFORE=$(sha256_of "$FILI_BIN")
@@ -70,20 +133,60 @@ TREE_BEFORE=$(git -C "$REPO" status --porcelain)
 
 # ── Step 2: a fresh directory outside the repository ─────────────────────────
 step "workdir"
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/fili-authoring.XXXXXX")
+WORK_BASE=${TMPDIR:-/tmp}
+WORK_BASE=${WORK_BASE%/}
+WORK_PREFIX="$WORK_BASE/fili-authoring."
+WORK=$(mktemp -d "${WORK_PREFIX}XXXXXX") || fail "mktemp -d failed"
+WORK_PHYS=$(cd "$WORK" && pwd -P) || fail "cannot resolve the work directory"
+case "$WORK_PHYS" in
+"$REPO" | "$REPO"/*)
+    fail "the work directory $WORK_PHYS is inside the repository; set TMPDIR outside it"
+    ;;
+esac
 PLUGIN="$WORK/plugin"
 mkdir -p "$PLUGIN" || fail "cannot create the plugin directory"
 
-# ── Step 3: copy the template and the published WIT ──────────────────────────
-step "copy"
-tar -C "$REPO/plugins/template" --exclude=./target --exclude=./src/bindings.rs -cf - . |
-    tar -C "$PLUGIN" -xf - || fail "cannot copy plugins/template"
+# ── Step 3: get the template and the published WIT ───────────────────────────
+if [ -n "$WIT_REF" ]; then
+    echo "mode: remote $WIT_REF"
+else
+    echo "mode: local (git archive HEAD wit)"
+fi
 
-step "wit"
-# Local mode: the WIT comes from `git archive HEAD wit`, so the proof needs
-# neither the network nor a tag.
-git -C "$REPO" archive HEAD wit | tar -x -C "$PLUGIN" ||
-    fail "cannot read wit/ from HEAD (is it committed?)"
+if [ -n "$WIT_REF" ]; then
+    step "wit"
+    case "$WIT_REF" in
+    -*) fail "WIT_REF must not start with a dash" ;;
+    esac
+    WIT_REPO=${WIT_REPO:-$(git -C "$REPO" remote get-url origin)} ||
+        fail "no WIT_REPO given and this repository has no origin remote"
+    SRC="$WORK/src-clone"
+    GIT_TERMINAL_PROMPT=0 git clone --quiet --depth 1 --branch "$WIT_REF" \
+        --filter=blob:none --sparse -- "$WIT_REPO" "$SRC" >"$WORK/clone.log" 2>&1 || {
+        tail -n 10 "$WORK/clone.log" >&2
+        fail "git clone at ref $WIT_REF failed"
+    }
+    git -C "$SRC" sparse-checkout set wit plugins/template >"$WORK/sparse.log" 2>&1 || {
+        tail -n 10 "$WORK/sparse.log" >&2
+        fail "sparse-checkout set wit plugins/template failed"
+    }
+    [ -f "$SRC/plugins/template/Cargo.toml" ] || fail "the clone has no plugins/template at ref $WIT_REF"
+    [ -f "$SRC/wit/worlds.wit" ] || fail "the clone has no wit/ at ref $WIT_REF"
+    TEMPLATE_SRC="$SRC/plugins/template"
+
+    step "copy"
+    tar -C "$TEMPLATE_SRC" --exclude=./target --exclude=./src/bindings.rs -cf - . |
+        tar -C "$PLUGIN" -xf - || fail "cannot copy plugins/template from the clone"
+    tar -C "$SRC" -cf - wit | tar -C "$PLUGIN" -xf - || fail "cannot copy wit/ from the clone"
+else
+    step "copy"
+    tar -C "$REPO/plugins/template" --exclude=./target --exclude=./src/bindings.rs -cf - . |
+        tar -C "$PLUGIN" -xf - || fail "cannot copy plugins/template"
+
+    step "wit"
+    git -C "$REPO" archive HEAD wit | tar -x -C "$PLUGIN" ||
+        fail "cannot read wit/ from HEAD (is it committed?)"
+fi
 [ -f "$PLUGIN/wit/worlds.wit" ] || fail "wit/worlds.wit is missing after the copy"
 
 # ── Step 4: the rename an author does by hand ────────────────────────────────
