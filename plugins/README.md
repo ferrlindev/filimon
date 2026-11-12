@@ -29,8 +29,9 @@ plugin contract in [`../wit`](../wit) (package `filimon:plugin@0.1.0`).
 - `replay-fetcher/`: a plugin for the `fetcher` world. `fetch` answers from the
   compiled-in table `src/fixtures.rs` by url substring, returns a `404` with a
   fixed body on a miss, logs fixed texts only and holds no state. It is the
-  fetcher the end-to-end replay tests use and the worked example of the
-  authoring guide (`docs/plugin-guide.md`). Frozen fixtures served as live data
+  fetcher the end-to-end replay tests use; the authoring guide
+  (`docs/plugin-guide.md`) builds its worked fetcher from `stub-fetcher` and
+  names this one only as a table-driven reference. Frozen fixtures served as live data
   are misleading, so never register it for a real source and never reference it
   from `examples/plugins/`.
 - `template/`: a copy-and-rename source plugin derived from `stub-source`. It

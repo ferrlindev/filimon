@@ -3,7 +3,7 @@ name = "replay-fetcher"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Replay filimon fetcher plugin: serves frozen fixtures as if they were live data. A test fixture and the plugin guide's worked example, never registered for a real source."
+description = "Replay filimon fetcher plugin: serves frozen fixtures as if they were live data. A test fixture and a table-driven reference, never registered for a real source."
 authors = ["filimon"]
 
 [lib]
