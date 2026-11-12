@@ -18,4 +18,9 @@ pub const TABLE: &[(&str, u16, &[u8])] = &[
         200,
         include_bytes!("../../reddit/tests/fixtures/listing_new.json"),
     ),
+    (
+        "playlistId=UU_x5XG1OV2P6uZZ5FSM9Ttw",
+        200,
+        include_bytes!("../../youtube/tests/fixtures/playlist_page.json"),
+    ),
 ];

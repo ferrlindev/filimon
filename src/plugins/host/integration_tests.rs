@@ -51,20 +51,17 @@ const REQUIRE_FLUVIO: &str = "FILI_TEST_REQUIRE_FLUVIO";
 /// a panic instead. Only a failed connect skips: every later failure is a
 /// test failure.
 async fn fluvio_or_skip() -> bool {
-    match tokio::time::timeout(Duration::from_secs(5), fluvio::Fluvio::connect()).await {
-        Ok(Ok(_)) => true,
-        _ => {
-            assert!(
-                std::env::var(REQUIRE_FLUVIO).as_deref() != Ok("1"),
-                "{REQUIRE_FLUVIO}=1 but no Fluvio cluster is reachable \
-                 (start one with `fluvio cluster start`)"
-            );
-            eprintln!(
-                "skipped: no reachable Fluvio cluster (start one with `fluvio cluster start`)"
-            );
-            false
-        }
+    if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(5), fluvio::Fluvio::connect()).await
+    {
+        return true;
     }
+    assert!(
+        std::env::var(REQUIRE_FLUVIO).as_deref() != Ok("1"),
+        "{REQUIRE_FLUVIO}=1 but no Fluvio cluster is reachable \
+         (start one with `fluvio cluster start`)"
+    );
+    eprintln!("skipped: no reachable Fluvio cluster (start one with `fluvio cluster start`)");
+    false
 }
 
 // ── Platforms And Backends ────────────────────────────────────────────────────
@@ -101,7 +98,7 @@ fn youtube_fixture() -> PathBuf {
     repo_root().join("plugins/youtube/tests/fixtures/playlist_page.json")
 }
 
-/// The API key the YouTube source receives through the env closure. It is
+/// The API key the `YouTube` source receives through the env closure. It is
 /// fake and never written to a file.
 const FAKE_YOUTUBE_KEY: &str = "replay-fake-key";
 
@@ -181,7 +178,10 @@ fn provision_tokens(backend: &Backend, platforms: &[Platform], state_dir: &Path)
 
 fn load_registry(path: &Path, env: &HashMap<String, String>) -> LoadedRegistry {
     load_registry_with_env(path, &|key| env.get(key).cloned()).unwrap_or_else(|e| {
-        panic!("replay registry failed to load: {:?}", miette::Report::new(e));
+        panic!(
+            "replay registry failed to load: {:?}",
+            miette::Report::new(e)
+        );
     })
 }
 
@@ -414,6 +414,8 @@ fn reddit_expected() -> Vec<Want> {
     posts
         .iter()
         .map(|post| {
+            // The plugin maps `created_utc * 1000` to whole milliseconds.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let created_ms = (post["created_utc"].as_f64().expect("created_utc") * 1000.0) as u64;
             let text = if post["is_self"] == true {
                 post["selftext"].as_str().expect("selftext")
@@ -437,7 +439,7 @@ fn reddit_expected() -> Vec<Want> {
         .collect()
 }
 
-/// The YouTube items the playlist fixture must produce, oldest first by
+/// The `YouTube` items the playlist fixture must produce, oldest first by
 /// publication. Computed at test time from the fixture. The published value
 /// prefers `contentDetails.videoPublishedAt` over `snippet.publishedAt`.
 fn youtube_expected() -> Vec<Want> {
@@ -489,9 +491,16 @@ fn assert_item(platform: Platform, key: &str, item: &SourceItem, want: &Want) {
     assert_eq!(item.url, want.url, "url of {id}");
     assert_eq!(item.title, want.title, "title of {id}");
     assert_eq!(item.author, want.author, "author of {id}");
-    assert_eq!(item.published.as_deref(), Some(want.published.as_str()), "published of {id}");
+    assert_eq!(
+        item.published.as_deref(),
+        Some(want.published.as_str()),
+        "published of {id}"
+    );
     assert_eq!(item.text, want.text, "text of {id}");
-    let raw = item.raw.as_ref().unwrap_or_else(|| panic!("{id} has no raw"));
+    let raw = item
+        .raw
+        .as_ref()
+        .unwrap_or_else(|| panic!("{id} has no raw"));
     match platform {
         Platform::Reddit => assert_eq!(raw["name"], want.raw["name"], "raw name of {id}"),
         Platform::YouTube => assert_eq!(raw, &want.raw, "raw snippet of {id}"),
@@ -631,7 +640,11 @@ impl StaleFixture {
     }
 
     fn stale(&self) -> bool {
-        is_stale(&self.crate_dir, &self.wasm, std::slice::from_ref(&self.extra))
+        is_stale(
+            &self.crate_dir,
+            &self.wasm,
+            std::slice::from_ref(&self.extra),
+        )
     }
 }
 
@@ -666,6 +679,10 @@ fn e2e_replay_staleness_sees_a_newer_source_or_fixture() {
         assert!(!fixture.stale());
         let newer = newer_inputs(&fixture).remove(index);
         fixture.touch(&newer, 300);
-        assert!(fixture.stale(), "{} is newer than the wasm", newer.display());
+        assert!(
+            fixture.stale(),
+            "{} is newer than the wasm",
+            newer.display()
+        );
     }
 }
