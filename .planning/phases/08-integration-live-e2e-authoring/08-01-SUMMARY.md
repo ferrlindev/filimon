@@ -45,7 +45,7 @@ key-files:
     - src/plugins/host/mod.rs
 
 key-decisions:
-  - "Missing cargo-component when a build is needed is a loud panic naming the install command, not a skip (research open question 2; Task 3 asks the user to confirm)"
+  - "Missing cargo-component when a build is needed is a loud panic naming the install command, not a skip (research open question 2; confirmed by the user at Task 3: fail-loudly)"
   - "Reddit replay uses an authorization-code [host.oauth] plus a pre-written token file so the host never calls the real token endpoint"
   - "Order across platforms is not asserted; per-platform order is oldest first, computed by sorting the fixture-derived published value"
   - "ensure_built memoises verified crates in the process-wide set so later tests skip even the staleness walk"
@@ -58,7 +58,7 @@ requirements-completed: [TEST-02]
 
 duration: 25min
 completed: 2026-11-12
-status: halted
+status: complete
 plan_head_before: a2e32c66493b73235314e2a39580454f917644d1
 plan_head_after: c6ccccd27b033bb95cfca51751375c6e7cc24563
 commits: 3
@@ -117,20 +117,20 @@ coverage:
     description: "Missing-toolchain policy of ensure_built (fail loudly with the install command)"
     verification: []
     human_judgment: true
-    rationale: "Task 3 is a checkpoint:decision awaiting the user's confirmation; the recommended option is what is implemented"
+    rationale: "Task 3 decision answered by the user (fail-loudly), which is what is implemented"
 ---
 
 # Phase 8 Plan 01: Replay Fetcher And E2E Replay Harness Summary
 
 **A fixture-serving `replay-fetcher` component plus an in-crate harness that runs the real Reddit and YouTube components through the host with replayed HTTP and lands exactly the fixture `SourceItem`s in a scratch Fluvio topic (or an in-memory sink), skipping cleanly when no cluster is reachable.**
 
-Status is `halted`: Tasks 1 and 2 are done and verified; Task 3 (`checkpoint:decision`, missing-toolchain policy) is awaiting the user. The recommended option (`fail-loudly`) is already the implemented behaviour, so confirming it needs no code change. Re-summarise as `complete` once it is answered.
+Status is `complete`: Tasks 1 and 2 are done and verified. Task 3 (`checkpoint:decision`, missing-toolchain policy) was answered by the user with `fail-loudly` on 2026-11-12, which is the implemented behaviour, so no code change was needed.
 
 ## Performance
 
 - **Duration:** about 25 min (first run of each component build is a few minutes cold)
 - **Completed:** 2026-11-12
-- **Tasks:** 2 of 3 executed (Task 3 is the pending checkpoint)
+- **Tasks:** 3 of 3 (Tasks 1-2 executed; Task 3 decision answered by the user: fail-loudly, no code change)
 - **Files modified:** 10 (8 created, 2 modified)
 
 ## Accomplishments
@@ -148,7 +148,7 @@ Status is `halted`: Tasks 1 and 2 are done and verified; Task 3 (`checkpoint:dec
 2. **Task 2: YouTube replay, both platforms, shared assertion (TDD)**
    - RED - `21c3fee` (test): `e2e_replay_host_path_needs_no_cluster` expected 6 records and got 3 (no YouTube fixture entry yet); it ran, the Reddit half produced its 3 records, so the failure was on the planned assertion, not a load or syntax fault
    - GREEN - `c6ccccd` (feat): YouTube fixture entry added, all five `e2e_replay_` tests pass
-3. **Task 3: Confirm the missing-toolchain policy** - not executed, returned as a checkpoint
+3. **Task 3: Confirm the missing-toolchain policy** - decision answered by the user: `fail-loudly` (no code change)
 
 **Plan metadata:** this SUMMARY (docs commit).
 
@@ -163,7 +163,7 @@ Status is `halted`: Tasks 1 and 2 are done and verified; Task 3 (`checkpoint:dec
 
 ## Decisions Made
 
-- Fail loudly (panic naming the install command) when `cargo-component` is missing and a build is needed; pending user confirmation at Task 3.
+- Fail loudly (panic naming the install command) when `cargo-component` is missing and a build is needed; confirmed by the user at Task 3.
 - `ensure_built` memoises verified crates for the life of the process, so the staleness walk runs once per component per test binary run.
 - The Reddit ordering check is derived (sort the fixture posts by `created_utc`) rather than a literal id list, keeping every expected value computed from the fixtures.
 
@@ -201,7 +201,7 @@ None. `ensure_built` spawning `cargo component build` is the plan's T-08-04 surf
 
 - Plan 08-04 can add the live backend to the same `Backend` / `assert_replay_items` body.
 - Plan 08-05 can use `plugins/replay-fetcher` (`lib.rs` glue + `fixtures.rs`) as the guide's worked fetcher example.
-- Open item: user confirmation of the Task 3 toolchain policy (`fail-loudly` recommended and implemented, or `skip-with-message`, which would change `ensure_built` to return an `Option` and make each caller print `skipped: cargo-component is not installed`).
+- Resolved: the user confirmed `fail-loudly` for the Task 3 toolchain policy. The `skip-with-message` alternative was not chosen. The skip-on-no-cluster path remains unexercised and is a human check (coverage D6).
 
 ---
 *Phase: 08-integration-live-e2e-authoring*

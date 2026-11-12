@@ -250,13 +250,13 @@ Plans:
   3. A live end-to-end run works: `fili` loads the Reddit and YouTube plugins, polls the real APIs, and records flow through Fluvio. The consumer writes NER-enriched social records alongside news articles in the same JSON output.
   4. Using only the plugin template and guide, a source plugin built with `cargo component` in a directory outside the filimon repo, against only the published WIT, is registered in `filimon.toml` and runs in an unmodified `fili` binary.
   5. The guide covers writing a fetcher plugin and assigning it to a source, and a fetcher built by following it serves that source's requests.
-**Plans:** 0/7 plans complete
+**Plans:** 3/7 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 08-01-PLAN.md — Tracer: the compiled `reddit` source runs in the host with its HTTP served by a new `replay-fetcher` component and its items land in a scratch Fluvio topic; then YouTube, one assertion body for a Fluvio and an in-memory sink, and the build-on-demand helper (TEST-02)
-- [ ] 08-02-PLAN.md — Tracer: `plugins/template` and `scripts/verify-authoring.sh` prove a plugin built outside the repo against only the WIT runs in the unmodified `fili`, plus the remote sparse-clone mode (WIT-03, DOCS-01)
-- [ ] 08-03-PLAN.md — `scripts/live-e2e.sh` runbook for the human-run live E2E: preflight with the D-09 Reddit stop, sanitiser, secret scan, evidence check and a hermetic self-test (TEST-04)
+- [x] 08-01-PLAN.md — Tracer: the compiled `reddit` source runs in the host with its HTTP served by a new `replay-fetcher` component and its items land in a scratch Fluvio topic; then YouTube, one assertion body for a Fluvio and an in-memory sink, and the build-on-demand helper (TEST-02)
+- [x] 08-02-PLAN.md — Tracer: `plugins/template` and `scripts/verify-authoring.sh` prove a plugin built outside the repo against only the WIT runs in the unmodified `fili`, plus the remote sparse-clone mode (WIT-03, DOCS-01)
+- [x] 08-03-PLAN.md — `scripts/live-e2e.sh` runbook for the human-run live E2E: preflight with the D-09 Reddit stop, sanitiser, secret scan, evidence check and a hermetic self-test (TEST-04)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 08-04-PLAN.md — Credential-gated live mode on the same test body (`skipped: missing <KEY>`), root `.env.example`, and the README test-group documentation (TEST-03)
@@ -280,4 +280,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
 | 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
 | 7. Reddit & YouTube Plugins | 12/12 | Complete    | 2026-11-12 |
-| 8. Integration, Live E2E & Authoring | 0/7 | Planned | - |
+| 8. Integration, Live E2E & Authoring | 3/7 | In Progress | - |
