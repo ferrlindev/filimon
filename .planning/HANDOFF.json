@@ -12,7 +12,7 @@
   "remaining_tasks": [
     {
       "id": 1,
-      "name": "Provide live prerequisites: Reddit app, YouTube key, GLiNER model, .env (D-07, D-09)",
+      "name": "Provide Reddit app, YouTube key and .env (GLiNER model done) (D-07, D-09)",
       "status": "blocked_on_human"
     },
     {
@@ -28,7 +28,7 @@
   ],
   "blockers": [
     {
-      "description": "No .env; REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, YOUTUBE_API_KEY unset; GLiNER tokenizer.json and onnx/model.onnx missing",
+      "description": "No .env; REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, YOUTUBE_API_KEY unset (GLiNER now present)",
       "type": "human_action",
       "workaround": "Reply reddit-unavailable to trigger the D-09 wait/waive decision"
     }
@@ -43,11 +43,6 @@
     {
       "action": "Create YouTube Data API v3 key",
       "context": "Google Cloud console",
-      "blocking": true
-    },
-    {
-      "action": "Download GLiNER model into models/gliner_small-v2.1/",
-      "context": "docker compose --profile setup up model-downloader, or README recipe",
       "blocking": true
     },
     {
@@ -78,5 +73,5 @@
     "?? test_config_panic.json"
   ],
   "next_action": "After prerequisites exist, run /gsd-execute-phase 8 (plan 08-06 has no commits or SUMMARY; it restarts at the Task 1 checkpoint). Automation already passed: builds, selftest.",
-  "context_notes": "Executor ran cargo builds, component builds and selftest (PASS). Preflight exit 3: only the 5 prerequisite FAILs remain; Fluvio, topics, SmartModules, components ok. Other phase 8 plans (01-05, 07) are complete. After 08-06, the phase needs verification."
+  "context_notes": "Executor ran cargo builds, component builds and selftest (PASS). Preflight exit 3: only the 5 prerequisite FAILs remain; Fluvio, topics, SmartModules, components ok. Other phase 8 plans (01-05, 07) are complete. After 08-06, the phase needs verification. 2026-11-15: GLiNER tokenizer.json and onnx/model.onnx fetched from onnx-community/gliner_small-v2.1 (sha256 verified), because the README recipe repo urchade/gliner_small-v2.1 holds no ONNX files. Preflight now fails only on the three keys."
 }
