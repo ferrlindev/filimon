@@ -1,53 +1,39 @@
 {
   "version": "1.0",
-  "timestamp": "2026-11-12T11:38:28.800Z",
+  "timestamp": "2026-11-14T17:02:46.445Z",
   "phase": "08",
   "phase_name": "Integration, Live E2E & Authoring",
   "phase_dir": "/Users/jferrolino/Devs/portfolio/filimon/.planning/phases/08-integration-live-e2e-authoring",
   "plan": 6,
-  "task": 1,
+  "task": 3,
   "total_tasks": 3,
   "status": "paused",
-  "completed_tasks": [],
-  "remaining_tasks": [
+  "completed_tasks": [
     {
       "id": 1,
-      "name": "Provide Reddit app, YouTube key and .env (GLiNER model done) (D-07, D-09)",
-      "status": "blocked_on_human"
+      "name": "Live prerequisites (preflight passes under the Reddit waiver; Reddit keys not obtained)",
+      "status": "done_with_waiver"
     },
     {
       "id": 2,
-      "name": "Decide wait or waive Reddit (only if reddit-unavailable) (D-09)",
-      "status": "not_started"
-    },
+      "name": "D-09 decision: waive Reddit",
+      "status": "done",
+      "decision": "waive: takes time to complete"
+    }
+  ],
+  "remaining_tasks": [
     {
       "id": 3,
-      "name": "Run live-e2e.sh run and credentialed tests, then commit sanitised evidence",
-      "status": "not_started"
+      "name": "User runs the live E2E under the waiver and the credentialed tests; Claude writes evidence README, runs check-evidence, commits listed evidence files",
+      "status": "awaiting_user_run"
     }
   ],
-  "blockers": [
-    {
-      "description": "No .env; REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, YOUTUBE_API_KEY unset (GLiNER now present)",
-      "type": "human_action",
-      "workaround": "Reply reddit-unavailable to trigger the D-09 wait/waive decision"
-    }
-  ],
+  "blockers": [],
   "async_jobs": [],
   "human_actions_pending": [
     {
-      "action": "Create Reddit web app and note client id/secret",
-      "context": "https://www.reddit.com/prefs/apps; approval may take days",
-      "blocking": true
-    },
-    {
-      "action": "Create YouTube Data API v3 key",
-      "context": "Google Cloud console",
-      "blocking": true
-    },
-    {
-      "action": "Put keys in repo-root .env (never paste values in chat, never commit)",
-      "context": "key names in .env.example",
+      "action": "Run LIVE_E2E_WAIVE_REDDIT='takes time to complete' scripts/live-e2e.sh run, then the credentialed tests (cargo test -p filimon e2e_credentialed_ -- --nocapture, tee to evidence/credentialed-tests.txt), then reply ran",
+      "context": "Task 3 of 08-06 is a human-run checkpoint (D-07)",
       "blocking": true
     }
   ],
@@ -55,6 +41,11 @@
     {
       "decision": "Ran 08-06 sequentially on the main working tree, not in a worktree",
       "rationale": "Human-run evidence, .env, models/ and target/ live in the main checkout; 08-07 lost worktree output for this reason",
+      "phase": "08"
+    },
+    {
+      "decision": "D-09: waive Reddit for the live E2E. User reason, verbatim: takes time to complete",
+      "rationale": "Reddit API access needs approval under the Responsible Builder Policy. The Reddit half of SC3/TEST-04 stays unmet until accepted at verification; live-e2e.sh writes evidence/WAIVER.md",
       "phase": "08"
     }
   ],
@@ -72,6 +63,6 @@
     "?? WORKFLOW.md",
     "?? test_config_panic.json"
   ],
-  "next_action": "After prerequisites exist, run /gsd-execute-phase 8 (plan 08-06 has no commits or SUMMARY; it restarts at the Task 1 checkpoint). Automation already passed: builds, selftest.",
-  "context_notes": "Executor ran cargo builds, component builds and selftest (PASS). Preflight exit 3: only the 5 prerequisite FAILs remain; Fluvio, topics, SmartModules, components ok. Other phase 8 plans (01-05, 07) are complete. After 08-06, the phase needs verification. 2026-11-15: GLiNER tokenizer.json and onnx/model.onnx fetched from onnx-community/gliner_small-v2.1 (sha256 verified), because the README recipe repo urchade/gliner_small-v2.1 holds no ONNX files. Preflight now fails only on the three keys."
+  "next_action": "User runs Task 3 commands (see human_actions_pending) and replies ran; then spawn a continuation agent for 08-06 resuming at Task 3 with user_response=ran. Do not read .env. .env.example holds an uncommitted credential value: never stage it.",
+  "context_notes": "2026-11-15: GLiNER model present (onnx-community/gliner_small-v2.1, sha256 verified). YOUTUBE_API_KEY set in .env. Reddit waived by the user. Tasks 1 and 2 resolved; only Task 3 remains for plan 08-06."
 }
