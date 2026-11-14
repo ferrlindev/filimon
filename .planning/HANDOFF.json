@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-11-14T17:02:46.445Z",
+  "timestamp": "2026-11-14T17:18:19.626Z",
   "phase": "08",
   "phase_name": "Integration, Live E2E & Authoring",
   "phase_dir": "/Users/jferrolino/Devs/portfolio/filimon/.planning/phases/08-integration-live-e2e-authoring",
@@ -24,15 +24,26 @@
   "remaining_tasks": [
     {
       "id": 3,
-      "name": "User runs the live E2E under the waiver and the credentialed tests; Claude writes evidence README, runs check-evidence, commits listed evidence files",
-      "status": "awaiting_user_run"
+      "name": "Fix YOUTUBE_API_KEY in .env, then user runs the live E2E under the Reddit waiver and the credentialed tests; Claude writes evidence README, runs check-evidence, commits listed evidence files",
+      "status": "blocked_on_human"
     }
   ],
-  "blockers": [],
+  "blockers": [
+    {
+      "description": "YOUTUBE_API_KEY in .env is rejected by Google (direct check returned HTTP 400; the check also produced two stray HTTP 000 transfers, which suggests spaces or special characters in the value). The credentialed YouTube live poll test fails with: the live youtube poll failed. A first live run exited 3 because LIVE_E2E_WAIVE_REDDIT was not set in that invocation.",
+      "type": "human_action",
+      "workaround": "Recopy the key (AIza..., 39 chars) into .env, verify with the curl -g --get --data-urlencode check (expect HTTP 200), export LIVE_E2E_WAIVE_REDDIT, run live-e2e.sh run, then the credentialed tests"
+    }
+  ],
   "async_jobs": [],
   "human_actions_pending": [
     {
-      "action": "Run LIVE_E2E_WAIVE_REDDIT='takes time to complete' scripts/live-e2e.sh run, then the credentialed tests (cargo test -p filimon e2e_credentialed_ -- --nocapture, tee to evidence/credentialed-tests.txt), then reply ran",
+      "action": "Fix YOUTUBE_API_KEY in .env (not .env.example) and confirm HTTP 200 with the key check",
+      "context": "HTTP 400 from Google means the key value is invalid",
+      "blocking": true
+    },
+    {
+      "action": "export LIVE_E2E_WAIVE_REDDIT='takes time to complete'; scripts/live-e2e.sh run; then cargo test -p filimon e2e_credentialed_ -- --nocapture with tee to evidence/credentialed-tests.txt; then reply ran",
       "context": "Task 3 of 08-06 is a human-run checkpoint (D-07)",
       "blocking": true
     }
@@ -50,6 +61,7 @@
     }
   ],
   "uncommitted_files": [
+    " M .env.example",
     " M .planning/STATE.md",
     " M .planning/config.json",
     " M .planning/phases/06-host-managed-oauth/06-VERIFICATION.md",
@@ -58,11 +70,13 @@
     "?? .claude/",
     "?? .cursor/",
     "?? .gsd-path/",
+    "?? .planning/phases/08-integration-live-e2e-authoring/evidence/credentialed-tests.txt",
+    "?? .planning/phases/08-integration-live-e2e-authoring/evidence/live-e2e-transcript.txt",
     "?? .planning/state.json",
     "?? AGENTS.md",
     "?? WORKFLOW.md",
     "?? test_config_panic.json"
   ],
-  "next_action": "User runs Task 3 commands (see human_actions_pending) and replies ran; then spawn a continuation agent for 08-06 resuming at Task 3 with user_response=ran. Do not read .env. .env.example holds an uncommitted credential value: never stage it.",
-  "context_notes": "2026-11-15: GLiNER model present (onnx-community/gliner_small-v2.1, sha256 verified). YOUTUBE_API_KEY set in .env. Reddit waived by the user. Tasks 1 and 2 resolved; only Task 3 remains for plan 08-06."
+  "next_action": "After the user fixes the key and reruns Task 3 successfully (check-evidence prints ok: evidence is complete and clean), spawn a continuation executor for 08-06 at Task 3 (sequential, main tree, root pin). Do not read .env. Never stage .env.example. The untracked evidence/live-e2e-transcript.txt and evidence/credentialed-tests.txt currently in the tree come from FAILED runs and will be overwritten by the next run; do not commit them as they are.",
+  "context_notes": "2026-11-15: Reddit waived (D-09, reason verbatim: takes time to complete). GLiNER model present. Key check: HTTP 400. Failed-run artifacts sit untracked in the evidence directory."
 }
