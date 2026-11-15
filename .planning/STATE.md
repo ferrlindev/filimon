@@ -103,7 +103,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 | Category | Item | Status | Deferred At | Milestone |
 |----------|------|--------|-------------|-----------|
-| *(none)* | | | | |
+| verification | Live Reddit proof for SC3 / TEST-04 (the Reddit app-only path against the real API); needs Reddit API approval and REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET | deferred (waiver accepted by the user, reason: takes time to complete) | Phase 8 verification 2026-11-15 | v1 |
 
 ## Session Continuity
 
