@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 08
 current_phase_name: Integration, Live E2E & Authoring
 status: executing
-stopped_at: Phase 8 context gathered
-last_updated: "2026-11-12T07:45:57.867Z"
+stopped_at: Completed 08-06-PLAN.md
+last_updated: "2026-11-15T06:11:30.018Z"
 last_activity: 2026-11-12
-last_activity_desc: Phase 08 execution started
-state_head: a2e32c66493b73235314e2a39580454f917644d1
+last_activity_desc: Phase 08 execution resumed (wave continue)
+state_head: b29525cf909a30cc04f0c6293cd228bfd7cca42c
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 65
-  completed_plans: 58
+  completed_plans: 65
   percent: 88
 ---
 
@@ -28,9 +28,9 @@ See: .planning/PROJECT.md (updated 2026-11-09)
 ## Current Position
 
 Phase: 08 (Integration, Live E2E & Authoring) — EXECUTING
-Plan: 1 of 7
-Status: Executing Phase 08
-Last activity: 2026-11-12 — Phase 08 execution started
+Plan: 7 of 7 (all plans executed)
+Status: Phase 08 plans complete; ready for verification (Reddit waiver awaits a ruling)
+Last activity: 2026-11-15 — Plan 08-06 complete (live E2E evidence, Reddit waived)
 
 Progress: [█████████░] 88%
 
@@ -58,6 +58,11 @@ Progress: [█████████░] 88%
 - Trend: -
 
 *Updated after each plan completion*
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 08 P06 | multi-session | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -75,6 +80,8 @@ Recent decisions affecting current work:
 - [Phase 2]: Every record is a `SourceItem`. News keeps the WISE SmartModule chain; social items pass straight through to the consumer (D-01 leaves the SmartModules unchanged); both land in one NER-enriched JSON output.
 - [Phase 2]: Consumer diagnostics never carry record content and all stderr goes through `print_diagnostic`. A social record and its notes travel as one `Incoming::Noted` item, so no stop can separate them.
 - [Phase 2]: UAT 3/3 passed; SECURITY.md verified with threats_open: 0 (36/36 threats closed).
+- [Phase 08]: 08-06: Reddit waived by the user for the live E2E (reason: takes time to complete); Reddit half of SC3/TEST-04 unmet, to be accepted or rejected at verification
+- [Phase 08]: 08-06: live E2E news crawl routed through a generated registry with [crawler] fetcher=http; registry-less fili produce still panics (src/crawler.rs blocking client in async main)
 
 ### Pending Todos
 
@@ -100,6 +107,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-12T06:47:04.564Z
-Stopped at: Phase 8 context gathered
-Resume file: .planning/phases/08-integration-live-e2e-authoring/08-CONTEXT.md
+Last session: 2026-11-15T06:11:29.159Z
+Stopped at: Completed 08-06-PLAN.md
+Resume file: None

@@ -71,8 +71,8 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 - [x] **TEST-01**: Each plugin has unit tests against recorded API fixtures — no network or keys required
 - [ ] **TEST-02**: Integration tests run the compiled Reddit and YouTube `.wasm` plugins inside the host against replayed fixtures and assert the expected `SourceItem`s reach a local Fluvio topic
-- [ ] **TEST-03**: Integration tests have a live mode that runs against real APIs only when credentials are present in `.env`
-- [ ] **TEST-04**: A live end-to-end run with real Reddit and YouTube data produces enriched JSON alongside news articles
+- [x] **TEST-03**: Integration tests have a live mode that runs against real APIs only when credentials are present in `.env`
+- [x] **TEST-04**: A live end-to-end run with real Reddit and YouTube data produces enriched JSON alongside news articles
 
 ### Authoring
 
@@ -161,8 +161,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | YTUB-03 | Phase 7 | Complete |
 | TEST-01 | Phase 7 | Complete |
 | TEST-02 | Phase 8 | Pending |
-| TEST-03 | Phase 8 | Pending |
-| TEST-04 | Phase 8 | Pending |
+| TEST-03 | Phase 8 | Complete |
+| TEST-04 | Phase 8 | Complete |
 | DOCS-01 | Phase 8 | Pending |
 | DOCS-02 | Phase 8 | Pending |
 
