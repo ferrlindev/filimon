@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-11-14T17:18:19.626Z",
+  "timestamp": "2026-11-15T05:59:17.829Z",
   "phase": "08",
   "phase_name": "Integration, Live E2E & Authoring",
   "phase_dir": "/Users/jferrolino/Devs/portfolio/filimon/.planning/phases/08-integration-live-e2e-authoring",
@@ -30,9 +30,9 @@
   ],
   "blockers": [
     {
-      "description": "YOUTUBE_API_KEY in .env is rejected by Google (direct check returned HTTP 400; the check also produced two stray HTTP 000 transfers, which suggests spaces or special characters in the value). The credentialed YouTube live poll test fails with: the live youtube poll failed. A first live run exited 3 because LIVE_E2E_WAIVE_REDDIT was not set in that invocation.",
+      "description": "Live run step 1 (fili produce) panicked because the built-in crawler builds a reqwest::blocking client inside the async main. FIXED in scripts/live-e2e.sh: the generated registry now has a [crawler] fetcher=http table and produce runs against it (selftest PASS, fili accepts the registry). Not yet proven live. Separately, YOUTUBE_API_KEY validity is unconfirmed: an earlier direct check returned HTTP 400 and the credentialed YouTube poll failed; the credentialed-tests.txt in the tree is from that failed run.",
       "type": "human_action",
-      "workaround": "Recopy the key (AIza..., 39 chars) into .env, verify with the curl -g --get --data-urlencode check (expect HTTP 200), export LIVE_E2E_WAIVE_REDDIT, run live-e2e.sh run, then the credentialed tests"
+      "workaround": "Re-run: LIVE_E2E_WAIVE_REDDIT='takes time to complete' scripts/live-e2e.sh run, then the credentialed tests"
     }
   ],
   "async_jobs": [],
@@ -58,6 +58,11 @@
       "decision": "D-09: waive Reddit for the live E2E. User reason, verbatim: takes time to complete",
       "rationale": "Reddit API access needs approval under the Responsible Builder Policy. The Reddit half of SC3/TEST-04 stays unmet until accepted at verification; live-e2e.sh writes evidence/WAIVER.md",
       "phase": "08"
+    },
+    {
+      "decision": "Deviation: scripts/live-e2e.sh (plan 08-03 artifact) edited to add a [crawler] table and pass --registry to produce, because fili produce panics with the built-in crawler. The brownfield crawler (src/crawler.rs) was not touched.",
+      "rationale": "User chose to fix the script (recommended) over fixing the crawler; record as a deviation in the 08-06 SUMMARY",
+      "phase": "08"
     }
   ],
   "uncommitted_files": [
@@ -77,6 +82,6 @@
     "?? WORKFLOW.md",
     "?? test_config_panic.json"
   ],
-  "next_action": "After the user fixes the key and reruns Task 3 successfully (check-evidence prints ok: evidence is complete and clean), spawn a continuation executor for 08-06 at Task 3 (sequential, main tree, root pin). Do not read .env. Never stage .env.example. The untracked evidence/live-e2e-transcript.txt and evidence/credentialed-tests.txt currently in the tree come from FAILED runs and will be overwritten by the next run; do not commit them as they are.",
+  "next_action": "User re-runs the live run under the waiver (same-line env var), then the credentialed tests, and replies ran. If check-evidence prints ok: evidence is complete and clean, spawn the continuation executor for 08-06 at Task 3. Mention the script deviation in the SUMMARY. Never stage .env.example; never read .env.",
   "context_notes": "2026-11-15: Reddit waived (D-09, reason verbatim: takes time to complete). GLiNER model present. Key check: HTTP 400. Failed-run artifacts sit untracked in the evidence directory."
 }
