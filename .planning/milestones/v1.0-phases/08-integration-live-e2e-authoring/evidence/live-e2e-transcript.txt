@@ -1,5 +1,5 @@
 live E2E run (TEST-04)
-Sun Nov 15 06:42:48 UTC 2026
+Sun Nov 15 07:04:45 UTC 2026
 fili 0.3.0
 work directory: /Users/jferrolino/Devs/portfolio/filimon/.live-e2e
 note: the production topics keep earlier records for 7 days; a rerun can read older records.
@@ -33,7 +33,7 @@ step 1: news crawl of https://blog.rust-lang.org/ (fili produce)
     → Produced to filimon-raw-pages
 
   [2/6] p=0.89  https://blog.rust-lang.org/2018/12/06/call-for-rust-2019-roadmap-blogposts/
-    ✗ transport failure: error sending request: client error (SendRequest): connection error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+    → Produced to filimon-raw-pages
 
   [3/6] p=0.89  https://blog.rust-lang.org/2018/01/03/new-years-rust-a-call-for-community-blogposts/
     → Produced to filimon-raw-pages
@@ -50,22 +50,14 @@ step 1: news crawl of https://blog.rust-lang.org/ (fili produce)
 ╔══════════════════════════════════════════╗
 ║  Produce complete                         ║
 ╠══════════════════════════════════════════╣
-║  Pages produced: 5                       ║
+║  Pages produced: 6                       ║
 ║  Topic: filimon-raw-pages               ║
 ╚══════════════════════════════════════════╝
 step 2: social run (fili run) until every enabled source reports a successful poll
 all enabled sources polled successfully; stopping fili run
 source youtube: ok
 step 3: consume with NER (fili consume --enrich-ner)
-consumer display omitted from this committed transcript (D-08): it listed author names and PERSON entities.
-(606 lines removed after the run; the sanitised sample, enriched-sample.json, is the committed evidence. A rerun with the current script keeps the display in the gitignored work directory.)
-
-╔══════════════════════════════════════════╗
-║           WISE Pipeline Summary           ║
-╠══════════════════════════════════════════╣
-║  Records kept  : 51                       ║
-║  Output file   : /Users/jferrolino/Devs/portfolio/filimon/.live-e2e/enriched.json║
-╚══════════════════════════════════════════╝
+consumer display kept in /Users/jferrolino/Devs/portfolio/filimon/.live-e2e/consume.log (790 lines; not committed, it lists author names and PERSON entities)
 raw output ready: /Users/jferrolino/Devs/portfolio/filimon/.live-e2e/enriched.json
 reminder: the production topics keep earlier records for 7 days; reruns accumulate.
 step 4: sanitise the sample

@@ -633,21 +633,21 @@
   {
     "source_type": "social",
     "platform": "youtube",
-    "id": "rsOiZE19RVo",
-    "url": "https://www.youtube.com/watch?v=rsOiZE19RVo",
-    "title": "Accelerate shipping to scale with Google Antigravity",
-    "text": "Building software to move tens of millions of vehicles requires massive infrastructure. Using Google Antigravity, Move Cars delivers fully tested production features in a single day, letting a small team scale complex logistics while staying in total control. \n\nDiscover what chan",
+    "id": "vLAegkGGWrM",
+    "url": "https://www.youtube.com/watch?v=vLAegkGGWrM",
+    "title": "Building with Gemini in Google Antigravity",
+    "text": "See what you can build using our latest Gemini models in Google Antigravity.  From in-browser animation and multimodal prototyping to autonomous codebase modernization, explore how you can ship complex architectures straight from a prompt.\n\nWhat are you building with Gemini in Go",
     "author": "redacted",
-    "published": "2026-10-29T20:00:20.000Z",
+    "published": "2026-11-12T17:00:11.000Z",
     "raw": null,
     "entities": [
       {
-        "text": "Google Antigravity",
+        "text": "Gemini",
         "kind": "PRODUCT"
       },
       {
-        "text": "[redacted]",
-        "kind": "PERSON"
+        "text": "Google",
+        "kind": "ORGANIZATION"
       }
     ],
     "article": null

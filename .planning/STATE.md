@@ -1,18 +1,18 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 08
-status: completed
-stopped_at: "Phase 8 complete; milestone ready for audit/completion"
-last_updated: "2026-11-15T06:59:37.938Z"
+status: Awaiting next milestone
+stopped_at: Phase 8 complete; milestone ready for audit/completion
+last_updated: "2026-11-15T07:12:40.116Z"
 last_activity: 2026-11-15
-last_activity_desc: Phase 08 complete
-state_head: 0dcaf3f0200ce5cb056be6d65a0b13232988bfa9
+last_activity_desc: Milestone v1.0 completed and archived
+state_head: b1a567d684142b04c0d0bfc87bf5cb0997210fcb
 progress:
   total_phases: 8
   completed_phases: 8
   total_plans: 65
   completed_plans: 65
   percent: 100
+current_phase: 08
 ---
 
 # Project State
@@ -26,12 +26,10 @@ See: .planning/PROJECT.md (updated 2026-11-15)
 
 ## Current Position
 
-Phase: 08
-Plan: Not started
-Status: All phases complete
-Last activity: 2026-11-15 — Phase 08 complete
-
-Progress: [██████████] 100%
+Phase: Milestone v1.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-11-15 — Milestone v1.0 completed and archived
 
 ## Performance Metrics
 
@@ -108,6 +106,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 | Category | Item | Status | Deferred At | Milestone |
 |----------|------|--------|-------------|-----------|
+| deferred_items | 02/deferred-items.md: docker-compose.yml sets `OUTPUT_PATH` for `filimon` but `fili` never reads it | acknowledged | 2026-11-15 | v1 |
+| deferred_items | 02/deferred-items.md: docker-compose `filimon-stream-processor` runs `stream` but `fili` has no `stream` subcommand | acknowledged | 2026-11-15 | v1 |
 | verification | Live Reddit proof for SC3 / TEST-04 (the Reddit app-only path against the real API); needs Reddit API approval and REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET | deferred (waiver accepted by the user, reason: takes time to complete) | Phase 8 verification 2026-11-15 | v1 |
 
 ## Session Continuity
@@ -115,3 +115,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 Last session: 2026-11-15
 Stopped at: Phase 8 complete; milestone ready for audit/completion
 Resume file: None
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone

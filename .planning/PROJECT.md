@@ -2,7 +2,7 @@
 
 ## What This Is
 
-filimon is a Rust, streaming-first semantic news crawler: pages flow through Fluvio topics, get processed by WISE-framework SmartModules (preprocess → extract → relevance filter), and are enriched with zero-shot NER (GLiNER) into JSON output. This milestone adds a **WASM/WIT plugin system** so social platforms (Reddit and YouTube first; X and others later) can stream posts into the same pipeline as additional sources — producing the same enriched output as news articles.
+filimon is a Rust, streaming-first semantic news crawler: pages flow through Fluvio topics, get processed by WISE-framework SmartModules (preprocess → extract → relevance filter), and are enriched with zero-shot NER (GLiNER) into JSON output. v1 added a **WASM/WIT plugin system**: social platforms (Reddit and YouTube shipped; X and others later) stream posts into the same pipeline as additional sources and produce the same enriched output as news articles. Third parties can build source and fetcher plugins outside the repo from the published WIT.
 
 ## Core Value
 
@@ -26,19 +26,20 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - ✓ Integration tests run the compiled Reddit/YouTube components inside the host against replayed fixtures into a local Fluvio topic, with a live mode when `.env` keys exist (TEST-02, TEST-03) — Phase 8; TEST-03's positive live path was shown for YouTube only (the Reddit live test skips)
 - ✓ Live end-to-end run produces enriched JSON alongside news articles (TEST-04) — Phase 8, with an accepted waiver: the user waived live Reddit on 2026-11-15 (reason: "takes time to complete"); the live proof used YouTube plus news, and live Reddit proof is a deferred item in STATE.md
 - ✓ A plugin built outside the repo from the published WIT loads and runs without rebuilding `fili` (WIT-03); plugin template and guide cover source and fetcher plugins (DOCS-01, DOCS-02) — Phase 8
+- ✓ Plugin host in `fili` built on the WASM component model, loading `.wasm` components listed in an explicit registry (`filimon.toml`) — v1.0
+- ✓ Host-provided HTTP fetch import with per-plugin domain allowlist, timeouts, and rate limiting — v1.0
+- ✓ Host-driven polling: host calls `poll(cursor)` on a schedule, persists the returned cursor, produces items to Fluvio — v1.0
+- ✓ Host passes each plugin's resolved settings and secrets into `init` (loading/validation done in Phase 1; delivery needs the Phase 3 host) — v1.0
+- ✓ Generic host-managed OAuth (PKCE + local callback): `fili auth login <plugin>`, token storage and refresh on the host; plugin TOML declares endpoints/scopes; plugin receives only access tokens via WIT — v1.0
+- ✓ Reference Reddit plugin (official Reddit API) as a separately built `.wasm` component — v1.0
+- ✓ Reference YouTube plugin (official YouTube Data API) as a separately built `.wasm` component — v1.0
+- ✓ Fetcher plugins: a second WIT world (`fetcher`) so the HTTP client is itself a supplied WASM component; source plugins' fetch and (optionally) the news crawler route through the configured fetcher; default HTTP fetcher shipped; host still enforces allowlist/timeout — v1.0
+- ✓ Plugin CLI: `fili plugins list | check | run-once`, plus a run command that polls all enabled sources — v1.0
+- ✓ Fixture-based tests per plugin (synthetic fixtures, not recorded; runs in CI without network or keys) — v1.0
 
 ### Active
 
-- [ ] Plugin host in `fili` built on the WASM component model, loading `.wasm` components listed in an explicit registry (`filimon.toml`)
-- [ ] Host-provided HTTP fetch import with per-plugin domain allowlist, timeouts, and rate limiting
-- [ ] Host-driven polling: host calls `poll(cursor)` on a schedule, persists the returned cursor, produces items to Fluvio
-- [ ] Host passes each plugin's resolved settings and secrets into `init` (loading/validation done in Phase 1; delivery needs the Phase 3 host)
-- [ ] Generic host-managed OAuth (PKCE + local callback): `fili auth login <plugin>`, token storage and refresh on the host; plugin TOML declares endpoints/scopes; plugin receives only access tokens via WIT
-- [ ] Reference Reddit plugin (official Reddit API) as a separately built `.wasm` component
-- [ ] Reference YouTube plugin (official YouTube Data API) as a separately built `.wasm` component
-- [ ] Fetcher plugins: a second WIT world (`fetcher`) so the HTTP client is itself a supplied WASM component; source plugins' fetch and (optionally) the news crawler route through the configured fetcher; default HTTP fetcher shipped; host still enforces allowlist/timeout
-- [ ] Plugin CLI: `fili plugins list | check | run-once`, plus a run command that polls all enabled sources
-- [ ] Fixture-based tests per plugin (recorded API responses; runs in CI without network or keys)
+(None yet — define with `/gsd-new-milestone`. Candidates: X plugin once API access is sorted, social SmartModule filtering, search/comments feeds, the v1 tech-debt items in `.planning/milestones/v1-MILESTONE-AUDIT.md`.)
 
 ### Out of Scope
 
@@ -58,6 +59,7 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - GLiNER NER runs consumer-side (ONNX model too large for WASM).
 - `fluvio/` in the workspace root is a separate git checkout of the upstream Fluvio repo (reference only).
 - Known concerns relevant to this work (from CONCERNS.md): streaming layer silently drops deserialization errors; HTTP client in crawler is rebuilt per request; crawler disables TLS cert validation (sandbox-only) — the new host fetch must NOT inherit that.
+- Shipped v1 (8 phases, 41 requirements) with known tech debt: draft VALIDATION.md on phases 1/7/8, open review warnings in phases 3 and 5, synthetic (not recorded) plugin fixtures, live Reddit proof waived, and local commits e13466b/af7aeea with author names/PERSON entities that must not be pushed before a history decision.
 - Motivation: social posts are additional sources feeding the same output — not a separate analytics product.
 
 ## Constraints
@@ -73,21 +75,21 @@ A user-supplied WASM component, written only against filimon's published WIT con
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| WASM components with WIT for plugins | Sandboxed, language-agnostic, third parties can supply plugins without rebuilding `fili` | — Pending |
-| Host-provided fetch import (not WASI HTTP) | Host enforces domain allowlist, rate limits, timeouts; plugins stay simple | — Pending |
-| Host polls plugins; host owns cursor | Plugins stay stateless; scheduling, persistence and backpressure in one place | — Pending |
-| Explicit registry (`filimon.toml`) | Nothing runs unless listed; predictable and auditable | — Pending |
-| Keys in `.env`, settings in per-plugin TOML | Separates secrets from shareable config | — Pending |
-| Generic host-managed OAuth (PKCE) | Written once, reused by any plugin; refresh tokens stay on host | — Pending |
+| WASM components with WIT for plugins | Sandboxed, language-agnostic, third parties can supply plugins without rebuilding `fili` | ✓ Good — shipped and verified in v1 |
+| Host-provided fetch import (not WASI HTTP) | Host enforces domain allowlist, rate limits, timeouts; plugins stay simple | ✓ Good — shipped and verified in v1 |
+| Host polls plugins; host owns cursor | Plugins stay stateless; scheduling, persistence and backpressure in one place | ✓ Good — shipped and verified in v1 |
+| Explicit registry (`filimon.toml`) | Nothing runs unless listed; predictable and auditable | ✓ Good — shipped and verified in v1 |
+| Keys in `.env`, settings in per-plugin TOML | Separates secrets from shareable config | ✓ Good — shipped and verified in v1 |
+| Generic host-managed OAuth (PKCE) | Written once, reused by any plugin; refresh tokens stay on host | ✓ Good — shipped and verified in v1 |
 | Unified `SourceItem` envelope, per-type SmartModule chains | Social posts aren't HTML; still converge on same enriched output | ✓ Good — Phase 2: news keeps the WISE chain, social items skip it (D-01 leaves the SmartModules unchanged), both reach one NER-enriched output |
-| Ship Reddit + YouTube; defer X | X read access requires paid app tier regardless of user login | — Pending |
-| Leave existing `fluvio-wise` gaps alone | Keep milestone focused on plugin system | — Pending |
-| Fetcher is itself a WASM plugin (`fetcher` world) | Lets a future headless-browser fetcher (remote CDP) be supplied for crawling without host changes | — Pending |
+| Ship Reddit + YouTube; defer X | X read access requires paid app tier regardless of user login | ✓ Good — shipped and verified in v1 |
+| Leave existing `fluvio-wise` gaps alone | Keep milestone focused on plugin system | ✓ Good — v1 stayed in scope; gaps remain for a later milestone |
+| Fetcher is itself a WASM plugin (`fetcher` world) | Lets a future headless-browser fetcher (remote CDP) be supplied for crawling without host changes | ✓ Good — shipped and verified in v1 |
 | Consumer diagnostics never carry record content, and all stderr writes go through one choke point | Record values are untrusted (page content, social text) and reach a terminal; control bytes and content must not leak | ✓ Good — Phase 2 (02-02, 02-04) |
 | An out-of-range `published` becomes null with a located note; the record is still written, and a record and its notes stay one item | A bad timestamp must not lose a record, and a note must never name a record that was not written | ✓ Good — Phase 2 (02-06, 02-07) |
-| Social items pass through (no social SmartModule chain in v1) | Keep v1 minimal; filtering deferred to v2 | — Pending |
-| Reddit: subreddits + user feed; YouTube: channel uploads + user subscriptions | User-selected v1 feeds; search/comments deferred | — Pending |
-| Skip project-level research | User decision at init; per-phase research remains enabled | — Pending |
+| Social items pass through (no social SmartModule chain in v1) | Keep v1 minimal; filtering deferred to v2 | ✓ Good — shipped and verified in v1 |
+| Reddit: subreddits + user feed; YouTube: channel uploads + user subscriptions | User-selected v1 feeds; search/comments deferred | ✓ Good — shipped and verified in v1 |
+| Skip project-level research | User decision at init; per-phase research remains enabled | ✓ Good — v1 |
 | Plugin components target `wasm32-unknown-unknown` (no WASI imports) | Every capability is an explicit WIT import; smallest attack surface | ✓ Phase 1 — host acceptance of wasip1 components open for Phase 3 |
 | Hand-written literal-or-reject `.env` parser (dotenvy removed) | dotenvy 0.15 always expands `$` from the process env (CR-01); verbatim-or-reject closes it and stays reversible | ✓ Phase 1 (01-05) |
 | Secrets wrapped in redacting `Secret` newtype; diagnostics carry alias/env names only | Secret values never reach Debug, tracing or rendered reports | ✓ Phase 1 |
@@ -115,4 +117,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-11-15 after Phase 8*
+*Last updated: 2026-11-15 after v1 milestone*
