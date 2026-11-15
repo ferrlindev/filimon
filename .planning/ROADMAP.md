@@ -19,7 +19,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 5: Fetcher Layer** - Plugin HTTP routed through a configurable fetcher component, a host-enforced allowlist and timeout, a default TLS-validating fetcher, and an optional crawler hook (completed 2026-11-11)
 - [x] **Phase 6: Host-Managed OAuth** - `fili auth login | status | logout` with PKCE, host-side token storage and refresh, and only access tokens passed to plugins (completed 2026-11-11)
 - [x] **Phase 7: Reddit & YouTube Plugins** - Two separately built reference `.wasm` source components on the official APIs, each with offline fixture tests (completed 2026-11-12)
-- [ ] **Phase 8: Integration, Live E2E & Authoring** - Compiled plugins tested in the host against replayed and live APIs, a live end-to-end run, and a guide that lets third parties build plugins outside the repo
+- [x] **Phase 8: Integration, Live E2E & Authoring** - Compiled plugins tested in the host against replayed and live APIs, a live end-to-end run, and a guide that lets third parties build plugins outside the repo (completed 2026-11-15)
 
 ## Phase Details
 
@@ -250,7 +250,7 @@ Plans:
   3. A live end-to-end run works: `fili` loads the Reddit and YouTube plugins, polls the real APIs, and records flow through Fluvio. The consumer writes NER-enriched social records alongside news articles in the same JSON output.
   4. Using only the plugin template and guide, a source plugin built with `cargo component` in a directory outside the filimon repo, against only the published WIT, is registered in `filimon.toml` and runs in an unmodified `fili` binary.
   5. The guide covers writing a fetcher plugin and assigning it to a source, and a fetcher built by following it serves that source's requests.
-**Plans:** 7/7 plans executed
+**Plans:** 7/7 plans complete
 
 Plans:
 **Wave 1**
@@ -280,4 +280,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Ph
 | 5. Fetcher Layer | 8/8 | Complete    | 2026-11-11 |
 | 6. Host-Managed OAuth | 9/9 | Complete    | 2026-11-11 |
 | 7. Reddit & YouTube Plugins | 12/12 | Complete    | 2026-11-12 |
-| 8. Integration, Live E2E & Authoring | 7/7 | In Progress | - |
+| 8. Integration, Live E2E & Authoring | 7/7 | Complete    | 2026-11-15 |

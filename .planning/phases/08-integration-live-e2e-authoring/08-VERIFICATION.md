@@ -1,6 +1,6 @@
 ---
 phase: 08-integration-live-e2e-authoring
-verified: 2026-11-15T08:00:00Z
+verified: 2026-11-15T15:30:00Z
 status: passed
 score: 5/5 must-haves verified
 covered_files:
@@ -30,7 +30,7 @@ covered_files:
   - scripts/verify-authoring.sh
   - src/plugins/host/integration_tests.rs
   - src/plugins/host/testing.rs
-covered_digest: "v4:sha256:8418bd9aa0f49a55474ac8c478c944a8b9f6d518c56440e443c16a41b3cde38f"
+covered_digest: "v4:sha256:1fb85c2166894eef66e6cf20a1719f6eca35cd939d4d13c9377bc7388d3a13c1"
 behavior_unverified: 0
 overrides_applied: 1
 overrides:
@@ -44,7 +44,8 @@ re_verification:
   gaps_closed:
     - "Human verification item 1 (Reddit waiver): ruled by the user, accepted, applied above as an override"
     - "Human verification item 2 (YouTube live-run provenance, CR-01): CR-01 fixed in 508db2a, live script rerun from an empty state directory, evidence regenerated in af7aeea"
-    - "Documentation defects: evidence/authoring-README.md claim about plugins/replay-fetcher corrected (verified against the tag); README and SUMMARY 'poll of this run' claim now rests on a fresh poll (see residual note about per-record attribution)"
+    - "Documentation defects: evidence/authoring-README.md claim about plugins/replay-fetcher corrected (verified against the tag); README and SUMMARY 'poll of this run' claim now rests on a fresh poll and, after 0dcaf3f, no longer overstates per-record attribution"
+    - "Transcript privacy defect (author names and PERSON entities in the committed transcript, contrary to D-08): display removed in 0dcaf3f, script fixed in 9312a8c, check-evidence now fails on such lines"
   gaps_remaining: []
   regressions: []
 ---
@@ -52,9 +53,22 @@ re_verification:
 # Phase 8: Integration, Live E2E & Authoring Verification Report
 
 **Phase Goal:** The whole system is proven end to end. Compiled plugins run inside the host against replayed and live APIs into Fluvio, enriched social JSON comes out alongside news, and a third party can build and register a plugin from the guide alone
-**Verified:** 2026-11-15T08:00:00Z
+**Verified:** 2026-11-15T15:30:00Z
 **Status:** passed (one success criterion passes by an accepted user override)
-**Re-verification:** Yes, after the user's rulings (Reddit waiver accepted, CR-01 fixed and the live script rerun)
+**Re-verification:** Yes (second re-verification), after commits 9312a8c and 0dcaf3f (transcript redaction, script hardening, README/SUMMARY softening)
+
+### Second re-verification note (2026-11-15T15:30:00Z)
+
+Changed since the previous pass: `scripts/live-e2e.sh` (consumer display to gitignored `consume.log`, check-evidence rejects `Author :` names other than `--`/`redacted` and any `[PERSON]` line in the transcript, selftest extended), `evidence/live-e2e-transcript.txt` (consumer display replaced by a marker), `evidence/README.md`, `08-06-SUMMARY.md`. Checked by me:
+
+- `scripts/live-e2e.sh selftest` prints `SELFTEST: PASS`; `scripts/live-e2e.sh check-evidence <evidence dir>` prints `ok: evidence is complete and clean`.
+- Transcript (73 lines now): 0 `Author :` lines, 0 `[PERSON]` lines, 0 e-mail-like strings, 0 `AIza`. It still shows steps 1 to 4, `source youtube: ok`, the Reddit waiver warning, and the `WISE Pipeline Summary` box (`Records kept : 51`). Line 60 to 61 is an explicit marker saying the display was omitted (606 lines) under D-08.
+- The new check is real, not vacuous: run against the previous transcript from `0dcaf3f^`, the same pattern the script uses (`^ Author : ` not followed by `--`/`redacted`) matches 31 lines and `[PERSON]` matches 23 lines, so the old transcript would now fail.
+- README and SUMMARY sentences: the YouTube provenance paragraph now says a fresh poll happened (work log, state wipe) and that the sample cannot show which poll produced which record, with the duplicate id disclosed; the transcript description now says the consumer display was removed. Both match what I verified earlier. One nit, not a defect: the README describes the transcript as holding "fixed texts, key names and counts"; the counts present are page and record totals (`Pages produced: 5`, `Records kept: 51`), not poll counts, and the README separately says poll counts are only in the uncommitted log.
+- SC1: `cargo test -p filimon e2e_replay_` 5 passed, 0 failed. SC4/SC5: `scripts/verify-authoring.sh` printed `AUTHORING PROOF: PASS (legs: source fetcher)`. SC2 and SC3 conclusions unchanged (committed `credentialed-tests.txt`, `enriched-sample.json` and `WAIVER.md` are untouched by these commits; the override is unchanged).
+- Known residual, disclosed in 08-06-SUMMARY deviation 7: the two earlier unpushed commits (e13466b, af7aeea) still contain the names in local git history; the user chose not to rewrite history and not to push yet. Tip-of-tree evidence is clean; pushing as-is would publish those names. This is a decision for the user, not a phase gap.
+
+Verdict unchanged: passed, 5/5, with the one user-accepted override.
 
 ## Goal Achievement
 
@@ -87,7 +101,7 @@ re_verification:
 - Entities: every record has an `entities` array, minimum 2, maximum 9; the YouTube records have 2 each (PRODUCT/ORGANIZATION, PRODUCT/PERSON).
 - `raw` is null on all 14; `author` is null or `redacted` on all 14; 0 e-mail-address matches; 0 `AIza` matches in any evidence file; `scripts/live-e2e.sh check-evidence` prints `ok: evidence is complete and clean`.
 - YouTube ids `vLAegkGGWrM` and `rsOiZE19RVo` are real video ids (they appear in the live transcript and in the live consume output, not replay-fixture ids such as `vidNew00001`). No Reddit record in the sample. The transcript itself, however, prints three replay-fixture Reddit records (`reddit.com/r/rust/comments/fili02`, author `u1`, text `lol cat`) that were already in the production topic; the README says Reddit records in the topics are not from this run and were kept out of the sample. Accurate.
-- Minor, not a failure: the transcript contains raw consume output, including YouTube channel names and PERSON entity text (for example public video credits). `evidence/README.md` describes the transcript as "key names and fixed texts only", which understates that. The data is public YouTube metadata and no credential or e-mail address is present.
+- (Superseded by 0dcaf3f, see the second re-verification note: the consumer display is no longer in the committed transcript.) Previously: the transcript contained raw consume output, including YouTube channel names and PERSON entity text (for example public video credits). `evidence/README.md` describes the transcript as "key names and fixed texts only", which understates that. The data is public YouTube metadata and no credential or e-mail address is present.
 
 **(iii) Corrected statements.**
 
@@ -162,9 +176,9 @@ None. Both items from the first report are resolved by the user's rulings (see `
 
 ### Gaps Summary
 
-No gaps. SC1, SC2 (mechanism and YouTube), SC4 and SC5 were re-verified by commands I ran. SC3's YouTube plus news half is now backed by a run whose fresh poll is guaranteed by committed script behavior (state wipe plus selftest) and corroborated by the gitignored work log and status file timestamp; its Reddit half passes only through the user's accepted waiver, which does not meet the roadmap's literal "real Reddit data" and is deferred. Minor documentation notes to optionally tidy: the README/SUMMARY sentence "YouTube records come from the live poll of this run" should be softened to say the topic also held the earlier run's copies (the sample contains one such duplicate pair), and the README's "key names and fixed texts only" description of the transcript understates that it includes raw consume output.
+No gaps. SC1, SC2 (mechanism and YouTube), SC4 and SC5 were re-verified by commands I ran. SC3's YouTube plus news half is now backed by a run whose fresh poll is guaranteed by committed script behavior (state wipe plus selftest) and corroborated by the gitignored work log and status file timestamp; its Reddit half passes only through the user's accepted waiver, which does not meet the roadmap's literal "real Reddit data" and is deferred. The two documentation notes from the previous pass are resolved in 0dcaf3f (attribution sentence softened; transcript consumer display removed). Residual for the user: names remain in unpushed local history (e13466b, af7aeea).
 
 ---
 
-_Verified: 2026-11-15T08:00:00Z_
+_Verified: 2026-11-15T15:30:00Z_
 _Verifier: Claude (gsd-verifier)_

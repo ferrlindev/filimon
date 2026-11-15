@@ -11,7 +11,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 - [x] **WIT-01**: A versioned WIT package in the repo defines a `source` world — plugin exports `init(settings, secrets)` and `poll(cursor, access-token) -> (items, next-cursor)`; host provides `fetch` and `log` imports, and supplies settings, the plugin's named secrets, and access tokens via the `init`/`poll` parameters
 - [x] **WIT-02**: The same WIT package defines a `fetcher` world — fetcher exports `fetch(request) -> response`; host provides a low-level outbound-HTTP capability import
-- [ ] **WIT-03**: A plugin built outside the filimon repo, using only the published WIT, loads and runs in `fili` without rebuilding `fili`
+- [x] **WIT-03**: A plugin built outside the filimon repo, using only the published WIT, loads and runs in `fili` without rebuilding `fili`
 
 ### Plugin Host
 
@@ -70,14 +70,14 @@ Requirements for this milestone. Each maps to roadmap phases.
 ### Testing
 
 - [x] **TEST-01**: Each plugin has unit tests against recorded API fixtures — no network or keys required
-- [ ] **TEST-02**: Integration tests run the compiled Reddit and YouTube `.wasm` plugins inside the host against replayed fixtures and assert the expected `SourceItem`s reach a local Fluvio topic
+- [x] **TEST-02**: Integration tests run the compiled Reddit and YouTube `.wasm` plugins inside the host against replayed fixtures and assert the expected `SourceItem`s reach a local Fluvio topic
 - [x] **TEST-03**: Integration tests have a live mode that runs against real APIs only when credentials are present in `.env`
-- [ ] **TEST-04**: A live end-to-end run with real Reddit and YouTube data produces enriched JSON alongside news articles
+- [x] **TEST-04**: A live end-to-end run with real Reddit and YouTube data produces enriched JSON alongside news articles (complete with the Reddit waiver accepted by the user on 2026-11-15; live Reddit proof deferred, see STATE.md Deferred Items)
 
 ### Authoring
 
-- [ ] **DOCS-01**: Plugin template plus guide covering building a source plugin with `cargo component`, writing its TOML, and registering it in `filimon.toml`
-- [ ] **DOCS-02**: Guide covers writing a fetcher plugin and assigning it to a source
+- [x] **DOCS-01**: Plugin template plus guide covering building a source plugin with `cargo component`, writing its TOML, and registering it in `filimon.toml`
+- [x] **DOCS-02**: Guide covers writing a fetcher plugin and assigning it to a source
 
 ## v2 Requirements
 
@@ -128,7 +128,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | WIT-01 | Phase 1 | Complete |
 | WIT-02 | Phase 1 | Complete |
-| WIT-03 | Phase 8 | Pending |
+| WIT-03 | Phase 8 | Complete |
 | HOST-01 | Phase 3 | Complete |
 | HOST-02 | Phase 3 | Complete |
 | HOST-03 | Phase 3 | Complete |
@@ -160,11 +160,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | YTUB-02 | Phase 7 | Complete |
 | YTUB-03 | Phase 7 | Complete |
 | TEST-01 | Phase 7 | Complete |
-| TEST-02 | Phase 8 | Pending |
+| TEST-02 | Phase 8 | Complete |
 | TEST-03 | Phase 8 | Complete |
-| TEST-04 | Phase 8 | Pending |
-| DOCS-01 | Phase 8 | Pending |
-| DOCS-02 | Phase 8 | Pending |
+| TEST-04 | Phase 8 | Complete |
+| DOCS-01 | Phase 8 | Complete |
+| DOCS-02 | Phase 8 | Complete |
 
 **Coverage:**
 - v1 requirements: 39 total

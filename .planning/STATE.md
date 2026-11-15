@@ -1,19 +1,18 @@
 ---
 gsd_state_version: "1.0"
 current_phase: 08
-current_phase_name: Integration, Live E2E & Authoring
-status: executing
-stopped_at: Completed 08-06-PLAN.md
-last_updated: "2026-11-15T06:11:30.018Z"
-last_activity: 2026-11-12
-last_activity_desc: Phase 08 execution resumed (wave continue)
-state_head: b29525cf909a30cc04f0c6293cd228bfd7cca42c
+status: completed
+stopped_at: Phase 08 complete — all phases complete
+last_updated: "2026-11-15T06:59:37.938Z"
+last_activity: 2026-11-15
+last_activity_desc: Phase 08 complete
+state_head: 0dcaf3f0200ce5cb056be6d65a0b13232988bfa9
 progress:
   total_phases: 8
-  completed_phases: 7
+  completed_phases: 8
   total_plans: 65
   completed_plans: 65
-  percent: 88
+  percent: 100
 ---
 
 # Project State
@@ -27,17 +26,17 @@ See: .planning/PROJECT.md (updated 2026-11-09)
 
 ## Current Position
 
-Phase: 08 (Integration, Live E2E & Authoring) — EXECUTING
-Plan: 7 of 7 (all plans executed)
-Status: Phase 08 plans complete; ready for verification (Reddit waiver awaits a ruling)
-Last activity: 2026-11-15 — Plan 08-06 complete (live E2E evidence, Reddit waived)
+Phase: 08
+Plan: Not started
+Status: All phases complete
+Last activity: 2026-11-15 — Phase 08 complete
 
-Progress: [█████████░] 88%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 58
+- Total plans completed: 65
 - Average duration: -
 - Total execution time: 0.0 hours
 
@@ -52,6 +51,7 @@ Progress: [█████████░] 88%
 | 05 | 8 | - | - |
 | 06 | 9 | - | - |
 | 07 | 12 | - | - |
+| 08 | 7 | - | - |
 
 **Recent Trend:**
 - Last 5 plans: -
@@ -80,7 +80,7 @@ Recent decisions affecting current work:
 - [Phase 2]: Every record is a `SourceItem`. News keeps the WISE SmartModule chain; social items pass straight through to the consumer (D-01 leaves the SmartModules unchanged); both land in one NER-enriched JSON output.
 - [Phase 2]: Consumer diagnostics never carry record content and all stderr goes through `print_diagnostic`. A social record and its notes travel as one `Incoming::Noted` item, so no stop can separate them.
 - [Phase 2]: UAT 3/3 passed; SECURITY.md verified with threats_open: 0 (36/36 threats closed).
-- [Phase 08]: 08-06: Reddit waived by the user for the live E2E (reason: takes time to complete); Reddit half of SC3/TEST-04 unmet, to be accepted or rejected at verification
+- [Phase 08]: 08-06: Reddit waived by the user for the live E2E (reason: takes time to complete); Reddit half of SC3/TEST-04 unmet; the user accepted the waiver at verification on 2026-11-15 and live Reddit proof is a deferred item
 - [Phase 08]: 08-06: live E2E news crawl routed through a generated registry with [crawler] fetcher=http; registry-less fili produce still panics (src/crawler.rs blocking client in async main)
 
 ### Pending Todos
@@ -108,5 +108,5 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-11-15T06:11:29.159Z
-Stopped at: Completed 08-06-PLAN.md
+Stopped at: Phase 08 complete — all phases complete
 Resume file: None
