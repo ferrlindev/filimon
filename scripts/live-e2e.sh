@@ -263,12 +263,18 @@ cmd_sanitise() {
     return 1
   fi
   tmp="$(mktemp "${out}.XXXXXX")"
-  if jq --argjson n "$SAMPLE_PER_TYPE" '
+  if [ -n "${LIVE_E2E_WAIVE_REDDIT:-}" ]; then
+    echo "note: Reddit is waived; Reddit records in the topics are not from this run and stay out of the sample"
+  fi
+  # Newest records first within each source type and platform: the consumer reads the topics from
+  # the beginning, so older records (fixtures, earlier runs) come first and this run's come last.
+  if jq --argjson n "$SAMPLE_PER_TYPE" --arg waive "${LIVE_E2E_WAIVE_REDDIT:-}" '
       def mail: if type == "string"
                 then gsub("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"; "[email]")
                 else . end;
-      group_by([.source_type, .platform])
-      | map(.[0:$n])
+      (if $waive != "" then map(select(.platform != "reddit")) else . end)
+      | group_by([.source_type, .platform])
+      | map(sort_by(.published // "") | reverse | .[0:$n])
       | add // []
       | map(
           .raw = null
@@ -307,7 +313,7 @@ scan_value() {
 
 # check-evidence <dir>
 cmd_check_evidence() {
-  local dir="${1:-}" sample transcript pf line key file jqfilter what
+  local dir="${1:-}" sample transcript pf line key file jqfilter what seed_host
   if [ -z "$dir" ]; then
     usage
     return 2
@@ -336,7 +342,24 @@ cmd_check_evidence() {
       if [ ! -f "$dir/WAIVER.md" ]; then
         check_sample "sample has a reddit record" "raise LIMIT, or waive Reddit with the user's reason (D-09)" \
           'map(select(.platform == "reddit")) | length > 0'
+      else
+        check_sample "a waived sample holds no reddit record" \
+          "sanitise again with LIVE_E2E_WAIVE_REDDIT set; Reddit records in the topics are replay or older data and never stand in for the live sample (D-09)" \
+          'map(select(.platform == "reddit")) | length == 0'
       fi
+      # Provenance of the news side: at least one news record must come from this run's crawl seed host.
+      seed_host="${NEWS_SEED_URL#*://}"
+      seed_host="${seed_host%%/*}"
+      case "$seed_host" in
+        '' | *[!A-Za-z0-9.-]*)
+          say_fail "NEWS_SEED_URL" "has no usable host ($seed_host)"
+          ;;
+        *)
+          check_sample "sample has a news record from the crawl seed host $seed_host" \
+            "raise LIMIT so the consumer reaches this run's records, then rerun" \
+            "map(select(.source_type == \"news\" and ((.url // \"\") | (startswith(\"https://$seed_host/\") or startswith(\"http://$seed_host/\"))))) | length > 0"
+          ;;
+      esac
       check_sample "a social record has entities" "run the consumer with --enrich-ner and the GLiNER model" \
         'map(select(.source_type == "social" and ((.entities // []) | length > 0))) | length > 0'
       check_sample "raw is null on every record" "sanitise the output again" \
@@ -621,6 +644,10 @@ selftest_fail() {
 
 cmd_selftest() {
   local t out rc long ev ev2
+  # The selftest must not depend on the operator's environment: no waiver, and the seed host of the
+  # synthetic news records (https://example.org/...).
+  unset LIVE_E2E_WAIVE_REDDIT
+  export NEWS_SEED_URL="https://example.org/"
   t="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$t'" EXIT
@@ -671,6 +698,23 @@ cmd_selftest() {
     || selftest_fail "a non-PERSON entity was dropped"
   jq -e 'any(.[]; .article != null)' "$t/sample.json" >/dev/null || selftest_fail "the article object was dropped"
   jq -e 'tojson | contains("@") | not' "$t/sample.json" >/dev/null || selftest_fail "an e-mail address remains"
+
+  # 1b. the newest records win, so this run's data is not crowded out by older topic content
+  jq -n '[ range(0; 5) as $i | { source_type: "news", platform: "p", id: "n\($i)", url: "https://example.org/\($i)",
+           title: "t", text: "x", author: null, published: "2026-11-1\($i)T00:00:00Z", raw: null, entities: [], article: null } ]' \
+    >"$t/order-in.json"
+  SAMPLE_PER_TYPE=2 "$SELF" sanitise "$t/order-in.json" "$t/order-out.json" >"$t/out.txt" 2>&1 \
+    || selftest_fail "sanitise failed on the ordering input"
+  jq -e 'map(.id) | sort == ["n3", "n4"]' "$t/order-out.json" >/dev/null \
+    || selftest_fail "sanitise did not keep the newest records"
+
+  # 1c. under a waiver no reddit record reaches the sample
+  LIVE_E2E_WAIVE_REDDIT="selftest reason" SAMPLE_PER_TYPE=3 "$SELF" sanitise "$t/in.json" "$t/waived-sample.json" >"$t/out.txt" 2>&1 \
+    || selftest_fail "a waived sanitise exited non-zero"
+  jq -e 'map(select(.platform == "reddit")) | length == 0' "$t/waived-sample.json" >/dev/null \
+    || selftest_fail "a waived sanitise kept reddit records"
+  jq -e 'map(select(.platform == "youtube")) | length > 0' "$t/waived-sample.json" >/dev/null \
+    || selftest_fail "a waived sanitise dropped the youtube records"
 
   # 2. check-evidence on the clean sample
   printf 'ok: synthetic transcript\nstep 1: news\n' >"$t/transcript.txt"
@@ -729,6 +773,26 @@ cmd_selftest() {
   env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY ENV_FILE="$t/fake.env" \
     "$SELF" check-evidence "$ev2" >"$t/out.txt" 2>&1 || rc=$?
   [ "$rc" -eq 0 ] || selftest_fail "a waived sample without reddit records did not pass"
+
+  # 5b. a waived sample that still holds reddit records fails (they are not from a live Reddit poll)
+  ev2="$t/ev-waived-with-reddit"
+  mk_evidence "$ev2"
+  printf 'Reddit waived (D-09): selftest reason\n2000-01-01\n' >"$ev2/WAIVER.md"
+  rc=0
+  env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY ENV_FILE="$t/fake.env" \
+    "$SELF" check-evidence "$ev2" >"$t/out.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 1 ] || selftest_fail "a waived sample holding reddit records did not fail"
+  grep -q 'FAIL: a waived sample holds no reddit record' "$t/out.txt" || selftest_fail "the waived reddit records were not named"
+
+  # 5c. no news record from the crawl seed host fails
+  ev2="$t/ev-no-seed-news"
+  mk_evidence "$ev2" 'map(if .source_type == "news" then .url = "https://other.example.net/x" else . end)'
+  rc=0
+  env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY ENV_FILE="$t/fake.env" \
+    "$SELF" check-evidence "$ev2" >"$t/out.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 1 ] || selftest_fail "a sample without news from the seed host did not fail"
+  grep -q 'FAIL: sample has a news record from the crawl seed host example.org' "$t/out.txt" \
+    || selftest_fail "the missing seed-host news record was not named"
 
   # 6. the D-09 gate (the fake fluvio first on PATH keeps this independent of a real cluster)
   rc=0
