@@ -1,7 +1,7 @@
 ---
 gsd_state_version: "1.0"
 status: Awaiting next milestone
-stopped_at: Phase 8 complete; milestone ready for audit/completion
+stopped_at: v1.0 milestone archived; awaiting /gsd-new-milestone
 last_updated: "2026-11-15T07:12:40.116Z"
 last_activity: 2026-11-15
 last_activity_desc: Milestone v1.0 completed and archived
@@ -22,7 +22,7 @@ current_phase: 08
 See: .planning/PROJECT.md (updated 2026-11-15)
 
 **Core value:** A user-supplied WASM component, written only against filimon's published WIT contract and listed in the registry, can stream items from a social platform into Fluvio and come out the other end as enriched records alongside news articles.
-**Current focus:** Milestone audit/completion (all 8 phases complete)
+**Current focus:** Planning next milestone (v1.0 shipped 2026-11-15)
 
 ## Current Position
 
