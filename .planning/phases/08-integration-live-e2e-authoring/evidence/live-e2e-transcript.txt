@@ -1,0 +1,511 @@
+live E2E run (TEST-04)
+Sun Nov 15 06:06:38 UTC 2026
+fili 0.3.0
+work directory: /Users/jferrolino/Devs/portfolio/filimon/.live-e2e
+note: the production topics keep earlier records for 7 days; a rerun can read older records.
+ok: jq on PATH
+ok: fili binary is executable
+ok: Fluvio cluster is up
+ok: topic filimon-raw-pages exists
+ok: topic filimon-social-items exists
+ok: SmartModule filimon/map-extract@0.1.0 is loaded
+ok: SmartModule filimon/map-preprocess@0.1.0 is loaded
+ok: SmartModule filimon/filter-relevance@0.1.0 is loaded
+warn: Reddit waived by the user: takes time to complete
+ok: YOUTUBE_API_KEY is set
+ok: component plugins/reddit/target/wasm32-unknown-unknown/release/reddit_source.wasm exists
+ok: component plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm exists
+ok: component plugins/youtube/target/wasm32-unknown-unknown/release/youtube_source.wasm exists
+ok: GLiNER tokenizer.json exists
+ok: GLiNER model.onnx exists
+step 1: news crawl of https://blog.rust-lang.org/ (fili produce)
+╔═══════════════════════════════════════════════╗
+║  filimon · Fluvio streaming news extractor    ║
+╚═══════════════════════════════════════════════╝
+
+[Crawl] fetching through the fetcher `http`, timeout 15 s, hosts: blog.rust-lang.org
+[Produce] Connecting to Fluvio cluster...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Crawl] Seed: https://blog.rust-lang.org/
+  Discovered 30 links (top priority: 0.89)
+
+  [1/6] p=1.00  https://blog.rust-lang.org/
+    → Produced to filimon-raw-pages
+
+  [2/6] p=0.89  https://blog.rust-lang.org/2018/12/06/call-for-rust-2019-roadmap-blogposts/
+    → Produced to filimon-raw-pages
+
+  [3/6] p=0.89  https://blog.rust-lang.org/2018/01/03/new-years-rust-a-call-for-community-blogposts/
+    → Produced to filimon-raw-pages
+
+  [4/6] p=0.85  https://blog.rust-lang.org/2024/09/24/webassembly-targets-change-in-default-target-features/
+    → Produced to filimon-raw-pages
+
+  [5/6] p=0.85  https://blog.rust-lang.org/2024/02/28/Clippy-deprecating-feature-cargo-clippy/
+    → Produced to filimon-raw-pages
+
+  [6/6] p=0.77  https://blog.rust-lang.org/2023/10/26/broken-badges-and-23k-keywords/
+    → Produced to filimon-raw-pages
+
+╔══════════════════════════════════════════╗
+║  Produce complete                         ║
+╠══════════════════════════════════════════╣
+║  Pages produced: 6                       ║
+║  Topic: filimon-raw-pages               ║
+╚══════════════════════════════════════════╝
+step 2: social run (fili run) until every enabled source reports a successful poll
+all enabled sources polled successfully; stopping fili run
+source youtube: ok
+step 3: consume with NER (fili consume --enrich-ner)
+╔═══════════════════════════════════════════════╗
+║  filimon · Fluvio streaming news extractor    ║
+╚═══════════════════════════════════════════════╝
+
+  Loading GLiNER NER engine...
+    tokenizer: models/gliner_small-v2.1/tokenizer.json
+    model: models/gliner_small-v2.1/onnx/model.onnx
+  NER: ✓ GLiNER loaded
+
+[Consume] Connecting to Fluvio cluster...
+[Consume] Reading filimon-raw-pages through filimon/map-preprocess@0.1.0 → filimon/map-extract@0.1.0 → filimon/filter-relevance@0.1.0
+[Consume] Reading filimon-social-items with no SmartModules
+[Consume] Will consume up to 100 records.
+
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] reddit  https://www.reddit.com/r/rust/comments/fili02
+------------------------------------------------------------------------------------------------------------------------
+ Title  : --
+ Author : u1
+ Published : 2024-10-27T03:33:20.123Z
+ Preview : lol cat
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] reddit  https://www.reddit.com/r/rust/comments/fili02
+------------------------------------------------------------------------------------------------------------------------
+ Title  : --
+ Author : u1
+ Published : 2024-10-27T03:33:20.123Z
+ Preview : lol cat
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] reddit  https://www.reddit.com/r/rust/comments/fili02
+------------------------------------------------------------------------------------------------------------------------
+ Title  : --
+ Author : u1
+ Published : 2024-10-27T03:33:20.123Z
+ Preview : lol cat
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=-nmcYcO-EE8
+------------------------------------------------------------------------------------------------------------------------
+ Title  : 🎵 Turning motion into music with Gemini
+ Author : Google for Developers
+ Published : 2026-10-16T16:00:00.000Z
+ Entities : Gemini [PRODUCT]  •  Google AI Studio [PRODUCT]  •  Google Antigravity [PRODUCT]  •  Google [ORGANIZATION]  •  Matias Piña Aguilera [PERSON]
+ Preview : Turning laptop movement into browser-based music: Creator utilized Google AI Studio, Google Antigravity, and Gemini to shift raw accelerometer data into audio responding to every tilt and gesture.  🔗 
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=LJ2v4-FvPcA
+------------------------------------------------------------------------------------------------------------------------
+ Title  : 🧰 Builders building with Gemini Audio
+ Author : Google for Developers
+ Published : 2026-10-16T21:00:00.000Z
+ Entities : Gemini Audio [PRODUCT]  •  Google DeepMind [ORGANIZATION]  •  Paige Bailey [PERSON]  •  Gemma [PERSON]  •  Lyria [PRODUCT]
+ Preview : Google DeepMind's Paige Bailey catches up with builders experimenting with our latest models. Watch as they dive deep into Gemma's open-weight capabilities to build powerful local applications, use Ly
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=SOF3_evPje8
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Design and replicate voices with Gemini 3.8 Flash TTS
+ Author : Google for Developers
+ Published : 2026-10-21T19:00:23.000Z
+ Entities : Gemini 3.8 [PRODUCT]  •  Google DeepMind [ORGANIZATION]  •  Thor Schaeff [PERSON]  •  LiveKit [PRODUCT]  •  Pipecat [PRODUCT]
+ Preview : See how Gemini 3.8 Flash TTS lets you design custom voices from a text prompt and replicate your own voice in Google AI Studio. Google DeepMind’s Thor Schaeff walks through:  *Voice design *Voice repl
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=CsF5oqVV5YE
+------------------------------------------------------------------------------------------------------------------------
+ Title  : 🔊 Voice design and voice replication with Gemini 3.8 Flash TTS
+ Author : Google for Developers
+ Published : 2026-10-21T23:00:08.000Z
+ Entities : Gemini 3.8 [PRODUCT]  •  Google DeepMind [ORGANIZATION]  •  Thor Schaeff [PERSON]  •  Google [ORGANIZATION]
+ Preview : Google DeepMind’s Thor Schaeff demos how Gemini 3.8 Flash TTS and Gemini 3.8 Flash-Lite TTS let you design custom voices from a text prompt or replicate your own, with support for 100+ languages and e
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=LOP8ul3KqQI
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Introducing Genie 4
+ Author : Google for Developers
+ Published : 2026-10-27T16:18:01.000Z
+ Entities : Genie 4 [PRODUCT]  •  Raia Hadsell [PERSON]  •  Diego Rivas [PERSON]  •  Hang Qi [PERSON]  •  Google DeepMind [ORGANIZATION]
+ Preview : Raia Hadsell, Diego Rivas, and Hang Qi from Google DeepMind join host Logan Kilpatrick to introduce Genie 4, the latest world model from Google DeepMind.   Their conversation covers: *What world model
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=pQ_Dnr9Q4k8
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Functional smart devices using Gemini 4 Argon and Google Antigravity
+ Author : Google for Developers
+ Published : 2026-10-28T15:08:11.000Z
+ Entities : Gemini 4 Argon [PRODUCT]  •  Google Antigravity [PRODUCT]  •  Surf Clock [PRODUCT]
+ Preview : What happens when you have a wild hardware idea and zero clue how to build it? Watch to see how these makers used Gemini 4 Argon and Google Antigravity to take a custom "Surf Clock" from a rough sketc
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=ID6vEy94j7c
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Building real-time vision & edge navigation with Gemini Live
+ Author : Google for Developers
+ Published : 2026-10-28T21:00:32.000Z
+ Entities : Gemini Live [PRODUCT]  •  Gemini [ORGANIZATION]  •  office [LOCATION]  •  Robotics ER 2.0 [PRODUCT]  •  Google [ORGANIZATION]
+ Preview : Meet Sprout, a semi-autonomous plant robot powered by Gemini. Watch as it navigates the office in search of sunlight, pings for help, and uses Gemini Live and Robotics ER 2.0 for vision to care for fe
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=cv8tEbKtEvk
+------------------------------------------------------------------------------------------------------------------------
+ Title  : 🪴 Building an autonomous plant rover with Gemini Live
+ Author : Google for Developers
+ Published : 2026-10-29T01:00:36.000Z
+ Entities : Gemini Live [PRODUCT]  •  Robotics ER 2.0 [PRODUCT]  •  office spaces [LOCATION]  •  Google [ORGANIZATION]  •  Xavier Plantaz [PERSON]
+ Preview : Meet Sprout: an semi-autonomous plant rover built with Gemini Live and Robotics ER 2.0 that navigates office spaces to hunt for sunlight and care for greenery.  🔗 Explore the build → https://goo.gle/3
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=rsOiZE19RVo
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Accelerate shipping to scale with Google Antigravity
+ Author : Google for Developers
+ Published : 2026-10-29T20:00:20.000Z
+ Entities : Google Antigravity [PRODUCT]  •  developers [PERSON]
+ Preview : Building software to move tens of millions of vehicles requires massive infrastructure. Using Google Antigravity, Move Cars delivers fully tested production features in a single day, letting a small t
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [social] youtube  https://www.youtube.com/watch?v=vLAegkGGWrM
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Building with Gemini in Google Antigravity
+ Author : Google for Developers
+ Published : 2026-11-12T17:00:11.000Z
+ Entities : Gemini [PRODUCT]  •  Google [ORGANIZATION]
+ Preview : See what you can build using our latest Gemini models in Google Antigravity.  From in-browser animation and multimodal prototyping to autonomous codebase modernization, explore how you can ship comple
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] example.com  https://example.com/news
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Tech Market Surges
+ Author : --
+ Published : --
+ Category : Business
+ Relevance : 0.448 | Words: 17
+ Keywords : market, around, artificial, break, experienc, growth, intelligence, investor, news, ralli, significant, stock
+ Entities : today [DATE]  •  investors [ORGANIZATION]  •  artificial intelligence stocks [PRODUCT]
+ Preview : The technology market experienced significant growth today as investors rallied around artificial intelligence stocks.
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] local  file://examples/fixtures/news-article.html
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Parliament passes national climate policy bill
+ Author : Jane Reporter
+ Published : 2024-05-01T09:00:00Z
+ Category : Politics
+ Relevance : 0.489 | Words: 70
+ Keywords : bill, climate, policy, national, parliament, economy, energy, government, next, passe, research, said
+ Entities : national climate policy bill [LAW_OR_REGULATION]  •  government [ORGANIZATION]  •  today [DATE]  •  Ministers [ORGANIZATION]  •  next year [DATE]
+ Preview : Parliament passes national climate policy bill The government won a decisive vote in parliament today on a national climate policy bill that sets new targets for energy production and emissions. Minis
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] local  file://examples/fixtures/news-article.html
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Parliament passes national climate policy bill
+ Author : Jane Reporter
+ Published : 2024-05-01T09:00:00Z
+ Category : Politics
+ Relevance : 0.489 | Words: 70
+ Keywords : bill, climate, policy, national, parliament, economy, energy, government, next, passe, research, said
+ Entities : national climate policy bill [LAW_OR_REGULATION]  •  government [ORGANIZATION]  •  today [DATE]  •  Ministers [ORGANIZATION]  •  next year [DATE]
+ Preview : Parliament passes national climate policy bill The government won a decisive vote in parliament today on a national climate policy bill that sets new targets for energy production and emissions. Minis
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] example.com  https://example.com/news
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Tech Market Surges
+ Author : --
+ Published : --
+ Category : Business
+ Relevance : 0.448 | Words: 17
+ Keywords : market, around, artificial, break, experienc, growth, intelligence, investor, news, ralli, significant, stock
+ Entities : today [DATE]  •  investors [ORGANIZATION]  •  artificial intelligence stocks [PRODUCT]
+ Preview : The technology market experienced significant growth today as investors rallied around artificial intelligence stocks.
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] local  file://examples/fixtures/news-article.html
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Parliament passes national climate policy bill
+ Author : Jane Reporter
+ Published : 2024-05-01T09:00:00Z
+ Category : Politics
+ Relevance : 0.489 | Words: 70
+ Keywords : bill, climate, policy, national, parliament, economy, energy, government, next, passe, research, said
+ Entities : national climate policy bill [LAW_OR_REGULATION]  •  government [ORGANIZATION]  •  today [DATE]  •  Ministers [ORGANIZATION]  •  next year [DATE]
+ Preview : Parliament passes national climate policy bill The government won a decisive vote in parliament today on a national climate policy bill that sets new targets for energy production and emissions. Minis
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] techcrunch.com  https://techcrunch.com
+------------------------------------------------------------------------------------------------------------------------
+ Title  : TechCrunch | Startup and Technology News
+ Author : --
+ Published : 2026-11-09T22:23:42Z
+ Category : Business
+ Relevance : 0.357 | Words: 1198
+ Keywords : 2026, techcrunch, hour, 8217, startup, loconsolo, security, theresa, brief, days, founder, venture
+ Entities : Nvidia [ORGANIZATION]  •  Connie Loizos [PERSON]  •  California [LOCATION]  •  Lucas Ropek [PERSON]  •  Anthropic [PRODUCT]
+ Preview : Image Credits: TechCrunch AI The race is on to sue Nvidia Connie Loizos 17 hours ago Government &amp; Policy California&#8217;s proposed &#8216;billionaire tax&#8217; fails to pass Lucas Ropek 10 hour
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] techcrunch.com  https://techcrunch.com/2026/11/09/jensen-huang-reportedly-engaged-a-pr-firm-with-a-history-of-handling-high-profile-sex-scandals-a-year-ago/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Jensen Huang reportedly engaged a PR firm with a history of handling high-profile sex scandals a year ago | TechCrunch
+ Author : Marina Temkin
+ Published : 2026-11-09T23:28:37Z
+ Category : Business
+ Relevance : 0.395 | Words: 448
+ Keywords : techcrunch, nvidia, huang, startup, jensen, report, heller, hour, scandal, 2026, 8217, amp
+ Entities : November 9, 2026 [DATE]  •  Jensen Huang [PERSON]  •  Heller Inc. [ORGANIZATION]  •  China [LOCATION]  •  Wired [ORGANIZATION]
+ Preview : In Brief Posted: 3:28 PM PST · November 9, 2026 Image Credits: Jose Sarmento Matos/Bloomberg / Getty Images Marina Temkin Jensen Huang reportedly engaged a PR firm with a history of handling high-prof
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] techcrunch.com  https://techcrunch.com/2026/11/05/claude-can-now-analyze-your-spending-with-its-new-personal-finance-tool/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Claude can now analyze your spending with its new Personal Finance tool | TechCrunch
+ Author : Aisha Malik
+ Published : 2026-11-05T18:00:00Z
+ Category : General News
+ Relevance : 0.367 | Words: 562
+ Keywords : claude, anthropic, finance, user, 8217, account, personal, techcrunch, spend, tool, aisha, connect
+ Entities : Anthropic [ORGANIZATION]  •  Thursday [DATE]  •  Claude [PERSON]  •  Personal Finance [PRODUCT]  •  users [PERSON]
+ Preview : Anthropic announced Thursday that Claude is getting a new tool called &#8220;Personal Finance,&#8221; designed to help users keep track of their money. With it, users can connect their bank and credit
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] techcrunch.com  https://techcrunch.com/2026/11/04/apple-is-reportedly-cutting-budgets-for-its-internal-ai-usage/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Apple is reportedly cutting budgets for its internal AI usage | TechCrunch
+ Author : Lucas Ropek
+ Published : 2026-11-05T01:26:22Z
+ Category : Business
+ Relevance : 0.412 | Words: 390
+ Keywords : techcrunch, apple, startup, 8217, amp, hour, 2026, daily, disrupt, engineer, luca, newsletter
+ Entities : November 4, 2026 [DATE]  •  Lucas Ropek [PERSON]  •  Apple [ORGANIZATION]  •  engineering teams [ORGANIZATION]  •  Bloomberg [ORGANIZATION]
+ Preview : In Brief Posted: 5:26 PM PST · November 4, 2026 Image Credits: STR/NurPhoto / Getty Images Lucas Ropek Apple is reportedly cutting budgets for its internal AI usage Apple is cutting the daily amount i
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] techcrunch.com  https://techcrunch.com/2026/11/08/sequoia-partners-reportedly-blindsided-when-roelof-botha-joined-spacex-board/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Sequoia partners reportedly blindsided when Roelof Botha joined SpaceX board | TechCrunch
+ Author : Anthony Ha
+ Published : 2026-11-08T19:51:30Z
+ Category : Business
+ Relevance : 0.400 | Words: 396
+ Keywords : techcrunch, botha, sequoia, startup, venture, days, roelof, board, partner, spacex, 2026, amp
+ Entities : November 8, 2026 [DATE]  •  Sequoia [ORGANIZATION]  •  Roelof Botha [PERSON]  •  SpaceX [ORGANIZATION]  •  Sequoia Capital [ORGANIZATION]
+ Preview : In Brief Posted: 11:51 AM PST · November 8, 2026 Image Credits: Kimberly White/Getty Images for TechCrunch Anthony Ha Sequoia partners reportedly blindsided when Roelof Botha joined SpaceX board Sequo
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] techcrunch.com  https://techcrunch.com/2026/11/09/anthropic-reportedly-plans-to-move-forward-with-ipo-plans/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Anthropic reportedly plans to move forward with IPO plans | TechCrunch
+ Author : Marina Temkin
+ Published : 2026-11-10T01:27:12Z
+ Category : Business
+ Relevance : 0.394 | Words: 368
+ Keywords : techcrunch, anthropic, startup, hour, plan, valuation, trillion, 2026, disrupt, newsletter, week, amp
+ Entities : November 9, 2026 [DATE]  •  Bloomberg [ORGANIZATION]  •  Anthropic [ORGANIZATION]  •  Nasdaq [ORGANIZATION]  •  CEO [PERSON]
+ Preview : In Brief Posted: 5:27 PM PST · November 9, 2026 Image Credits: Ruhani Kaur/Bloomberg / Getty Images Marina Temkin Anthropic reportedly plans to move forward with IPO plans Launching a major tech IPO w
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : The Rust Programming Language Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.334 | Words: 2308
+ Keywords : nbsp, rust, announc, may, sept, dec, apr, july, mar, nov, aug, feb
+ Entities : Rust teams [ORGANIZATION]
+ Preview : This is the main Rust blog . Rust teams use this blog to announce major developments in the world of Rust. See also: the &quot;Inside Rust&quot; blog , release announcements or tagged posts
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2018/12/06/call-for-rust-2019-roadmap-blogposts/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : A call for Rust 2019 Roadmap blog posts | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.342 | Words: 318
+ Keywords : rust, post, year, 2019, blog, community, like, roadmap, team, 2018, next, accept
+ Entities : Rust team [ORGANIZATION]  •  Rust [PRODUCT]  •  January 3 [DATE]  •  March 5th [DATE]  •  January 1 [DATE]
+ Preview : It's almost 2019! As such, the Rust team needs to create a roadmap for Rust's development next year. At the highest level, Rust's development process looks like this: We try to align this with the cal
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2018/01/03/new-years-rust-a-call-for-community-blogposts/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : New Year&#x27;s Rust: A Call for Community Blogposts | Rust Blog
+ Author : --
+ Published : --
+ Category : Sports
+ Relevance : 0.345 | Words: 329
+ Keywords : rust, post, community, blog, team, roadmap, 2018, year, goal, blogpost, call, feedback
+ Entities : Rust team [ORGANIZATION]  •  Last month [DATE]  •  2017 [DATE]  •  Last year [DATE]
+ Preview : 'Tis the season for people and communities to reflect and set goals- and the Rust team is no different. Last month, we published a blogpost about our accomplishments in 2017 , and the teams have alrea
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2024/09/24/webassembly-targets-change-in-default-target-features/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : WebAssembly targets: change in default target-features | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.302 | Words: 1250
+ Keywords : webassembly, rust, llvm, feature, proposal, default, type, reference, change, enabl, function, support
+ Entities : LLVM 19 [PRODUCT]  •  2024-10-17 [DATE]
+ Preview : The Rust compiler has recently upgraded to using LLVM 19 and this change accompanies some updates to the default set of target features enabled for WebAssembly targets of the Rust compiler. Beta Rust 
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2024/02/28/Clippy-deprecating-feature-cargo-clippy/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Clippy: Deprecating &#x60;feature &#x3D; &quot;cargo-clippy&quot;&#x60; | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.337 | Words: 297
+ Keywords : clippy, cargo, feature, lint, quot, config, rust, cfg, code, deprecat, allow, blog
+ Entities : 2016 [DATE]  •  Today [DATE]
+ Preview : Since Clippy v0.0.97 and before it was shipped with rustup , Clippy implicitly added a feature = "cargo-clippy" config [1] when linting your code with cargo clippy . Back in the day (2016) this was ne
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2023/10/26/broken-badges-and-23k-keywords/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : A tale of broken badges and 23,000 features | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.350 | Words: 423
+ Keywords : crate, feature, problem, rust, team, index, cargo, version, publish, 000, already, also
+ Entities : mid-October of 2023 [DATE]  •  crates.io [PRODUCT]  •  one of our users [PERSON]  •  shields.io [PRODUCT]  •  issue reporter [PERSON]
+ Preview : Around mid-October of 2023 the crates.io team was notified by one of our users that a shields.io badge for their crate stopped working. The issue reporter was kind enough to already debug the problem 
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : The Rust Programming Language Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.334 | Words: 2308
+ Keywords : nbsp, rust, announc, may, sept, dec, apr, july, mar, nov, aug, feb
+ Entities : Rust teams [ORGANIZATION]
+ Preview : This is the main Rust blog . Rust teams use this blog to announce major developments in the world of Rust. See also: the &quot;Inside Rust&quot; blog , release announcements or tagged posts
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2018/12/06/call-for-rust-2019-roadmap-blogposts/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : A call for Rust 2019 Roadmap blog posts | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.342 | Words: 318
+ Keywords : rust, post, year, 2019, blog, community, like, roadmap, team, 2018, next, accept
+ Entities : Rust team [ORGANIZATION]  •  Rust [PRODUCT]  •  January 3 [DATE]  •  March 5th [DATE]  •  January 1 [DATE]
+ Preview : It's almost 2019! As such, the Rust team needs to create a roadmap for Rust's development next year. At the highest level, Rust's development process looks like this: We try to align this with the cal
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2018/01/03/new-years-rust-a-call-for-community-blogposts/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : New Year&#x27;s Rust: A Call for Community Blogposts | Rust Blog
+ Author : --
+ Published : --
+ Category : Sports
+ Relevance : 0.345 | Words: 329
+ Keywords : rust, post, community, blog, team, roadmap, 2018, year, goal, blogpost, call, feedback
+ Entities : Rust team [ORGANIZATION]  •  Last month [DATE]  •  2017 [DATE]  •  Last year [DATE]
+ Preview : 'Tis the season for people and communities to reflect and set goals- and the Rust team is no different. Last month, we published a blogpost about our accomplishments in 2017 , and the teams have alrea
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2024/09/24/webassembly-targets-change-in-default-target-features/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : WebAssembly targets: change in default target-features | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.302 | Words: 1250
+ Keywords : webassembly, rust, llvm, feature, proposal, default, type, reference, change, enabl, function, support
+ Entities : LLVM 19 [PRODUCT]  •  2024-10-17 [DATE]
+ Preview : The Rust compiler has recently upgraded to using LLVM 19 and this change accompanies some updates to the default set of target features enabled for WebAssembly targets of the Rust compiler. Beta Rust 
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2024/02/28/Clippy-deprecating-feature-cargo-clippy/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : Clippy: Deprecating &#x60;feature &#x3D; &quot;cargo-clippy&quot;&#x60; | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.337 | Words: 297
+ Keywords : clippy, cargo, feature, lint, quot, config, rust, cfg, code, deprecat, allow, blog
+ Entities : 2016 [DATE]  •  Today [DATE]
+ Preview : Since Clippy v0.0.97 and before it was shipped with rustup , Clippy implicitly added a feature = "cargo-clippy" config [1] when linting your code with cargo clippy . Back in the day (2016) this was ne
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+ ■  [news] blog.rust-lang.org  https://blog.rust-lang.org/2023/10/26/broken-badges-and-23k-keywords/
+------------------------------------------------------------------------------------------------------------------------
+ Title  : A tale of broken badges and 23,000 features | Rust Blog
+ Author : --
+ Published : --
+ Category : General News
+ Relevance : 0.350 | Words: 423
+ Keywords : crate, feature, problem, rust, team, index, cargo, version, publish, 000, already, also
+ Entities : mid-October of 2023 [DATE]  •  crates.io [PRODUCT]  •  one of our users [PERSON]  •  shields.io [PRODUCT]  •  issue reporter [PERSON]
+ Preview : Around mid-October of 2023 the crates.io team was notified by one of our users that a shields.io badge for their crate stopped working. The issue reporter was kind enough to already debug the problem 
+------------------------------------------------------------------------------------------------------------------------
+
+╔══════════════════════════════════════════╗
+║           WISE Pipeline Summary           ║
+╠══════════════════════════════════════════╣
+║  Records kept  : 36                       ║
+║  Output file   : /Users/jferrolino/Devs/portfolio/filimon/.live-e2e/enriched.json║
+╚══════════════════════════════════════════╝
+raw output ready: /Users/jferrolino/Devs/portfolio/filimon/.live-e2e/enriched.json
+reminder: the production topics keep earlier records for 7 days; reruns accumulate.
+step 4: sanitise the sample
+note: Reddit is waived; Reddit records in the topics are not from this run and stay out of the sample
+ok: sanitised sample written to /Users/jferrolino/Devs/portfolio/filimon/.planning/phases/08-integration-live-e2e-authoring/evidence/enriched-sample.json

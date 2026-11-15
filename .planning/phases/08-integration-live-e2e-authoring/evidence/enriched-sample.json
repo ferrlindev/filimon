@@ -1,0 +1,667 @@
+[
+  {
+    "source_type": "news",
+    "platform": "blog.rust-lang.org",
+    "id": "https://blog.rust-lang.org/2023/10/26/broken-badges-and-23k-keywords/",
+    "url": "https://blog.rust-lang.org/2023/10/26/broken-badges-and-23k-keywords/",
+    "title": "A tale of broken badges and 23,000 features | Rust Blog",
+    "text": "Around mid-October of 2023 the crates.io team was notified by one of our users that a shields.io badge for their crate stopped working. The issue reporter was kind enough to already debug the problem and figured out that the API request that shields.io sends to crates.io was most",
+    "author": null,
+    "published": null,
+    "raw": null,
+    "entities": [
+      {
+        "text": "mid-October of 2023",
+        "kind": "DATE"
+      },
+      {
+        "text": "crates.io",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "shields.io",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.35,
+      "top_keywords": [
+        "crate",
+        "feature",
+        "problem",
+        "rust",
+        "team",
+        "index",
+        "cargo",
+        "version",
+        "publish",
+        "000",
+        "already",
+        "also"
+      ],
+      "inferred_category": "General News",
+      "word_count": 423,
+      "published_raw": null
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "blog.rust-lang.org",
+    "id": "https://blog.rust-lang.org/2024/02/28/Clippy-deprecating-feature-cargo-clippy/",
+    "url": "https://blog.rust-lang.org/2024/02/28/Clippy-deprecating-feature-cargo-clippy/",
+    "title": "Clippy: Deprecating &#x60;feature &#x3D; &quot;cargo-clippy&quot;&#x60; | Rust Blog",
+    "text": "Since Clippy v0.0.97 and before it was shipped with rustup , Clippy implicitly added a feature = \"cargo-clippy\" config [1] when linting your code with cargo clippy .\nBack in the day (2016) this was necessary to allow, warn or deny Clippy lints using attributes:\n# [ cfg_attr ( fea",
+    "author": null,
+    "published": null,
+    "raw": null,
+    "entities": [
+      {
+        "text": "2016",
+        "kind": "DATE"
+      },
+      {
+        "text": "Today",
+        "kind": "DATE"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.33662564715544285,
+      "top_keywords": [
+        "clippy",
+        "cargo",
+        "feature",
+        "lint",
+        "quot",
+        "config",
+        "rust",
+        "cfg",
+        "code",
+        "deprecat",
+        "allow",
+        "blog"
+      ],
+      "inferred_category": "General News",
+      "word_count": 297,
+      "published_raw": null
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "blog.rust-lang.org",
+    "id": "https://blog.rust-lang.org/2024/09/24/webassembly-targets-change-in-default-target-features/",
+    "url": "https://blog.rust-lang.org/2024/09/24/webassembly-targets-change-in-default-target-features/",
+    "title": "WebAssembly targets: change in default target-features | Rust Blog",
+    "text": "The Rust compiler has recently upgraded to using LLVM 19 and this change accompanies some updates to the default set of target features enabled for WebAssembly targets of the Rust compiler. Beta Rust today, which will become Rust 1.82 on 2024-10-17, reflects all of these changes ",
+    "author": null,
+    "published": null,
+    "raw": null,
+    "entities": [
+      {
+        "text": "LLVM 19",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "2024-10-17",
+        "kind": "DATE"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.30219999999999997,
+      "top_keywords": [
+        "webassembly",
+        "rust",
+        "llvm",
+        "feature",
+        "proposal",
+        "default",
+        "type",
+        "reference",
+        "change",
+        "enabl",
+        "function",
+        "support"
+      ],
+      "inferred_category": "General News",
+      "word_count": 1250,
+      "published_raw": null
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "example.com",
+    "id": "https://example.com/news",
+    "url": "https://example.com/news",
+    "title": "Tech Market Surges",
+    "text": "The technology market experienced significant growth today as investors rallied around artificial intelligence stocks.",
+    "author": null,
+    "published": null,
+    "raw": null,
+    "entities": [
+      {
+        "text": "today",
+        "kind": "DATE"
+      },
+      {
+        "text": "investors",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "artificial intelligence stocks",
+        "kind": "PRODUCT"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.4477471976888375,
+      "top_keywords": [
+        "market",
+        "around",
+        "artificial",
+        "break",
+        "experienc",
+        "growth",
+        "intelligence",
+        "investor",
+        "news",
+        "ralli",
+        "significant",
+        "stock"
+      ],
+      "inferred_category": "Business",
+      "word_count": 17,
+      "published_raw": null
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "example.com",
+    "id": "https://example.com/news",
+    "url": "https://example.com/news",
+    "title": "Tech Market Surges",
+    "text": "The technology market experienced significant growth today as investors rallied around artificial intelligence stocks.",
+    "author": null,
+    "published": null,
+    "raw": null,
+    "entities": [
+      {
+        "text": "today",
+        "kind": "DATE"
+      },
+      {
+        "text": "investors",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "artificial intelligence stocks",
+        "kind": "PRODUCT"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.4477471976888375,
+      "top_keywords": [
+        "market",
+        "around",
+        "artificial",
+        "break",
+        "experienc",
+        "growth",
+        "intelligence",
+        "investor",
+        "news",
+        "ralli",
+        "significant",
+        "stock"
+      ],
+      "inferred_category": "Business",
+      "word_count": 17,
+      "published_raw": null
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "local",
+    "id": "file://examples/fixtures/news-article.html",
+    "url": "file://examples/fixtures/news-article.html",
+    "title": "Parliament passes national climate policy bill",
+    "text": "Parliament passes national climate policy bill The government won a decisive vote in parliament today on a national climate policy bill that sets new targets for energy production and emissions. Ministers said the policy would strengthen the economy and protect the environment ah",
+    "author": "redacted",
+    "published": "2024-05-01T09:00:00Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "national climate policy bill",
+        "kind": "LAW_OR_REGULATION"
+      },
+      {
+        "text": "government",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "today",
+        "kind": "DATE"
+      },
+      {
+        "text": "Ministers",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "next year",
+        "kind": "DATE"
+      },
+      {
+        "text": "election",
+        "kind": "EVENT"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.48933290145634056,
+      "top_keywords": [
+        "bill",
+        "climate",
+        "policy",
+        "national",
+        "parliament",
+        "economy",
+        "energy",
+        "government",
+        "next",
+        "passe",
+        "research",
+        "said"
+      ],
+      "inferred_category": "Politics",
+      "word_count": 70,
+      "published_raw": "2024-05-01T10:00:00+01:00"
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "local",
+    "id": "file://examples/fixtures/news-article.html",
+    "url": "file://examples/fixtures/news-article.html",
+    "title": "Parliament passes national climate policy bill",
+    "text": "Parliament passes national climate policy bill The government won a decisive vote in parliament today on a national climate policy bill that sets new targets for energy production and emissions. Ministers said the policy would strengthen the economy and protect the environment ah",
+    "author": "redacted",
+    "published": "2024-05-01T09:00:00Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "national climate policy bill",
+        "kind": "LAW_OR_REGULATION"
+      },
+      {
+        "text": "government",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "today",
+        "kind": "DATE"
+      },
+      {
+        "text": "Ministers",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "next year",
+        "kind": "DATE"
+      },
+      {
+        "text": "election",
+        "kind": "EVENT"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.48933290145634056,
+      "top_keywords": [
+        "bill",
+        "climate",
+        "policy",
+        "national",
+        "parliament",
+        "economy",
+        "energy",
+        "government",
+        "next",
+        "passe",
+        "research",
+        "said"
+      ],
+      "inferred_category": "Politics",
+      "word_count": 70,
+      "published_raw": "2024-05-01T10:00:00+01:00"
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "local",
+    "id": "file://examples/fixtures/news-article.html",
+    "url": "file://examples/fixtures/news-article.html",
+    "title": "Parliament passes national climate policy bill",
+    "text": "Parliament passes national climate policy bill The government won a decisive vote in parliament today on a national climate policy bill that sets new targets for energy production and emissions. Ministers said the policy would strengthen the economy and protect the environment ah",
+    "author": "redacted",
+    "published": "2024-05-01T09:00:00Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "national climate policy bill",
+        "kind": "LAW_OR_REGULATION"
+      },
+      {
+        "text": "government",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "today",
+        "kind": "DATE"
+      },
+      {
+        "text": "Ministers",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "next year",
+        "kind": "DATE"
+      },
+      {
+        "text": "election",
+        "kind": "EVENT"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.48933290145634056,
+      "top_keywords": [
+        "bill",
+        "climate",
+        "policy",
+        "national",
+        "parliament",
+        "economy",
+        "energy",
+        "government",
+        "next",
+        "passe",
+        "research",
+        "said"
+      ],
+      "inferred_category": "Politics",
+      "word_count": 70,
+      "published_raw": "2024-05-01T10:00:00+01:00"
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "techcrunch.com",
+    "id": "https://techcrunch.com/2026/11/09/anthropic-reportedly-plans-to-move-forward-with-ipo-plans/",
+    "url": "https://techcrunch.com/2026/11/09/anthropic-reportedly-plans-to-move-forward-with-ipo-plans/",
+    "title": "Anthropic reportedly plans to move forward with IPO plans | TechCrunch",
+    "text": "In Brief Posted: 5:27 PM PST · November 9, 2026 Image Credits: Ruhani Kaur/Bloomberg / Getty Images Marina Temkin Anthropic reportedly plans to move forward with IPO plans Launching a major tech IPO would seem risky right now, shortly after one of Nasdaq’s biggest sell-offs and a",
+    "author": "redacted",
+    "published": "2026-11-10T01:27:12Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "November 9, 2026",
+        "kind": "DATE"
+      },
+      {
+        "text": "Bloomberg",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "Anthropic",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "Nasdaq",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "The Wall Street Journal",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.39388586956521743,
+      "top_keywords": [
+        "techcrunch",
+        "anthropic",
+        "startup",
+        "hour",
+        "plan",
+        "valuation",
+        "trillion",
+        "2026",
+        "disrupt",
+        "newsletter",
+        "week",
+        "amp"
+      ],
+      "inferred_category": "Business",
+      "word_count": 368,
+      "published_raw": "2026-11-10T01:27:12+00:00"
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "techcrunch.com",
+    "id": "https://techcrunch.com/2026/11/09/jensen-huang-reportedly-engaged-a-pr-firm-with-a-history-of-handling-high-profile-sex-scandals-a-year-ago/",
+    "url": "https://techcrunch.com/2026/11/09/jensen-huang-reportedly-engaged-a-pr-firm-with-a-history-of-handling-high-profile-sex-scandals-a-year-ago/",
+    "title": "Jensen Huang reportedly engaged a PR firm with a history of handling high-profile sex scandals a year ago | TechCrunch",
+    "text": "In Brief Posted: 3:28 PM PST · November 9, 2026 Image Credits: Jose Sarmento Matos/Bloomberg / Getty Images Marina Temkin Jensen Huang reportedly engaged a PR firm with a history of handling high-profile sex scandals a year ago Nvidia CEO Jensen Huang hired Heller Inc., a crisis ",
+    "author": "redacted",
+    "published": "2026-11-09T23:28:37Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "November 9, 2026",
+        "kind": "DATE"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "Heller Inc.",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "China",
+        "kind": "LOCATION"
+      },
+      {
+        "text": "Wired",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.3953125,
+      "top_keywords": [
+        "techcrunch",
+        "nvidia",
+        "huang",
+        "startup",
+        "jensen",
+        "report",
+        "heller",
+        "hour",
+        "scandal",
+        "2026",
+        "8217",
+        "amp"
+      ],
+      "inferred_category": "Business",
+      "word_count": 448,
+      "published_raw": "2026-11-09T23:28:37+00:00"
+    }
+  },
+  {
+    "source_type": "news",
+    "platform": "techcrunch.com",
+    "id": "https://techcrunch.com",
+    "url": "https://techcrunch.com",
+    "title": "TechCrunch | Startup and Technology News",
+    "text": "Image Credits: TechCrunch AI The race is on to sue Nvidia Connie Loizos 17 hours ago Government &amp; Policy California&#8217;s proposed &#8216;billionaire tax&#8217; fails to pass Lucas Ropek 10 hours ago AI Anthropic releases new Mythos and Fable models amid RSI concerns Russel",
+    "author": null,
+    "published": "2026-11-09T22:23:42Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "Nvidia",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "California",
+        "kind": "LOCATION"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "Anthropic",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      },
+      {
+        "text": "China",
+        "kind": "LOCATION"
+      }
+    ],
+    "article": {
+      "relevance_score": 0.3565525876460768,
+      "top_keywords": [
+        "2026",
+        "techcrunch",
+        "hour",
+        "8217",
+        "startup",
+        "loconsolo",
+        "security",
+        "theresa",
+        "brief",
+        "days",
+        "founder",
+        "venture"
+      ],
+      "inferred_category": "Business",
+      "word_count": 1198,
+      "published_raw": "2026-11-09T14:23:42-08:00"
+    }
+  },
+  {
+    "source_type": "social",
+    "platform": "youtube",
+    "id": "vLAegkGGWrM",
+    "url": "https://www.youtube.com/watch?v=vLAegkGGWrM",
+    "title": "Building with Gemini in Google Antigravity",
+    "text": "See what you can build using our latest Gemini models in Google Antigravity.  From in-browser animation and multimodal prototyping to autonomous codebase modernization, explore how you can ship complex architectures straight from a prompt.\n\nWhat are you building with Gemini in Go",
+    "author": "redacted",
+    "published": "2026-11-12T17:00:11.000Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "Gemini",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "Google",
+        "kind": "ORGANIZATION"
+      }
+    ],
+    "article": null
+  },
+  {
+    "source_type": "social",
+    "platform": "youtube",
+    "id": "rsOiZE19RVo",
+    "url": "https://www.youtube.com/watch?v=rsOiZE19RVo",
+    "title": "Accelerate shipping to scale with Google Antigravity",
+    "text": "Building software to move tens of millions of vehicles requires massive infrastructure. Using Google Antigravity, Move Cars delivers fully tested production features in a single day, letting a small team scale complex logistics while staying in total control. \n\nDiscover what chan",
+    "author": "redacted",
+    "published": "2026-10-29T20:00:20.000Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "Google Antigravity",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      }
+    ],
+    "article": null
+  },
+  {
+    "source_type": "social",
+    "platform": "youtube",
+    "id": "cv8tEbKtEvk",
+    "url": "https://www.youtube.com/watch?v=cv8tEbKtEvk",
+    "title": "🪴 Building an autonomous plant rover with Gemini Live",
+    "text": "Meet Sprout: an semi-autonomous plant rover built with Gemini Live and Robotics ER 2.0 that navigates office spaces to hunt for sunlight and care for greenery.\n\n🔗 Explore the build → https://goo.gle/3UCdUOa \n\n\nSubscribe to Google for Developers → https://goo.gle/developers   \n\n\nP",
+    "author": "redacted",
+    "published": "2026-10-29T01:00:36.000Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "Gemini Live",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "Robotics ER 2.0",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "office spaces",
+        "kind": "LOCATION"
+      },
+      {
+        "text": "Google",
+        "kind": "ORGANIZATION"
+      },
+      {
+        "text": "[redacted]",
+        "kind": "PERSON"
+      }
+    ],
+    "article": null
+  }
+]
