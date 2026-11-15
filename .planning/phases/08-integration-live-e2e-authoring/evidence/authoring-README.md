@@ -7,7 +7,7 @@ Index for 08-VERIFICATION.md. The transcripts were produced by the user in their
 - **Tag on origin:** confirmed with `git ls-remote --tags origin wit-v0.1.0`
 - **Date (UTC):** 2026-11-12
 - **Tag message:** `filimon:plugin@0.1.0 authoring contract: wit/, plugins/template, plugins/stub-fetcher, docs/plugin-guide.md`
-- **Fetcher fixture:** `plugins/stub-fetcher` stands in for the `plugins/replay-fetcher` named in plan 08-07, per the plan 08-05 Task 1 answer (walkthrough fresh-from-stub). `plugins/replay-fetcher` does not exist in the tagged commit.
+- **Fetcher fixture:** `plugins/stub-fetcher` stands in for the `plugins/replay-fetcher` named in plan 08-07, per the plan 08-05 Task 1 answer (walkthrough fresh-from-stub). `plugins/replay-fetcher` does exist in the tagged commit (`git cat-file -e wit-v0.1.0:plugins/replay-fetcher/Cargo.toml` succeeds); it was not used for the walkthrough.
 
 ## Commands (from the repository root)
 
