@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-11-15T05:59:17.829Z",
+  "timestamp": "2026-11-15T06:04:00.267Z",
   "phase": "08",
   "phase_name": "Integration, Live E2E & Authoring",
   "phase_dir": "/Users/jferrolino/Devs/portfolio/filimon/.planning/phases/08-integration-live-e2e-authoring",
@@ -30,21 +30,16 @@
   ],
   "blockers": [
     {
-      "description": "Live run step 1 (fili produce) panicked because the built-in crawler builds a reqwest::blocking client inside the async main. FIXED in scripts/live-e2e.sh: the generated registry now has a [crawler] fetcher=http table and produce runs against it (selftest PASS, fili accepts the registry). Not yet proven live. Separately, YOUTUBE_API_KEY validity is unconfirmed: an earlier direct check returned HTTP 400 and the credentialed YouTube poll failed; the credentialed-tests.txt in the tree is from that failed run.",
+      "description": "Evidence must be regenerated: the current untracked enriched-sample.json, live-e2e-transcript.txt and credentialed-tests.txt come from earlier runs and fail the new check-evidence rules. Credentialed tests were last run before the YouTube key worked in the live run; rerun them.",
       "type": "human_action",
-      "workaround": "Re-run: LIVE_E2E_WAIVE_REDDIT='takes time to complete' scripts/live-e2e.sh run, then the credentialed tests"
+      "workaround": "LIVE_E2E_WAIVE_REDDIT=... LIMIT=100 scripts/live-e2e.sh run, then the credentialed tests with tee"
     }
   ],
   "async_jobs": [],
   "human_actions_pending": [
     {
-      "action": "Fix YOUTUBE_API_KEY in .env (not .env.example) and confirm HTTP 200 with the key check",
-      "context": "HTTP 400 from Google means the key value is invalid",
-      "blocking": true
-    },
-    {
-      "action": "export LIVE_E2E_WAIVE_REDDIT='takes time to complete'; scripts/live-e2e.sh run; then cargo test -p filimon e2e_credentialed_ -- --nocapture with tee to evidence/credentialed-tests.txt; then reply ran",
-      "context": "Task 3 of 08-06 is a human-run checkpoint (D-07)",
+      "action": "Run LIVE_E2E_WAIVE_REDDIT='takes time to complete' LIMIT=100 scripts/live-e2e.sh run, then cargo test -p filimon e2e_credentialed_ -- --nocapture with tee to evidence/credentialed-tests.txt, then reply ran",
+      "context": "Topics hold 30 records, so LIMIT=100 reads all of them",
       "blocking": true
     }
   ],
@@ -62,6 +57,11 @@
     {
       "decision": "Deviation: scripts/live-e2e.sh (plan 08-03 artifact) edited to add a [crawler] table and pass --registry to produce, because fili produce panics with the built-in crawler. The brownfield crawler (src/crawler.rs) was not touched.",
       "rationale": "User chose to fix the script (recommended) over fixing the crawler; record as a deviation in the 08-06 SUMMARY",
+      "phase": "08"
+    },
+    {
+      "decision": "Deviation 2: scripts/live-e2e.sh sampling fixed after the first full run. The consumer reads the oldest records first, so the sample held replay/older data (3 Reddit fixture records dated 2024-10-27, example.com and local news) and none from this run. Now: newest-first per group, Reddit records dropped under a waiver, check-evidence requires no Reddit in a waived sample and a news record from the crawl seed host.",
+      "rationale": "User chose the script fix (recommended). D-09: replay or synthetic data never stands in for the live sample. Record both script deviations in the 08-06 SUMMARY; the brownfield crawler was not touched.",
       "phase": "08"
     }
   ],
@@ -82,6 +82,6 @@
     "?? WORKFLOW.md",
     "?? test_config_panic.json"
   ],
-  "next_action": "User re-runs the live run under the waiver (same-line env var), then the credentialed tests, and replies ran. If check-evidence prints ok: evidence is complete and clean, spawn the continuation executor for 08-06 at Task 3. Mention the script deviation in the SUMMARY. Never stage .env.example; never read .env.",
+  "next_action": "When the user replies ran: verify check-evidence prints ok: evidence is complete and clean and credentialed-tests.txt has test result: ok, then spawn the continuation executor for 08-06 at Task 3 (sequential, main tree, root pin) with both script deviations noted for the SUMMARY.",
   "context_notes": "2026-11-15: Reddit waived (D-09, reason verbatim: takes time to complete). GLiNER model present. Key check: HTTP 400. Failed-run artifacts sit untracked in the evidence directory."
 }
