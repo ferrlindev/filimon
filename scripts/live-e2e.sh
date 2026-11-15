@@ -440,7 +440,18 @@ stop_fili_run() {
 # Writes the live registry and plugin configs into the work directory.
 write_live_registry() {
   local waived="$1" client_id="" contact ua_contact
-  mkdir -p "$WORK" "$WORK/state"
+  case "$WORK" in
+    /?*) ;;
+    *)
+      say_fail "WORK" "must be an absolute path ($WORK)"
+      return 1
+      ;;
+  esac
+  mkdir -p "$WORK"
+  # Every run starts from an empty state directory. Poll status and cursors left by an earlier run
+  # would satisfy the wait loop in step 2 before this run polls anything (review CR-01).
+  rm -rf "$WORK/state"
+  mkdir -p "$WORK/state"
   # The registry loader reads .env next to the registry; it is linked, never copied.
   ln -sf "$ENV_FILE" "$WORK/.env"
 
@@ -832,6 +843,19 @@ cmd_selftest() {
     || selftest_fail "the [crawler] table does not name the http fetcher"
   grep -qE 'fili_run --registry "\$WORK/filimon\.toml" .* produce ' "$SELF" \
     || selftest_fail "step 1 does not run produce against the generated registry"
+
+  # 9. a run never inherits poll status or cursors from an earlier run (review CR-01)
+  mkdir -p "$t/work-stale/state"
+  printf '{"state":"ok"}\n' >"$t/work-stale/state/youtube.status.json"
+  rc=0
+  (
+    WORK="$t/work-stale"
+    ENV_FILE="$t/fake.env"
+    write_live_registry "selftest waiver"
+  ) >"$t/out.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || selftest_fail "the live registry could not be generated over a stale work directory"
+  [ -d "$t/work-stale/state" ] || selftest_fail "the state directory was not recreated"
+  [ ! -e "$t/work-stale/state/youtube.status.json" ] || selftest_fail "a stale poll status survived into the next run"
 
   echo "SELFTEST: PASS"
 }
