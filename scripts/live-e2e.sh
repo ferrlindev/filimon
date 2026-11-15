@@ -373,6 +373,17 @@ cmd_check_evidence() {
     fi
   fi
 
+  # The transcript must not carry the consumer's record display: it lists author names and PERSON
+  # entities, which D-08 keeps out of everything committed (only the sanitised sample is committed).
+  if [ -f "$transcript" ]; then
+    if grep -E '^ Author : ' "$transcript" | grep -vE '^ Author : (--|redacted)$' | grep -q .; then
+      say_fail "transcript lists author names" "send the consumer display to a work file and commit only the sanitised sample (D-08)"
+    fi
+    if grep -qF '[PERSON]' "$transcript"; then
+      say_fail "transcript lists PERSON entities" "send the consumer display to a work file and commit only the sanitised sample (D-08)"
+    fi
+  fi
+
   # Secret scan: every non-empty .env value of length 6 or more, plus the three credential
   # variables from the process environment. A hit names the key, never the value.
   pf="$(mktemp)"
@@ -602,11 +613,14 @@ run_steps() {
 
   echo "step 3: consume with NER (fili consume --enrich-ner)"
   rm -f "$WORK/enriched.json"
+  # The consumer prints every record it keeps, with author names and PERSON entities. That display
+  # goes to a work file that is never committed; only a line count reaches the transcript (D-08, T-08-22).
   if ! fili_run --tokenizer "$TOKENIZER_PATH" --model "$MODEL_PATH" consume \
-    --from-beginning --limit "$LIMIT" --enrich-ner --source both --output "$WORK/enriched.json"; then
-    say_fail "fili consume" "the enriched consume failed"
+    --from-beginning --limit "$LIMIT" --enrich-ner --source both --output "$WORK/enriched.json" >"$WORK/consume.log" 2>&1; then
+    say_fail "fili consume" "the enriched consume failed; its output is in $WORK/consume.log (not committed)"
     return 1
   fi
+  echo "consumer display kept in $WORK/consume.log ($(wc -l <"$WORK/consume.log" | tr -d ' ') lines; not committed, it lists author names and PERSON entities)"
   if ! jq -e 'type == "array"
       and (map(select(.source_type == "news")) | length > 0)
       and (map(select(.source_type == "social")) | length > 0)' "$WORK/enriched.json" >/dev/null 2>&1; then
@@ -856,6 +870,31 @@ cmd_selftest() {
   [ "$rc" -eq 0 ] || selftest_fail "the live registry could not be generated over a stale work directory"
   [ -d "$t/work-stale/state" ] || selftest_fail "the state directory was not recreated"
   [ ! -e "$t/work-stale/state/youtube.status.json" ] || selftest_fail "a stale poll status survived into the next run"
+
+  # 10. the transcript carries no author names and no PERSON entities (D-08); '--' and redacted are fine
+  ev2="$t/ev-transcript-author"
+  mk_evidence "$ev2"
+  printf ' Author : --\n Author : redacted\n Author : Some Reporter\n' >>"$ev2/live-e2e-transcript.txt"
+  rc=0
+  env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY ENV_FILE="$t/fake.env" \
+    "$SELF" check-evidence "$ev2" >"$t/out.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 1 ] || selftest_fail "a transcript with an author name did not fail check-evidence"
+  grep -q 'FAIL: transcript lists author names' "$t/out.txt" || selftest_fail "the author name in the transcript was not named"
+  ev2="$t/ev-transcript-person"
+  mk_evidence "$ev2"
+  printf ' Entities : Jane Doe [PERSON]\n' >>"$ev2/live-e2e-transcript.txt"
+  rc=0
+  env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY ENV_FILE="$t/fake.env" \
+    "$SELF" check-evidence "$ev2" >"$t/out.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 1 ] || selftest_fail "a transcript with a PERSON entity did not fail check-evidence"
+  grep -q 'FAIL: transcript lists PERSON entities' "$t/out.txt" || selftest_fail "the PERSON entity in the transcript was not named"
+  ev2="$t/ev-transcript-ok"
+  mk_evidence "$ev2"
+  printf ' Author : --\n Author : redacted\n' >>"$ev2/live-e2e-transcript.txt"
+  rc=0
+  env -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET -u YOUTUBE_API_KEY ENV_FILE="$t/fake.env" \
+    "$SELF" check-evidence "$ev2" >"$t/out.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || selftest_fail "a transcript with only placeholder author lines failed check-evidence"
 
   echo "SELFTEST: PASS"
 }
