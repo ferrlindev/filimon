@@ -611,6 +611,28 @@
   {
     "source_type": "social",
     "platform": "youtube",
+    "id": "vLAegkGGWrM",
+    "url": "https://www.youtube.com/watch?v=vLAegkGGWrM",
+    "title": "Building with Gemini in Google Antigravity",
+    "text": "See what you can build using our latest Gemini models in Google Antigravity.  From in-browser animation and multimodal prototyping to autonomous codebase modernization, explore how you can ship complex architectures straight from a prompt.\n\nWhat are you building with Gemini in Go",
+    "author": "redacted",
+    "published": "2026-11-12T17:00:11.000Z",
+    "raw": null,
+    "entities": [
+      {
+        "text": "Gemini",
+        "kind": "PRODUCT"
+      },
+      {
+        "text": "Google",
+        "kind": "ORGANIZATION"
+      }
+    ],
+    "article": null
+  },
+  {
+    "source_type": "social",
+    "platform": "youtube",
     "id": "rsOiZE19RVo",
     "url": "https://www.youtube.com/watch?v=rsOiZE19RVo",
     "title": "Accelerate shipping to scale with Google Antigravity",
@@ -622,40 +644,6 @@
       {
         "text": "Google Antigravity",
         "kind": "PRODUCT"
-      },
-      {
-        "text": "[redacted]",
-        "kind": "PERSON"
-      }
-    ],
-    "article": null
-  },
-  {
-    "source_type": "social",
-    "platform": "youtube",
-    "id": "cv8tEbKtEvk",
-    "url": "https://www.youtube.com/watch?v=cv8tEbKtEvk",
-    "title": "🪴 Building an autonomous plant rover with Gemini Live",
-    "text": "Meet Sprout: an semi-autonomous plant rover built with Gemini Live and Robotics ER 2.0 that navigates office spaces to hunt for sunlight and care for greenery.\n\n🔗 Explore the build → https://goo.gle/3UCdUOa \n\n\nSubscribe to Google for Developers → https://goo.gle/developers   \n\n\nP",
-    "author": "redacted",
-    "published": "2026-10-29T01:00:36.000Z",
-    "raw": null,
-    "entities": [
-      {
-        "text": "Gemini Live",
-        "kind": "PRODUCT"
-      },
-      {
-        "text": "Robotics ER 2.0",
-        "kind": "PRODUCT"
-      },
-      {
-        "text": "office spaces",
-        "kind": "LOCATION"
-      },
-      {
-        "text": "Google",
-        "kind": "ORGANIZATION"
       },
       {
         "text": "[redacted]",
