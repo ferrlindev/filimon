@@ -478,6 +478,11 @@ write_live_registry() {
     printf '%s\n' 'fetcher = "http"'
     printf '\n%s\n' '[fetchers.http]'
     printf "component = '%s'\n" "$REPO_ROOT/plugins/http-fetcher/target/wasm32-unknown-unknown/release/http_fetcher.wasm"
+    # The news crawl (step 1) fetches its pages through this component. Without a [crawler]
+    # table `fili produce` falls back to the built-in blocking HTTP client, which panics when
+    # built inside the async main ("Cannot drop a runtime in a context where blocking is not allowed").
+    printf '\n%s\n' '[crawler]'
+    printf '%s\n' 'fetcher = "http"'
   } >"$WORK/filimon.toml"
 }
 
@@ -526,7 +531,7 @@ run_steps() {
   trap 'exit 130' INT TERM
 
   echo "step 1: news crawl of $NEWS_SEED_URL (fili produce)"
-  if ! fili_run produce "$NEWS_SEED_URL"; then
+  if ! fili_run --registry "$WORK/filimon.toml" --state-dir "$WORK/state" produce "$NEWS_SEED_URL"; then
     say_fail "fili produce" "the news crawl failed"
     return 1
   fi
@@ -749,6 +754,20 @@ cmd_selftest() {
   if grep -q 'selftest-' "$t/out.txt"; then
     selftest_fail "a credential value reached the preflight output"
   fi
+
+  # 8. the news crawl goes through the registry's [crawler] fetcher, never the built-in blocking client
+  rc=0
+  (
+    WORK="$t/work-crawler"
+    ENV_FILE="$t/fake.env"
+    write_live_registry "selftest waiver"
+  ) >"$t/out.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || selftest_fail "the live registry could not be generated"
+  grep -qx '\[crawler\]' "$t/work-crawler/filimon.toml" || selftest_fail "the live registry has no [crawler] table"
+  awk '/^\[crawler\]$/{f=1;next} /^\[/{f=0} f' "$t/work-crawler/filimon.toml" | grep -qx 'fetcher = "http"' \
+    || selftest_fail "the [crawler] table does not name the http fetcher"
+  grep -qE 'fili_run --registry "\$WORK/filimon\.toml" .* produce ' "$SELF" \
+    || selftest_fail "step 1 does not run produce against the generated registry"
 
   echo "SELFTEST: PASS"
 }
