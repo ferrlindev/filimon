@@ -2,7 +2,7 @@
 gsd_state_version: "1.0"
 current_phase: 08
 status: completed
-stopped_at: Phase 08 complete — all phases complete
+stopped_at: "Phase 8 complete; milestone ready for audit/completion"
 last_updated: "2026-11-15T06:59:37.938Z"
 last_activity: 2026-11-15
 last_activity_desc: Phase 08 complete
@@ -19,10 +19,10 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-11-09)
+See: .planning/PROJECT.md (updated 2026-11-15)
 
 **Core value:** A user-supplied WASM component, written only against filimon's published WIT contract and listed in the registry, can stream items from a social platform into Fluvio and come out the other end as enriched records alongside news articles.
-**Current focus:** Phase 08 — Integration, Live E2E & Authoring
+**Current focus:** Milestone audit/completion (all 8 phases complete)
 
 ## Current Position
 
@@ -94,6 +94,11 @@ None yet.
 - [Phase 7]: Reddit's API needs OAuth even for read-only subreddit access. Research must settle whether RDDT-01 uses app-only credentials (CONF-02 secrets) or the Phase 6 PKCE login.
 - [Phase 2/8]: Consumer NER only runs in batch/`--limit` mode (an existing gap, out of scope). PIPE-04 and TEST-04 are verified in that mode.
 - [Phase 2]: Two docker-compose.yml items stay open in `phases/02-sourceitem-pipeline/deferred-items.md` (acknowledged at phase close): the `OUTPUT_PATH` env var that `fili` never reads, and the `filimon-stream-processor` service that runs a `stream` subcommand `fili` doesn't have. 20 of 28 code-review findings are also still open (see 02-REVIEW-DISPOSITION.md); none block a later phase.
+- [Phase 8]: Registry-less `fili produce` still panics (`src/crawler.rs` blocking client in the async main; review CR-02, open); the live E2E script works around it with a `[crawler]` fetcher registry
+- [Phase 8]: The README's GLiNER setup recipe cannot produce tokenizer.json / onnx/model.onnx; the ONNX files come from onnx-community/gliner_small-v2.1
+- [Phase 8]: All 24 code-review findings in 08-REVIEW.md are `open` in 08-REVIEW-DISPOSITION.md (2 critical: CR-01 fixed in 508db2a but still listed open, CR-02 unfixed)
+- [Phase 8]: Local commits e13466b and af7aeea (unpushed) still contain author names and PERSON entities in git history: do not push the branch until the user decides about history
+- [Phase 8]: SECURITY.md and a completed Nyquist validation are missing for phase 8 (`/gsd-secure-phase 8`, `/gsd-validate-phase 8`)
 - [Brownfield]: Build on the uncommitted `fluvio-wise` work. Do not fix its known gaps, and never modify the `fluvio/` reference checkout.
 - [Research flags]: Phase 1 (WIT/`cargo component` toolchain versions), Phase 3 (wasmtime component-model host), Phase 5 (host-mediated component-to-component fetch), Phase 6 (Reddit/Google PKCE loopback specifics), Phase 7 (Reddit UA/rate-limit rules, YouTube quota costs).
 
@@ -107,6 +112,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-15T06:11:29.159Z
-Stopped at: Phase 08 complete — all phases complete
+Last session: 2026-11-15
+Stopped at: Phase 8 complete; milestone ready for audit/completion
 Resume file: None

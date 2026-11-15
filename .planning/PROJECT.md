@@ -23,6 +23,9 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - ✓ WIT package `filimon:plugin@0.1.0` defining `source` (exports init/poll; imports fetch, log) and `fetcher` worlds; stub crates build components from the WIT alone — Phase 1
 - ✓ `filimon.toml` registry + per-plugin TOML load into typed config; `.env` secrets resolved per plugin alias only; errors name plugin and field/key — Phase 1
 - ✓ Unified `SourceItem` envelope covers news pages and social posts; news stays on the WISE SmartModule chain, social items pass straight through to the consumer, and both land NER-enriched in the same JSON output — Phase 2
+- ✓ Integration tests run the compiled Reddit/YouTube components inside the host against replayed fixtures into a local Fluvio topic, with a live mode when `.env` keys exist (TEST-02, TEST-03) — Phase 8; TEST-03's positive live path was shown for YouTube only (the Reddit live test skips)
+- ✓ Live end-to-end run produces enriched JSON alongside news articles (TEST-04) — Phase 8, with an accepted waiver: the user waived live Reddit on 2026-11-15 (reason: "takes time to complete"); the live proof used YouTube plus news, and live Reddit proof is a deferred item in STATE.md
+- ✓ A plugin built outside the repo from the published WIT loads and runs without rebuilding `fili` (WIT-03); plugin template and guide cover source and fetcher plugins (DOCS-01, DOCS-02) — Phase 8
 
 ### Active
 
@@ -36,8 +39,6 @@ A user-supplied WASM component, written only against filimon's published WIT con
 - [ ] Fetcher plugins: a second WIT world (`fetcher`) so the HTTP client is itself a supplied WASM component; source plugins' fetch and (optionally) the news crawler route through the configured fetcher; default HTTP fetcher shipped; host still enforces allowlist/timeout
 - [ ] Plugin CLI: `fili plugins list | check | run-once`, plus a run command that polls all enabled sources
 - [ ] Fixture-based tests per plugin (recorded API responses; runs in CI without network or keys)
-- [ ] Integration tests running compiled Reddit/YouTube components inside the host against replayed fixtures into a local Fluvio topic; live mode when `.env` keys exist
-- [ ] Live end-to-end run: `fili` loads Reddit + YouTube plugins, polls real APIs, records flow through Fluvio, enriched JSON is produced alongside news articles
 
 ### Out of Scope
 
@@ -90,6 +91,11 @@ A user-supplied WASM component, written only against filimon's published WIT con
 | Plugin components target `wasm32-unknown-unknown` (no WASI imports) | Every capability is an explicit WIT import; smallest attack surface | ✓ Phase 1 — host acceptance of wasip1 components open for Phase 3 |
 | Hand-written literal-or-reject `.env` parser (dotenvy removed) | dotenvy 0.15 always expands `$` from the process env (CR-01); verbatim-or-reject closes it and stays reversible | ✓ Phase 1 (01-05) |
 | Secrets wrapped in redacting `Secret` newtype; diagnostics carry alias/env names only | Secret values never reach Debug, tracing or rendered reports | ✓ Phase 1 |
+| Accept the user's waiver of live Reddit for the live E2E (D-09) | The user waived it on 2026-11-15 ("takes time to complete"); YouTube plus news carried the live proof | ✓ Accepted at Phase 8 verification — live Reddit proof deferred |
+| Live E2E script routes the news crawl through a `[crawler]` fetcher registry | Registry-less `fili produce` panics (`src/crawler.rs` blocking client in the async main); the brownfield crawler was not changed | ⚠️ Revisit — registry-less panic still open (review CR-02) |
+| Evidence sample takes the newest records and excludes waived Reddit | Keeps the committed evidence current and honest about what was proven | ✓ Phase 8 |
+| Live E2E transcript carries no consumer record display (D-08) | Record values are untrusted and must not reach the transcript | ✓ Phase 8 |
+| GLiNER ONNX files come from `onnx-community/gliner_small-v2.1` | The README recipe repo has no tokenizer.json/onnx/model.onnx | ⚠️ Revisit — README setup recipe still wrong |
 
 ## Evolution
 
@@ -109,4 +115,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-11-09 after Phase 2*
+*Last updated: 2026-11-15 after Phase 8*
