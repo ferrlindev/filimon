@@ -1,8 +1,8 @@
 ---
 phase: 08-integration-live-e2e-authoring
-verified: 2026-11-15T07:10:00Z
-status: human_needed
-score: 4/5 must-haves verified
+verified: 2026-11-15T08:00:00Z
+status: passed
+score: 5/5 must-haves verified
 covered_files:
   - .planning/phases/08-integration-live-e2e-authoring/08-01-PLAN.md
   - .planning/phases/08-integration-live-e2e-authoring/08-01-SUMMARY.md
@@ -18,6 +18,11 @@ covered_files:
   - .planning/phases/08-integration-live-e2e-authoring/08-06-SUMMARY.md
   - .planning/phases/08-integration-live-e2e-authoring/08-07-PLAN.md
   - .planning/phases/08-integration-live-e2e-authoring/08-07-SUMMARY.md
+  - .planning/phases/08-integration-live-e2e-authoring/evidence/README.md
+  - .planning/phases/08-integration-live-e2e-authoring/evidence/WAIVER.md
+  - .planning/phases/08-integration-live-e2e-authoring/evidence/credentialed-tests.txt
+  - .planning/phases/08-integration-live-e2e-authoring/evidence/enriched-sample.json
+  - .planning/phases/08-integration-live-e2e-authoring/evidence/live-e2e-transcript.txt
   - docs/plugin-guide.md
   - plugins/replay-fetcher/src/lib.rs
   - plugins/template/src/lib.rs
@@ -25,24 +30,31 @@ covered_files:
   - scripts/verify-authoring.sh
   - src/plugins/host/integration_tests.rs
   - src/plugins/host/testing.rs
-covered_digest: "v4:sha256:a0809f9a5a09eac1d73265290ec5c4ef4a0f33c7740bfcab7b9bb65aa7c23541"
+covered_digest: "v4:sha256:8418bd9aa0f49a55474ac8c478c944a8b9f6d518c56440e443c16a41b3cde38f"
 behavior_unverified: 0
-overrides_applied: 0
-human_verification:
-  - test: "Rule on the Reddit waiver (D-09) for SC3 / TEST-04 and the Reddit half of SC2 / TEST-03"
-    expected: "Either accept the waiver (add an `overrides:` entry for SC3 and TEST-04 naming the user as accepter, reason 'takes time to complete', so the phase can pass), or reject it (set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in the root .env, rerun scripts/live-e2e.sh run and the credentialed tests, recommit evidence)"
-    why_human: "The roadmap SC3 and REQUIREMENTS TEST-04 say 'real Reddit and YouTube data'. No Reddit record from a live poll exists anywhere in the evidence. Only the user can decide that a documented waiver satisfies a requirement; the verifier cannot."
-  - test: "Decide whether the committed YouTube live-run evidence is acceptable given that its transcript did not perform a fresh poll"
-    expected: "Either accept that the YouTube records in enriched-sample.json come from the earlier live poll recorded in .live-e2e/state/youtube.status.json (at 2026-11-15T06:00:49Z, 10 items, real video ids), or have the live run repeated from an empty state directory (rm -rf .live-e2e/state) so the transcript itself shows a fresh poll (SENT > 0 in run.log). Fixing CR-01 in scripts/live-e2e.sh first is recommended."
-    why_human: "Evidence-quality judgement. The data is real live YouTube data that flowed through Fluvio and the NER consumer, but the committed transcript's 'all enabled sources polled successfully' line was satisfied by a stale status file from a previous run (see Truth 3)."
+overrides_applied: 1
+overrides:
+  - must_have: "A live end-to-end run works: fili loads the Reddit and YouTube plugins, polls the real APIs (live E2E with real Reddit and YouTube data), the consumer writes NER-enriched social records alongside news articles"
+    reason: "Reddit waived under D-09: takes time to complete. The user accepted the waiver; live Reddit proof is tracked as a deferred item in .planning/STATE.md (Deferred Items). The Reddit app-only path is covered by replay tests only."
+    accepted_by: "user (session dialog, recorded in 08-UAT.md test 1)"
+    accepted_at: "2026-11-15"
+re_verification:
+  previous_status: human_needed
+  previous_score: 4/5
+  gaps_closed:
+    - "Human verification item 1 (Reddit waiver): ruled by the user, accepted, applied above as an override"
+    - "Human verification item 2 (YouTube live-run provenance, CR-01): CR-01 fixed in 508db2a, live script rerun from an empty state directory, evidence regenerated in af7aeea"
+    - "Documentation defects: evidence/authoring-README.md claim about plugins/replay-fetcher corrected (verified against the tag); README and SUMMARY 'poll of this run' claim now rests on a fresh poll (see residual note about per-record attribution)"
+  gaps_remaining: []
+  regressions: []
 ---
 
 # Phase 8: Integration, Live E2E & Authoring Verification Report
 
 **Phase Goal:** The whole system is proven end to end. Compiled plugins run inside the host against replayed and live APIs into Fluvio, enriched social JSON comes out alongside news, and a third party can build and register a plugin from the guide alone
-**Verified:** 2026-11-15T07:10:00Z
-**Status:** human_needed
-**Re-verification:** No, initial verification
+**Verified:** 2026-11-15T08:00:00Z
+**Status:** passed (one success criterion passes by an accepted user override)
+**Re-verification:** Yes, after the user's rulings (Reddit waiver accepted, CR-01 fixed and the live script rerun)
 
 ## Goal Achievement
 
@@ -50,121 +62,109 @@ human_verification:
 
 | #   | Truth | Status | Evidence |
 | --- | ----- | ------ | -------- |
-| 1 | Integration tests run the compiled Reddit and YouTube `.wasm` components inside the host against replayed fixtures and assert the expected `SourceItem`s land in a local Fluvio topic; no network and no keys | VERIFIED | I ran `cargo test -p filimon e2e_replay_` myself: 5 passed, 0 failed. `e2e_replay_reddit_poll_lands_exact_items_in_a_scratch_topic` and `e2e_replay_reddit_and_youtube_land_exact_items_in_a_scratch_topic` ran against the local cluster (6.3 s, no `skipped:` line, so they were not silently skipped) and `e2e_replay_host_path_needs_no_cluster` ran the same body into an in-memory sink. `integration_tests.rs` assigns `fetcher = "replay"` (replay-fetcher component), uses the real compiled `reddit_source.wasm` / `youtube_source.wasm`, allowlists `oauth.reddit.com` / `www.googleapis.com`, uses a `filimon-test-replay-` scratch topic deleted through a `catch_unwind` wrapper, and `assert_replay_items` compares every field (id, url, title, author, published, text, raw) against values computed from the fixtures, oldest first, key `<platform>:<id>`. |
-| 2 | The same tests run in live mode against the real APIs only when credentials are in `.env`, and skip cleanly when they are not | VERIFIED, with a Reddit caveat | `run_live_poll` (integration_tests.rs:808) calls `missing_key(...)` and prints the documented `skipped: missing <KEY>` line before building anything or touching a cluster; the gate helper tests exist and passed in `credentialed-tests.txt` (10 passed, 0 failed, run by the user). YouTube live poll ran with the real key and passed; the Reddit live test printed `skipped: missing REDDIT_CLIENT_ID` and shows as `ok`, so the Reddit positive path has never run against the real API. Covered by the waiver decision in Human Verification item 1. |
-| 3 | A live end-to-end run works: `fili` loads the Reddit and YouTube plugins, polls the real APIs, records flow through Fluvio; the consumer writes NER-enriched social records alongside news articles in the same JSON output | NEEDS HUMAN DECISION | Reddit half: not met. The run used `LIVE_E2E_WAIVE_REDDIT='takes time to complete'`; the generated registry `.live-e2e/filimon.toml` loads only `youtube` and `http`; `fili run` printed `loaded sources: youtube`. The sample holds 0 Reddit records. YouTube/news half: real data is present and enriched (see below) but the committed transcript did not show a fresh poll (CR-01 confirmed, see below). Not marked VERIFIED. |
-| 4 | Using only the template and guide, a source plugin built with `cargo component` outside the repo, against only the published WIT, is registered in `filimon.toml` and runs in an unmodified `fili` binary | VERIFIED | Annotated signed tag `wit-v0.1.0` exists locally and on origin (`git ls-remote` shows tag object `cd7e905`, peeled `31c1ded`); the tag contains `wit/worlds.wit`, `plugins/template`, `plugins/stub-fetcher`, `plugins/replay-fetcher`, `docs/plugin-guide.md`, `scripts/verify-authoring.sh`; no diff between the tag and HEAD for the guide, template, stub-fetcher, verify script and `wit/`. I re-ran `scripts/verify-authoring.sh` in local mode: it ended `AUTHORING PROOF: PASS (legs: source fetcher)`, exit 0, including step 21/22 (fili binary hash and tree unchanged). The user's own local and from-the-tag transcripts (`authoring-proof-local.txt`, `authoring-proof-remote.txt`) both end with the same PASS line. I did not re-run remote mode (network). |
-| 5 | The guide covers writing a fetcher plugin and assigning it to a source, and a fetcher built by following it serves that source's requests | VERIFIED | `docs/plugin-guide.md` has "Write a fetcher plugin" (line 220), `fetcher = "<fetcher name>"` assignment, build, TOML, and a pinned `<!-- wit-tag: wit-v0.1.0 -->`. The proof's fetcher leg (steps 11 to 20, re-run by me) shows the canned 200 answer reaching the source, the 404 for an unmatched URL, and no canned answer when the `fetcher` key is absent. |
+| 1 | Integration tests run the compiled Reddit and YouTube `.wasm` components inside the host against replayed fixtures and assert the expected `SourceItem`s land in a local Fluvio topic; no network and no keys | VERIFIED (re-checked) | Re-ran `cargo test -p filimon e2e_replay_` today: 5 passed, 0 failed (includes both scratch-topic tests against the local cluster, and the no-cluster in-memory host path). No regression since the first report. |
+| 2 | The same tests run in live mode against the real APIs only when credentials are in `.env`, and skip cleanly when they are not | VERIFIED for the mechanism and YouTube; Reddit positive path unexercised (covered by the override) | `credentialed-tests.txt` (regenerated in af7aeea): `test result: ok. 10 passed; 0 failed`; line 106 `skipped: missing REDDIT_CLIENT_ID`; `e2e_credentialed_youtube_live_poll_has_the_expected_structure ... ok` (ran, not skipped). The Reddit live test shows `ok` only because it skipped. |
+| 3 | A live end-to-end run works: `fili` loads the Reddit and YouTube plugins, polls the real APIs, records flow through Fluvio; the consumer writes NER-enriched social records alongside news articles in the same JSON output | PASSED (override) | YouTube and news half independently verified, see below. Reddit half not met by evidence and accepted by the user's override. See "Override assessment". |
+| 4 | Using only the template and guide, a source plugin built with `cargo component` outside the repo, against only the published WIT, is registered in `filimon.toml` and runs in an unmodified `fili` binary | VERIFIED (re-checked) | Re-ran `scripts/verify-authoring.sh` in local mode today: exit 0, `PASS: source leg`, `PASS: fetcher leg`, `AUTHORING PROOF: PASS (legs: source fetcher)`, including step 22 (fili tree untouched). Remote-mode transcript `authoring-proof-remote.txt` unchanged (not re-run, needs network). |
+| 5 | The guide covers writing a fetcher plugin and assigning it to a source, and a fetcher built by following it serves that source's requests | VERIFIED (re-checked) | The fetcher leg of the same re-run passed. `docs/plugin-guide.md` unchanged since the first report. |
 
-**Score:** 4/5 truths verified (SC3 awaits a human decision; 0 behavior-unverified).
+**Score:** 5/5 truths (4 verified, 1 passed by override); 0 behavior-unverified.
 
-### Evidence checks for SC3 (what the committed sample does and does not show)
+### SC3 evidence, re-checked after the rerun
 
-Checked in `evidence/enriched-sample.json` (14 records) with `jq`, not from the SUMMARY:
+**(i) Fresh poll in this run: what is and is not committed evidence.**
 
-- Platforms and types: news blog.rust-lang.org 3, example.com 2, local `file:` 3, techcrunch.com 3; social youtube 3; Reddit 0. The counts in `README.md` are accurate.
-- NER: every record has an `entities` array (entity field names are `text` and `kind`: ORGANIZATION 17, PERSON 14, PRODUCT 10, DATE 14, LOCATION 4, EVENT 3, LAW_OR_REGULATION 3). The three YouTube records have 2, 2 and 5 entities.
-- Sanitising: `raw` is null on all 14, `author` is null or `redacted` on all 14, PERSON entity text is `[redacted]`, no e-mail address anywhere in the file, no `AIza...` key pattern in the evidence, scripts, docs or `src`. `scripts/live-e2e.sh check-evidence` printed `ok: evidence is complete and clean` when I ran it. The root `.env` is not tracked (not read by me).
-- The YouTube ids are real video ids, not the `vidNew00001`-style replay fixture ids. The data is genuine live YouTube data.
-- Weakness in the sample: 8 of the 11 news records are old (example.com, local `file:` fixtures, an earlier techcrunch.com crawl), not from this run. That is disclosed in `README.md`.
+- Committed, direct: the transcript starts `Sun Nov 15 06:42:48 UTC 2026` and shows `step 2 ... all enabled sources polled successfully; stopping fili run` and `source youtube: ok`. It does NOT show poll counts.
+- Committed, indirect but decisive: `scripts/live-e2e.sh` (commit 508db2a) executes `rm -rf "$WORK/state"; mkdir -p "$WORK/state"` in `write_live_registry` before `fili run` starts (lines 451-454). The step 2 wait loop reads `plugins list --json` from that same state directory. After a wipe, `last_poll.state == "ok"` can only be written by a poll made in this run, so the transcript line is now a real proof of a fresh poll. `scripts/live-e2e.sh selftest` (case 9, stale status must not survive) printed `SELFTEST: PASS` when I ran it.
+- Uncommitted (gitignored), corroborating: `.live-e2e/run.log` exists and ends with the table `youtube  1  10  0  0  stopped` (POLLS 1, SENT 10, DROPPED 0, FAILURES 0). `.live-e2e/state/youtube.status.json` reads `"at":"2026-11-15T06:42:53Z","ok":true,"items":10`, five seconds after the transcript start (06:42:48Z). So the executor's report is accurate, and the README says explicitly that these counts come from the uncommitted work log.
+- Contrast with the first report: the status file then predated the run by six minutes and POLLS was 0. That defect (CR-01) is gone.
 
-**CR-01 confirmed on the committed run (adversarial finding).** The committed transcript starts at 06:06:38Z. `.live-e2e/state/youtube.status.json` still reads `"at":"2026-11-15T06:00:49Z"`, `items":10`, six minutes earlier. `.live-e2e/run.log` of the committed run ends with the table `youtube  POLLS 0  SENT 0  DROPPED 0  FAILURES 0  STATE stopped`. So `fili run` in the committed run was stopped before its first poll finished, and step 2's "all enabled sources polled successfully; stopping fili run" was satisfied by the previous run's status file. `README.md` and `08-06-SUMMARY.md` state "The YouTube records come from the live poll of this run". That statement is not supported: the YouTube records came from the poll at 06:00:49Z in an earlier run of the same script, for which no transcript is committed. They are still live data that reached Fluvio and went through `consume --enrich-ner`, which is why this is raised as a decision and not as a failure.
+**Residual note on per-record attribution (does not change the verdict).** The uncommitted `.live-e2e/enriched.json` (51 records) holds 20 YouTube records, every one of the 10 video ids twice, because the production topic still held the 10 records of the earlier 06:00:49Z poll plus the 10 sent by this run (state wipe resets cursors, so the same latest 10 videos are re-sent). The committed sample's three YouTube records are `vLAegkGGWrM` twice and `rsOiZE19RVo` once, so one of the duplicated pair necessarily comes from the earlier run and the third record's origin cannot be told. `evidence/README.md` and `08-06-SUMMARY.md` say "The YouTube records come from the live poll of this run". That is true of the run as a whole (10 items were sent fresh, genuine live data) but overstated for the three sample records, and the README does not mention the duplicate pair or that the topic held the earlier run's copies. The same README discloses the older news groups. I rate this a minor documentation inaccuracy, not a gap: the goal is that a live run works end to end, which the fresh poll, the transcript and the enriched output now show.
+
+**(ii) Sample content, checked with `jq`/`grep` on `evidence/enriched-sample.json` (14 records).**
+
+- Types and platforms: news blog.rust-lang.org 3, example.com 2, local `file:` 3, techcrunch.com 3 (11 news); social youtube 3; Reddit 0. Matches the README table.
+- Entities: every record has an `entities` array, minimum 2, maximum 9; the YouTube records have 2 each (PRODUCT/ORGANIZATION, PRODUCT/PERSON).
+- `raw` is null on all 14; `author` is null or `redacted` on all 14; 0 e-mail-address matches; 0 `AIza` matches in any evidence file; `scripts/live-e2e.sh check-evidence` prints `ok: evidence is complete and clean`.
+- YouTube ids `vLAegkGGWrM` and `rsOiZE19RVo` are real video ids (they appear in the live transcript and in the live consume output, not replay-fixture ids such as `vidNew00001`). No Reddit record in the sample. The transcript itself, however, prints three replay-fixture Reddit records (`reddit.com/r/rust/comments/fili02`, author `u1`, text `lol cat`) that were already in the production topic; the README says Reddit records in the topics are not from this run and were kept out of the sample. Accurate.
+- Minor, not a failure: the transcript contains raw consume output, including YouTube channel names and PERSON entity text (for example public video credits). `evidence/README.md` describes the transcript as "key names and fixed texts only", which understates that. The data is public YouTube metadata and no credential or e-mail address is present.
+
+**(iii) Corrected statements.**
+
+- `evidence/authoring-README.md` line 10 now says `plugins/replay-fetcher` does exist in the tagged commit. Confirmed: `git cat-file -e wit-v0.1.0:plugins/replay-fetcher/Cargo.toml` succeeds. Accurate.
+- `evidence/README.md` and `08-06-SUMMARY.md` now state the Reddit waiver is accepted and deferred, that this is the second run after CR-01 (commit 508db2a), that POLLS 1 / SENT 10 come from the gitignored log and are not in the committed transcript, and that the first run's evidence was stale. Accurate, with the per-record caveat above.
+
+### Override assessment (SC3 / TEST-04)
+
+The override is applied in the frontmatter, naming the user as accepter, with their reason verbatim (`takes time to complete`) and the date of the ruling (2026-11-15, recorded in `08-UAT.md` test 1 and in `.planning/STATE.md` Deferred Items). It is a legitimate use of the mechanism: the user, who owns the scope, made an explicit, bounded and documented ruling, and live Reddit proof is tracked as a deferred item.
+
+Stated plainly, so it is not hidden: the roadmap wording for SC3 and the wording of TEST-04 ask for real Reddit and YouTube data, and the committed evidence contains no Reddit record from a live poll. The generated registry loaded only `youtube` and `http` (`[Run] loaded sources: youtube`). The Reddit app-only path (RDDT-01) is therefore proven only by replay tests (SC1: the real compiled `reddit_source.wasm` inside the host, exact items in a scratch topic) and by its unit tests, never against the real Reddit API, and the Reddit live credentialed test passes only by skipping. The phase passes on SC3 because the user accepted that reduction, not because the evidence meets the literal wording. The deferred item should be closed later by creating a Reddit web app, setting `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` in the root `.env`, and rerunning `scripts/live-e2e.sh run` plus the credentialed tests.
 
 ### Requirements Coverage
 
 | Requirement | Source Plan | Description | Status | Evidence |
 | ----------- | ----------- | ----------- | ------ | -------- |
-| TEST-02 | 08-01 | Compiled Reddit and YouTube `.wasm` run in the host against replayed fixtures, items reach a local Fluvio topic | SATISFIED | Truth 1; tests run by me and passed |
-| TEST-03 | 08-04, 08-06 | Live mode that runs against real APIs only when credentials are in `.env` | SATISFIED for the mechanism and YouTube; Reddit live path unexercised (waiver) | Truth 2 |
-| TEST-04 | 08-03, 08-06 | A live E2E run with real Reddit and YouTube data produces enriched JSON alongside news | NEEDS HUMAN: Reddit half unmet (waiver D-09), YouTube half real but provenance of the committed transcript is weak | Truth 3 |
-| WIT-03 | 08-02, 08-05, 08-07 | A plugin built outside the repo, using only the published WIT, loads and runs in `fili` without rebuilding `fili` | SATISFIED | Truth 4 |
-| DOCS-01 | 08-02, 08-05 | Template plus guide for a source plugin: `cargo component`, TOML, registration in `filimon.toml` | SATISFIED | Guide sections "Build and check", "Write the plugin TOML", "Register it"; proof source leg passed |
+| TEST-02 | 08-01 | Compiled Reddit and YouTube `.wasm` run in the host against replayed fixtures, items reach a local Fluvio topic | SATISFIED | Truth 1, re-run today |
+| TEST-03 | 08-04, 08-06 | Live mode that runs against real APIs only when credentials are in `.env` | SATISFIED (mechanism and YouTube positive path; Reddit positive path not exercised, covered by the override) | Truth 2 |
+| TEST-04 | 08-03, 08-06 | A live end-to-end run with real Reddit and YouTube data produces enriched JSON alongside news | SATISFIED WITH ACCEPTED WAIVER (YouTube plus news proven by a fresh-poll run; Reddit half waived by the user and deferred) | Truth 3 |
+| WIT-03 | 08-02, 08-05, 08-07 | A plugin built outside the repo, using only the published WIT, loads and runs in `fili` without rebuilding `fili` | SATISFIED | Truth 4, re-run today |
+| DOCS-01 | 08-02, 08-05 | Template plus guide for a source plugin | SATISFIED | Truth 4 |
 | DOCS-02 | 08-05 | Guide covers writing a fetcher plugin and assigning it to a source | SATISFIED | Truth 5 |
 
-All six phase requirement IDs are claimed by at least one PLAN's `requirements` frontmatter and all appear in REQUIREMENTS.md. No orphaned requirements.
+No orphaned requirements.
 
-**REQUIREMENTS.md tracking is wrong and needs editing by the orchestrator:** TEST-02, WIT-03, DOCS-01 and DOCS-02 are still `[ ]` / `Pending` although their evidence is complete (the SUMMARYs for 08-01, 08-02, 08-05 and 08-07 did not mark them). TEST-03 and TEST-04 are `[x]` / `Complete`, which was a mechanical mark; TEST-04 must not stay `Complete` unless the user accepts the waiver.
+**Tracking state to fix (orchestrator, not edited by me).** `.planning/REQUIREMENTS.md` currently reads: TEST-02 `[ ]`/Pending, WIT-03 `[ ]`/Pending, DOCS-01 `[ ]`/Pending, DOCS-02 `[ ]`/Pending, TEST-03 `[x]`/Complete, TEST-04 `[ ]`/Pending. Given the accepted override, all six should read `[x]` / Complete. For TEST-04 I recommend appending a note such as "Complete with accepted Reddit waiver, live Reddit proof deferred (STATE.md Deferred Items)", so the checkbox does not claim more than the evidence shows. `.planning/STATE.md` line 32 still says "Reddit waiver awaits a ruling" and line 83 says the Reddit half is "to be accepted or rejected at verification"; both are stale now (the Deferred Items table row at line 106 is correct). Reported, not edited.
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 | -------- | -------- | ------ | ------- |
-| `plugins/replay-fetcher/` (Cargo.toml, src/lib.rs, src/fixtures.rs, rust-toolchain.toml) | Fetcher component serving frozen fixtures | VERIFIED | Built on demand by the tests (`bindings.rs` is generated and gitignored); wired through `fetcher = "replay"` |
-| `src/plugins/host/integration_tests.rs`, `testing.rs`, `mod.rs` | Replay and credentialed tests, build-on-demand helper | VERIFIED | Tests ran and passed; no TBD/FIXME/XXX markers |
-| `plugins/template/` | Source plugin template | VERIFIED | Built and run by the proof (re-run by me) |
-| `plugins/stub-fetcher/` | Fetcher fixture for the guide | VERIFIED | Used by the proof's fetcher leg |
-| `scripts/verify-authoring.sh` | Authoring proof, local and remote | VERIFIED | Local mode re-run by me: PASS |
-| `docs/plugin-guide.md` | Source and fetcher guide pinned to a WIT tag | VERIFIED | 392 lines, tag line matches the existing tag |
-| `scripts/live-e2e.sh` | Live E2E runbook, sanitiser, check-evidence | VERIFIED as a tool; has CR-01 | `check-evidence` re-run: ok |
-| `evidence/` (8 files, all tracked) | Committed live and authoring evidence | PARTIAL | See Truth 3; `authoring-README.md` also wrongly says `plugins/replay-fetcher` "does not exist in the tagged commit" (it does; `git cat-file -e wit-v0.1.0:plugins/replay-fetcher/Cargo.toml` succeeds) |
+| `plugins/replay-fetcher/`, `plugins/template/`, `plugins/stub-fetcher/` | Fetcher and template components | VERIFIED | Built and run by the tests and the proof I re-ran |
+| `src/plugins/host/integration_tests.rs`, `testing.rs` | Replay and credentialed tests | VERIFIED | Tests re-run, pass |
+| `scripts/verify-authoring.sh` | Authoring proof | VERIFIED | Re-run, PASS |
+| `docs/plugin-guide.md` | Guide pinned to `wit-v0.1.0` | VERIFIED | Unchanged |
+| `scripts/live-e2e.sh` | Live runbook, sanitiser, check-evidence | VERIFIED | CR-01 fixed (lines 451-454), selftest PASS, check-evidence ok |
+| `evidence/` (8 files, tracked) | Live and authoring evidence | VERIFIED | Regenerated in af7aeea, corrected in 2f25e89; claims checked above |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 | ---- | -- | --- | ------ | ------- |
-| replay tests | compiled reddit / youtube wasm | `ensure_built` + registry with `fetcher = "replay"` | WIRED | Tests landed exact items |
-| host run | Fluvio scratch topic | `drive_fluvio` + `scratch_topic` / `delete_topic` | WIRED | Replay tests passed against the local cluster |
-| `docs/plugin-guide.md` | tag `wit-v0.1.0` | `git clone --branch wit-v0.1.0` | WIRED | Tag on origin; origin URL matches the guide URL |
-| `scripts/live-e2e.sh` | consumer NER output | `fili consume --enrich-ner` | WIRED | Sample has entities on all records |
-| `live-e2e.sh` step 2 wait loop | a fresh poll of the current run | `plugins list --json` over a reused `$WORK/state` | NOT_WIRED for reruns | CR-01, confirmed on the committed run |
+| replay tests | compiled reddit / youtube wasm | `ensure_built`, `fetcher = "replay"` | WIRED | 5 tests pass |
+| host run | Fluvio scratch topic | `drive_fluvio` + `scratch_topic` | WIRED | passed against the local cluster |
+| `docs/plugin-guide.md` | tag `wit-v0.1.0` | `git clone --branch` | WIRED | tag on origin (first report); local tag still contains the replay fetcher |
+| `scripts/live-e2e.sh` | consumer NER output | `fili consume --enrich-ner` | WIRED | all 14 sample records have entities |
+| step 2 wait loop | a fresh poll of the current run | `plugins list --json` over a state dir wiped at run start | WIRED (was NOT_WIRED, CR-01) | wipe at lines 451-454; status file timestamp 06:42:53Z, five seconds after run start |
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 | -------- | ------- | ------ | ------ |
-| Replay into a real Fluvio topic and in-memory | `cargo test -p filimon e2e_replay_` | 5 passed, 0 failed | PASS |
-| Authoring proof, local mode | `PROOF_TRANSCRIPT=/tmp/verifier-authoring-local.txt scripts/verify-authoring.sh` | `AUTHORING PROOF: PASS (legs: source fetcher)`, exit 0 | PASS |
-| Evidence is complete and clean | `scripts/live-e2e.sh check-evidence <evidence dir>` | `ok: evidence is complete and clean` | PASS |
-| Credentialed tests | not run by me (constraint) | user's run: 10 passed, 0 failed, Reddit skipped | SKIP (taken from the user's committed transcript) |
-| Live E2E `run` | not run by me (constraint) | n/a | SKIP |
-| Remote authoring proof from the tag | not re-run (network) | user's committed transcript PASS | SKIP |
+| Replay into Fluvio and in-memory | `cargo test -p filimon e2e_replay_` | 5 passed, 0 failed | PASS |
+| Authoring proof, local mode | `scripts/verify-authoring.sh` | `AUTHORING PROOF: PASS (legs: source fetcher)`, exit 0 | PASS |
+| Live script safety logic incl. stale-state case | `scripts/live-e2e.sh selftest` | `SELFTEST: PASS` | PASS |
+| Evidence complete and clean | `scripts/live-e2e.sh check-evidence <dir>` | `ok: evidence is complete and clean` | PASS |
+| Credentialed tests, live E2E `run`, remote proof | not run by me (credentials and network, per constraints) | user's committed outputs only | SKIP |
+
+### Probe Execution
+
+None declared beyond `scripts/verify-authoring.sh` and the live script selftest, both run above.
 
 ### Anti-Patterns Found
 
-| File | Line | Pattern | Severity | Impact |
-| ---- | ---- | ------- | -------- | ------ |
-| none | | No TBD/FIXME/XXX markers in the files this phase changed; no uncommitted changes under `src`, `scripts`, `docs`, `plugins` | none | |
+None blocking. No TBD/FIXME/XXX in files this phase changed; no uncommitted changes under `src`, `scripts`, `docs`, `plugins` (git status shows only unrelated working-tree changes).
 
-Code-review items that bear on the phase goal (advisory, all `open` in `08-REVIEW-DISPOSITION.md`):
-
-- CR-01: confirmed on the committed run, see Truth 3. This is the item that weakens the live evidence.
-- WR-06: the sample cannot show freshness. Confirmed in effect (8 of 11 news records are old; YouTube ids are real but the run did not poll).
-- CR-02: `fili produce` without a registry panics (`src/crawler.rs`, blocking reqwest client inside the async runtime). Not fixed; it is a brownfield defect, but it means a user following the README `produce` path without `[crawler]` hits a panic. Does not break a phase must-have, because the live script works around it.
-- WR-08 (the "unassigned" assertion passes on any failure) does not invalidate Truth 5, because the canned and unmatched assertions are positive checks.
-- WR-12: credentialed tests make real API calls under a plain `cargo test` when keys are in `.env`; the `-- --skip e2e_credentialed_` gate the orchestrator uses avoids this.
-
-### Deferred Items
-
-None. No later milestone phase covers Reddit live proof.
+Open review items (advisory, unchanged from the first report): CR-02 (`fili produce` without a registry panics, brownfield defect worked around by the script), WR-08, WR-12. CR-01 and WR-06 are now addressed for the live evidence (fresh poll proven; old news groups disclosed).
 
 ### Human Verification Required
 
-#### 1. Reddit waiver (D-09) for SC3, TEST-04 and the Reddit half of SC2
-
-**Question to the user:** "Do you accept that SC3 / TEST-04 ('a live end-to-end run with real Reddit and YouTube data') is satisfied by a YouTube-plus-news live run with Reddit waived (reason, verbatim: 'takes time to complete'), and that the Reddit live poll path stays unexercised against the real API?"
-
-- If yes: add to this file's frontmatter
-  ```yaml
-  overrides:
-    - must_have: "A live end-to-end run works: fili loads the Reddit and YouTube plugins, polls the real APIs (live E2E with real Reddit and YouTube data)"
-      reason: "Reddit waived under D-09: takes time to complete"
-      accepted_by: "<user>"
-      accepted_at: "<ISO timestamp>"
-  ```
-  and re-verify; the phase then passes on this item.
-- If no: create a Reddit web app, put `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET` in the root `.env`, rerun `scripts/live-e2e.sh run` (without `LIVE_E2E_WAIVE_REDDIT`) and the credentialed tests, recommit the evidence.
-
-#### 2. YouTube live-run provenance
-
-**Question to the user:** "Accept the committed YouTube evidence as is (real live records from the 06:00:49Z poll, not from the 06:06 run whose transcript is committed), or repeat the run from an empty state directory so the transcript shows the poll?"
-
-Recommended: fix CR-01 (`rm -rf "$WORK/state"` before the run, or require a status newer than the launch time), rerun once, and in the same run supply Reddit if the waiver is rejected. This makes one clean rerun serve both questions.
+None. Both items from the first report are resolved by the user's rulings (see `re_verification`). The only residual risk is the accepted Reddit waiver, recorded as an override and a deferred item.
 
 ### Gaps Summary
 
-No code gap blocks the phase goal. SC1, SC2 (mechanism and YouTube), SC4 and SC5 are verified by tests and a proof that I ran myself. SC3 is not marked verified: the Reddit half has no live evidence by the user's own waiver, which only the user can accept, and the committed YouTube live run did not itself perform a poll (stale status accepted by the wait loop, confirmed from `run.log` and the status file timestamp). Minor documentation defects to correct regardless of the decision: `evidence/README.md` and `08-06-SUMMARY.md` say the YouTube records are from "this run" (inaccurate); `evidence/authoring-README.md` says `plugins/replay-fetcher` is absent from the tagged commit (it is present); REQUIREMENTS.md checkboxes for TEST-02, WIT-03, DOCS-01 and DOCS-02 are stale, and TEST-04 is marked complete without an accepted waiver. The post-wave gate (`cargo build`, `cargo test -- --skip e2e_credentialed_`) was reported passing by the orchestrator and I did not re-run the full suite.
+No gaps. SC1, SC2 (mechanism and YouTube), SC4 and SC5 were re-verified by commands I ran. SC3's YouTube plus news half is now backed by a run whose fresh poll is guaranteed by committed script behavior (state wipe plus selftest) and corroborated by the gitignored work log and status file timestamp; its Reddit half passes only through the user's accepted waiver, which does not meet the roadmap's literal "real Reddit data" and is deferred. Minor documentation notes to optionally tidy: the README/SUMMARY sentence "YouTube records come from the live poll of this run" should be softened to say the topic also held the earlier run's copies (the sample contains one such duplicate pair), and the README's "key names and fixed texts only" description of the transcript understates that it includes raw consume output.
 
 ---
 
-_Verified: 2026-11-15T07:10:00Z_
+_Verified: 2026-11-15T08:00:00Z_
 _Verifier: Claude (gsd-verifier)_

@@ -122,6 +122,8 @@ Related fix commits made during this plan to the plan 08-03 script: `0342c17`, `
 
 **Impact:** Evidence is genuine and sanitised; the Reddit half of the requirement has no live proof, by user choice, and that waiver was accepted at verification.
 
+7. **[Rule 2 - Missing critical] The committed transcript held the consumer's record display (found by the verifier, confirmed by the orchestrator).** It listed author names (real bylines) and about 23 PERSON entity lines, which D-08 and threat T-08-22 keep out of committed evidence; only the sample was sanitised and check-evidence did not scan the transcript. Fix: the display section was removed from the committed transcript (marker line, 606 lines), `scripts/live-e2e.sh` now writes the consumer output to the gitignored work file `consume.log`, and check-evidence fails on raw `Author :` or `[PERSON]` lines in the transcript (selftest cases). The two earlier unpushed commits (e13466b, af7aeea) still contain the names in local history; the user chose not to rewrite history and not to push before deciding.
+
 ## Verification rulings (2026-11-15)
 
 1. **Reddit waiver accepted** for SC3 / TEST-04, reason verbatim: `takes time to complete`. Live Reddit proof is tracked as a deferred item (STATE.md Deferred Items).
@@ -130,7 +132,7 @@ Related fix commits made during this plan to the plan 08-03 script: `0342c17`, `
 ## Issues Encountered
 
 - A registry-less `fili produce` still panics (`src/crawler.rs` blocking client inside the async runtime). Not fixed here; out of this plan's scope.
-- The sample contains older news groups (example.com, local `file:` URLs, an earlier techcrunch.com crawl) because the consumer reads oldest-first and the topics retain records for 7 days. The YouTube records come from the regenerated run's live poll (`youtube  POLLS 1  SENT 10  FAILURES 0` in the gitignored work log), not from the first committed run.
+- The sample contains older news groups (example.com, local `file:` URLs, an earlier techcrunch.com crawl) because the consumer reads oldest-first and the topics retain records for 7 days. The YouTube records are real live data from the same key: the regenerated run made a fresh poll (`youtube  POLLS 1  SENT 10  FAILURES 0` in the gitignored work log), but the sample alone cannot show which poll produced which record, because the topic still held an earlier poll's copies and one sampled id appears twice.
 
 ## Known Stubs
 

@@ -1,18 +1,14 @@
 ---
-status: testing
+status: complete
 phase: 08-integration-live-e2e-authoring
 source: [08-VERIFICATION.md]
 started: 2026-11-15T06:25:53.368Z
-updated: 2026-11-15T06:41:44.454Z
+updated: 2026-11-15T06:57:16.505Z
 ---
 
 ## Current Test
 
-number: 2
-name: Decide the YouTube live-run evidence (CR-01)
-expected: |
-  Either accept the waiver (an overrides entry for SC3 and TEST-04 naming the user as accepter, reason "takes time to complete"), or reject it: set the Reddit keys in the repo-root credentials file, rerun scripts/live-e2e.sh run and the credentialed tests, and recommit the evidence.
-awaiting: user response
+[testing complete]
 
 ## Tests
 
@@ -22,14 +18,14 @@ result: ACCEPTED by the user on 2026-11-15 (waiver reason, verbatim: takes time 
 
 ### 2. Decide whether the committed YouTube live-run evidence is acceptable (CR-01)
 expected: Either accept that the YouTube records come from the earlier live poll (status file dated 2026-11-15T06:00:49Z, 10 items, real video ids), because the committed run's transcript did not perform a fresh poll (run.log shows youtube POLLS 0), with the README and SUMMARY claim "from this run" corrected; or fix CR-01 (stale state reuse in scripts/live-e2e.sh) and repeat the live run from an empty state.
-result: DECIDED by the user on 2026-11-15: fix CR-01 and rerun once. CR-01 fixed in 508db2a (every run starts from an empty state directory). Pending: the user's rerun of the live script and the credentialed tests, then recommit the evidence with corrected claims and re-verify.
+result: PASSED on 2026-11-15. CR-01 fixed in 508db2a, the live script and credentialed tests were rerun by the user (run.log: youtube POLLS 1, SENT 10), evidence recommitted (af7aeea) and re-verified. The verifier noted that the sample alone cannot show which poll produced which YouTube record; README and SUMMARY now say so.
 
 ## Summary
 
 total: 2
-passed: 1
+passed: 2
 issues: 0
-pending: 1
+pending: 0
 skipped: 0
 blocked: 0
 
