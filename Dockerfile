@@ -31,8 +31,18 @@ ENV ORT_STRATEGY=download
 
 COPY Cargo.toml Cargo.lock ./
 
-# Pre-fetch all crates without compiling; only reruns when Cargo.lock changes.
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs
+# The root manifest declares a workspace; cargo must be able to load every
+# member manifest even just to fetch, so copy them and stub their sources.
+COPY smartmodules/filter-relevance/Cargo.toml smartmodules/filter-relevance/Cargo.toml
+COPY smartmodules/map-preprocess/Cargo.toml   smartmodules/map-preprocess/Cargo.toml
+COPY smartmodules/map-extract/Cargo.toml      smartmodules/map-extract/Cargo.toml
+
+# Pre-fetch all crates without compiling; only reruns when a manifest or Cargo.lock changes.
+RUN mkdir -p src \
+    && echo 'fn main() {}' > src/main.rs \
+    && for m in filter-relevance map-preprocess map-extract; do \
+         mkdir -p smartmodules/$m/src && touch smartmodules/$m/src/lib.rs; \
+       done
 RUN cargo fetch --locked
 
 # ── Stage 2: Compiler ─────────────────────────────────────────────────────────
@@ -43,7 +53,7 @@ FROM deps AS builder
 ENV RUSTFLAGS="-C link-args=-Wl,-rpath,/usr/local/lib"
 
 # ── 2a. Compile dependency graph (cached unless deps change) ──────────────────
-RUN cargo build --release --locked
+RUN cargo build --release --locked -p filimon
 
 # ── 2b. Swap in real source and rebuild only filimon ─────────────────────────
 # Remove build artefacts that would prevent a full re-link of our crate.
@@ -55,7 +65,7 @@ RUN rm -f \
 
 COPY src ./src
 
-RUN cargo build --release --locked
+RUN cargo build --release --locked -p filimon
 
 # ── 2c. Stage the ONNX Runtime shared library ─────────────────────────────────
 # ort's copy-dylibs feature (enabled by default) copies libonnxruntime.so* into
