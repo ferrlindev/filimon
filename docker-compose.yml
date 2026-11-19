@@ -21,8 +21,9 @@ services:
     container_name: fluvio-sc
     entrypoint: ["/fluvio-run", "sc"]
     ports:
-      - "9003:9003"   # SC API (internal)
-      - "9005:9005"   # SC public endpoint
+      # Host ports are offset so they do not clash with a local `fluvio cluster` on 9003/9005/9010.
+      - "19003:9003"  # SC API (internal)
+      - "19005:9005"  # SC public endpoint
     environment:
       RUST_LOG: "info"
     volumes:
@@ -45,8 +46,8 @@ services:
       fluvio-sc:
         condition: service_healthy
     ports:
-      - "9010:9010"   # SPU public endpoint
-      - "9011:9011"   # SPU private endpoint
+      - "19010:9010"  # SPU public endpoint
+      - "19011:9011"  # SPU private endpoint
     environment:
       RUST_LOG: "info"
     volumes:
@@ -90,7 +91,13 @@ services:
       # Extraction results – wise_output.json is written here by Stage 4.
       - ./output:/app/output
       # Fluvio profile for cluster connection
-      - fluvio-profile:/root/.fluvio
+      # fili connects through the default Fluvio profile; point it at the in-network SC.
+      - ./docker/fluvio-config:/root/.fluvio/config:ro
+      # Plugin registry, compiled .wasm components (build on the host with
+      # `cargo component build --release`) and persistent plugin state.
+      - ./plugins:/app/plugins:ro
+      - ./examples:/app/examples:ro
+      - ./.fili-state:/app/.fili-state
 
     environment:
       RUST_LOG: "info,filimon=debug"
@@ -106,6 +113,10 @@ services:
 
       # Fluvio cluster endpoint (for container-to-container communication)
       FLUVIO_CLUSTER_ADDR: "fluvio-sc:9003"
+
+      # Plugin registry and state directory (see the volumes above).
+      FILI_REGISTRY: /app/examples/plugins/filimon.toml
+      FILI_STATE_DIR: /app/.fili-state
 
     # Default command – override at runtime:
     #   docker compose run --rm filimon crawl https://techcrunch.com
@@ -148,7 +159,8 @@ services:
 
     volumes:
       - ./models:/app/models:ro
-      - fluvio-profile:/root/.fluvio
+      # fili connects through the default Fluvio profile; point it at the in-network SC.
+      - ./docker/fluvio-config:/root/.fluvio/config:ro
 
     environment:
       RUST_LOG: "info,filimon=debug"

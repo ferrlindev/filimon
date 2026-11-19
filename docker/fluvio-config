@@ -1,0 +1,15 @@
+version = "2.0"
+current_profile = "docker"
+
+[profile.docker]
+cluster = "docker"
+
+[cluster.docker]
+endpoint = "fluvio-sc:9005"
+use_spu_local_address = false
+
+[cluster.docker.tls]
+tls_policy = "disabled"
+
+[cluster.docker.metadata]
+installation = "docker"

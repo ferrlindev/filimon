@@ -64,6 +64,15 @@ RUN rm -f \
         src/main.rs
 
 COPY src ./src
+# The host's WIT bindings are generated at compile time from ./wit.
+COPY wit ./wit
+COPY transforms.yaml ./transforms.yaml
+
+# COPY keeps the host's old mtimes, which cargo would see as older than the
+# placeholder build above and skip recompiling. Drop the placeholder's
+# fingerprints and touch the sources so the real crate is always rebuilt.
+RUN rm -rf target/release/.fingerprint/filimon-* \
+    && find src -type f -exec touch {} +
 
 RUN cargo build --release --locked -p filimon
 
