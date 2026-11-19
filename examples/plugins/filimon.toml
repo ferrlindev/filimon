@@ -33,6 +33,13 @@ config = "youtube-user.toml"
 enabled = true
 fetcher = "http"
 
+# RSS / Atom feeds: one instance can follow several feeds (see rss.toml).
+[sources.rss]
+component = "../../plugins/rss/target/wasm32-unknown-unknown/release/rss_source.wasm"
+config = "rss.toml"
+enabled = true
+fetcher = "http"
+
 [fetchers.stub-fetcher]
 component = "../../plugins/stub-fetcher/target/wasm32-unknown-unknown/release/stub_fetcher.wasm"
 

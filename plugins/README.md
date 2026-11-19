@@ -88,6 +88,7 @@ From the repository root:
 (cd plugins/http-fetcher && cargo component build --release)
 (cd plugins/reddit && cargo component build --release)
 (cd plugins/youtube && cargo component build --release)
+(cd plugins/rss && cargo component build --release)
 (cd plugins/replay-fetcher && cargo component build --release)
 (cd plugins/template && cargo component build --release)
 ```
@@ -1012,3 +1013,11 @@ cargo-component is marked experimental and has not released since 2025-04.
 The fallback is `cargo build --target wasm32-wasip2` with the `wit-bindgen`
 macro. Switching to it changes the build and conformance requirements, so it
 needs user sign-off first.
+
+## RSS / Atom feeds (`plugins/rss`)
+
+A source plugin that polls RSS 2.0 and Atom 1.0 feeds and returns one item per
+entry, with no API key and no login. `examples/plugins/rss.toml` is a working
+config and `[sources.rss]` in `examples/plugins/filimon.toml` registers it. How it
+works, its settings, failure handling and limits are in
+[`rss/README.md`](rss/README.md).
