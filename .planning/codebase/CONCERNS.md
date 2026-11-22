@@ -1,151 +1,112 @@
 ---
-last_mapped_commit: 5122e6b9c4aa51ca49831917f1a1035fdc543870
-last_mapped_at: 2026-11-03
+last_mapped_commit: ee408de9974ea0cee802f332ee2386ef13b0428b
+last_mapped_at: 2026-11-22
 ---
 # Codebase Concerns
 
-**Analysis Date:** 2026-11-03
+**Analysis Date:** 2026-11-22
 
 ## Tech Debt
 
-**Dead Code Blocks:**
-- Issue: `src/main.rs` contains ~215 lines of commented-out code (lines 103-175, 177-229, 232-317) for previous mode implementations (`run_produce`, `run_consume`, `run_watch`). These functions were refactored into `src/commands/` but the old implementations remain commented out instead of deleted.
-- Files: `src/main.rs`
-- Impact: Increases maintenance burden, confuses developers about which implementation is current, wastes bytes in the binary
-- Fix approach: Delete all commented-out code blocks. The current implementations in `src/commands/produce.rs`, `src/commands/consume.rs`, and `src/commands/watch.rs` are the authoritative versions.
+**Oversized modules:**
+- Issue: Several files exceed 2000 lines and mix concerns (config parsing, CLI handling, scheduling, fetching).
+- Files: `src/plugins/config.rs` (3981), `src/commands/consume.rs` (2809), `src/commands/plugins.rs` (2686), `src/plugins/host/scheduler.rs` (2594), `src/commands/auth.rs` (2068), `src/plugins/host/fetch.rs` (1967)
+- Impact: Hard to review, high merge-conflict risk, slow incremental compile.
+- Fix approach: Split into submodules (parsing / validation / types / tests). Move inline test blocks into `tests/` or sibling `*_tests.rs` files, as already done for `src/plugins/host/integration_tests.rs`.
 
-**Deprecated Fluvio API Usage:**
-- Issue: `src/streaming.rs` uses deprecated Fluvio consumer API with `#[allow(deprecated)]` pragmas (lines 71, 156). The comments indicate this is known but not yet upgraded.
-- Files: `src/streaming.rs` (lines 71, 156)
-- Impact: Future Fluvio versions may remove these deprecated methods, forcing a breaking upgrade
-- Fix approach: Update to the non-deprecated consumer API when Fluvio releases a stable replacement or in the next major version bump
+**Panicking config load in CLI args:**
+- Issue: `Args::produce` calls `load_config(&self.config).unwrap()` and `self.ls.as_ref().unwrap()`. A missing or malformed `config.json` panics instead of returning an error.
+- Files: `src/args.rs` (lines 15-20)
+- Impact: Poor UX on bad config; the untracked `test_config_panic.json` at repo root (contents: `not json`) is a leftover from the panic test.
+- Fix approach: Return `Result` from `produce_links`, propagate via `anyhow`/`Box<dyn Error>`, and delete `test_config_panic.json`.
 
-**Incomplete Refactoring:**
-- Issue: The transition from a unified CLI to a modular commands structure appears incomplete. Functions like `criteria()` and type conflicts suggest the refactoring wasn't fully validated before commit.
-- Files: `src/main.rs`, `src/commands/`, `src/cli.rs`
-- Impact: Inconsistent error handling patterns, unused code paths, potential logic errors in mode selection
-- Fix approach: Complete the refactoring by removing the old mode implementations and ensuring all CLI routing points to `src/commands/*` modules
+**Unfinished async hook in watch command:**
+- Issue: `// TODO: We can't easily await here in the sync closure`.
+- Files: `src/commands/watch.rs` (line 112)
+- Impact: Some watch behavior is deferred or incomplete.
+- Fix approach: Use a channel or `tokio::spawn`/`block_on` handle from the sync callback.
+
+**Per-plugin workspace duplication:**
+- Issue: Each plugin (`plugins/reddit`, `plugins/rss`, `plugins/http-fetcher`, `plugins/fault-source`, `plugins/replay-fetcher`, `plugins/stub-fetcher`) is a separate crate with its own `Cargo.lock`, `rust-toolchain.toml`, and `.cargo/config.toml`. `plugins/reddit/src/{cursor,http,poll,settings}.rs` and `plugins/rss/src/{cursor,http,poll,settings}.rs` have parallel structure.
+- Impact: Dependency and toolchain drift; duplicated logic (cursor, poll, http wrappers) must be fixed in multiple places.
+- Fix approach: Extract a shared plugin-support crate; consider a plugins workspace.
 
 ## Known Bugs
 
-**Watch Mode Not Actually Producing to Fluvio:**
-- Issue: `src/commands/watch.rs` at lines 112-114 has a TODO noting that the sync closure in Watchexec cannot easily await async operations. The detected HTML files are logged but never actually sent to Fluvio, only printed as "Would produce..."
-- Files: `src/commands/watch.rs`
-- Trigger: Running `fili watch` on a directory with HTML files
-- Workaround: Use `fili file <paths>` to produce files instead
-- Fix approach: Use a channel to send file paths from the watch thread to an async task that handles the actual Fluvio production
-
-**Typo in Error Message:**
-- Issue: `src/cli.rs` at line 46 has "Config fead failed" instead of "Config read failed"
-- Files: `src/cli.rs`
-- Impact: Minor; only affects user-facing error message clarity
-- Fix approach: Change "fead" to "read" in the eprintln message
-
-**Silent Error Handling in Streaming:**
-- Issue: `src/streaming.rs` in the `process` method (lines 164-178) and `consume_batch` method (lines 192-206) silently log deserialization errors and stream errors without failing or notifying the caller that data was lost. Timeouts in consume_batch silently break the loop.
-- Files: `src/streaming.rs`
-- Trigger: Malformed JSON in Fluvio topic or network timeout during consumption
-- Impact: Consumer may report false completion while silently dropping records; data loss goes unnoticed
-- Fix approach: Either propagate deserialization/stream errors to the caller, or track and report a summary of dropped records
+No confirmed bugs detected from static review. Verify `src/commands/watch.rs` TODO behavior.
 
 ## Security Considerations
 
-**Dangerous TLS Certificate Handling:**
-- Risk: `src/crawler.rs` at line 64 enables `danger_accept_invalid_certs(true)` for the HTTP client. While documented as necessary for a sandboxed environment, this bypasses TLS certificate validation.
-- Files: `src/crawler.rs`
-- Current mitigation: Clear comment noting this is sandbox-only; feature should be disabled for production
-- Recommendations: 
-  - Make this configurable via environment variable or CLI flag
-  - Add a compile-time feature gate to exclude this in release builds
-  - Document requirement to remove this for any real deployment
+**Secrets handling:**
+- Risk: `.env` is gitignored, and `.env.example` is tracked (currently modified, uncommitted). Auth providers store/handle tokens (`src/plugins/auth/client.rs`, `src/plugins/auth/provider.rs`, `src/commands/auth.rs`).
+- Current mitigation: `.gitignore` excludes `.env` and `.env.*`.
+- Recommendations: Confirm token storage uses restrictive file permissions and that logs never print credentials. Review the `.env.example` diff before commit so no real values land in it.
 
-**Test Files Committed to Repository:**
-- Risk: Invalid JSON test file `test_config_panic.json` contains `not json` and is committed to the repository. While harmless, it's test debris that shouldn't be in version control.
-- Files: `test_config_panic.json`
-- Recommendations: Move to a `tests/fixtures/` directory or remove if no longer needed; add `test_config_*.json` to `.gitignore`
+**Untrusted WASM plugins and network content:**
+- Risk: Plugins run in wasmtime (`wasmtime = 48`, component-model) and fetch arbitrary external content (HTML, RSS, Reddit JSON).
+- Files: `src/plugins/host/fetch.rs`, `src/plugins/host/scheduler.rs`, `plugins/*/src/http.rs`
+- Current mitigation: Component sandbox plus host-mediated fetch.
+- Recommendations: Enforce host-side limits on response size, redirects, timeouts, and allowed hosts, and verify fuel/memory limits on plugin instances.
 
 ## Performance Bottlenecks
 
-**HTTP Client Not Cached:**
-- Problem: `src/crawler.rs` in `build_client()` creates a new `reqwest::blocking::Client` on every `fetch_page()` call (line 71). HTTP clients should be reused across requests for connection pooling and efficiency.
-- Files: `src/crawler.rs`
-- Cause: No singleton or connection pool pattern for HTTP clients
-- Improvement path: Create a static or lazy-initialized HTTP client and reuse it across all fetch operations. This will reduce connection overhead and improve throughput.
+**Large model and build artifacts:**
+- Problem: `models/` (591M, gitignored) holds GLiNER weights, loaded for extraction. `target/` is 3.5G.
+- Improvement path: Document model download in the README; keep model loading lazy and shared across calls.
 
-**Timeout in Consume Batch:**
-- Problem: `src/streaming.rs` at line 192 uses a 5-second timeout per record in `consume_batch()`. With many slow-arriving records or network latency, this can cause premature exit even when more data is available.
-- Files: `src/streaming.rs`
-- Improvement path: Make timeout configurable and consider batch-level timeouts instead of per-record timeouts
+**Wasmtime compile cost:**
+- Problem: `cranelift` plus `parallel-compilation` makes plugin load and builds heavy.
+- Improvement path: Cache compiled components.
 
 ## Fragile Areas
 
-**Panic-Prone Config Loading in args.rs:**
-- Files: `src/args.rs`
-- Why fragile: The `produce()` method (line 17) and direct access to `.ls` (line 19) use `.unwrap()` that will panic if config file loading fails. The test intentionally triggers this panic (`test_produce_panic_file_not_found`, `test_produce_panic_invalid_json`), confirming the design is to panic rather than handle errors.
-- Safe modification: Use Result<T, E> return types throughout the config path; avoid unwrap in production code paths. Current cli.rs correctly uses `unwrap_or_else()` with logging, but args.rs takes the opposite approach.
-- Test coverage: Tests exist for panic scenarios but this is fragile design
+**Vendored `fluvio/` checkout:**
+- Files: `fluvio/` (1.6G, untracked build tree; `fluvio/target/` is large)
+- Why fragile: A local Fluvio clone coexists with `fluvio = "0.50"` in `Cargo.toml`. It is unclear which one the build uses. `git ls-files fluvio` returns nothing, so it is not committed.
+- Safe modification: Do not edit; confirm whether it is needed and add it to `.gitignore` if it is local only.
 
-**Error Handling in Smartmodules:**
-- Files: `smartmodules/map-extract/src/lib.rs` (lines 208-209), `smartmodules/filter-relevance/src/lib.rs` (line 66)
-- Why fragile: Uses `unwrap_or(0)` and `.unwrap()` in text extraction, which silently defaults to boundary values or panics on test data. If the HTML structure is malformed, extraction may fail silently.
-- Safe modification: Add explicit error logging and consider partial extraction fallback strategies
+**Plugin scheduler:**
+- Files: `src/plugins/host/scheduler.rs`, `src/plugins/config.rs`
+- Why fragile: Large stateful code (retries, cursors, rate limits) with timing-dependent behavior.
+- Safe modification: Change only with `src/plugins/host/integration_tests.rs` and `src/plugins/host/wasm_tests.rs` run.
+- Test coverage: Tests exist; WASM tests need prebuilt plugin artifacts.
+
+**Fixture/WIT coupling:**
+- Files: `wit/types.wit`, `src/models.rs` (test parses the WIT text by string search at lines ~433)
+- Why fragile: Tests find record bodies via `find('}')`, so a WIT formatting change breaks them.
+- Safe modification: Edit WIT and the model tests together.
 
 ## Scaling Limits
 
-**Async Closure Limitations in Watch Mode:**
-- Current capacity: Watch mode detects HTML changes but cannot scale beyond local file system operations due to inability to await async code in Watchexec's sync closure
-- Limit: Only local file watching is practically supported; remote file sources would require a separate service
-- Scaling path: Decouple file watching from production via a channel-based event queue that feeds into an async task
-
-**SmartModule WASM Size Constraints:**
-- Problem: NER model (~200-500MB) cannot run in WASM SmartModules; must run on consumer side. This limits where NER can be applied in the pipeline.
-- Current capacity: NER works only with `--limit` mode (batch consumption), not streaming mode due to async closure constraints
-- Scaling path: Either implement NER as a microservice or use a lighter NER model for WASM compatibility
+Not measured. Single-process scheduler with in-memory state; no horizontal scaling documented.
 
 ## Dependencies at Risk
 
-**Fluvio at 0.50 with API Deprecations:**
-- Risk: Using Fluvio 0.50 which has documented deprecated APIs in use (`partition_consumer`). Future releases may remove these.
-- Impact: Next Fluvio upgrade could break compilation
-- Migration plan: Track Fluvio release notes; migrate to `stream_consumer` or replacement API when stable. Review fluvio-smartmodule 0.50.1 linker issue noted in README (Rust 1.96+ incompatibility).
-
-**Reqwest 0.12 with rustls-tls:**
-- Risk: Custom feature selection (rustls-tls instead of native-tls) increases supply chain risk and may have security patches lag
-- Impact: TLS vulnerabilities may not be patched as quickly in rustls
-- Migration plan: Consider using native-tls for production or ensure security monitoring of rustls releases
+**Pinned toolchain per crate:**
+- Risk: `rust-toolchain.toml` in root and in each plugin can diverge.
+- Impact: Build failures for wasm targets when versions differ.
+- Migration plan: Single shared toolchain file.
 
 ## Missing Critical Features
 
-**Config File Not Loaded by Default:**
-- Problem: Watch mode expects a `config.json` file in the current directory, but this file is not provided or documented. Users cannot easily discover how to configure watched directories.
-- Blocks: Users cannot use watch mode without knowing about the `--config` flag or the CLI `--ls` override
-- Fix: Provide a template `config.json.example` in the repo and document in README; make the error message more helpful
-
-**No Integration Tests:**
-- Problem: No tests verify that the CLI, streaming layer, and SmartModules work together end-to-end. All tests are unit-level for individual modules.
-- Blocks: Refactoring risks breaking the pipeline without detection
-- Fix: Add integration tests that spin up a test Fluvio cluster and verify data flows through all stages
+Not detected.
 
 ## Test Coverage Gaps
 
-**Untested Streaming Pipeline:**
-- What's not tested: The actual data flow from producer → SmartModules → consumer, the JSON serialization/deserialization at each stage, end-to-end crawling
-- Files: `src/streaming.rs`, `src/commands/produce.rs`, `src/commands/consume.rs`, all `smartmodules/*/src/lib.rs`
-- Risk: Refactoring any part of the pipeline could silently break data compatibility without detection
-- Priority: High — this is the core of the application
+**Test hygiene:**
+- What's not tested: Panic paths in `src/args.rs` are tested with fixed temp filenames in the working directory (`fs::write(config_path, ...)` then `remove_file`), which can race under parallel test runs and leave files such as `test_config_panic.json`.
+- Files: `src/args.rs` (lines 80-141)
+- Risk: Flaky tests, stray files committed accidentally.
+- Priority: Medium. Use `tempfile::TempDir` as `src/output.rs` already does.
 
-**No Error Path Testing for Fluvio Operations:**
-- What's not tested: What happens when Fluvio cluster is unavailable, when serialization fails, when the topics don't exist
-- Files: `src/streaming.rs`, `src/commands/produce.rs`, `src/commands/consume.rs`
-- Risk: Errors may crash the application instead of providing helpful diagnostics
-- Priority: High — affects reliability in production
+**Network-dependent behavior:**
+- Replay fixtures exist for Reddit (`plugins/reddit/tests/fixtures/`) but the RSS plugin (`plugins/rss/`) has no fixtures directory.
+- Priority: Low to Medium.
 
-**Incomplete SmartModule Tests:**
-- What's not tested: Actual extraction logic (title, author, date, keywords), category inference accuracy, relevance scoring computation
-- Files: `smartmodules/map-extract/src/lib.rs` (445 lines with no tests), `smartmodules/map-preprocess/src/lib.rs` (216 lines with no tests)
-- Risk: Algorithm changes could silently degrade quality; edge cases in HTML parsing are not caught
-- Priority: Medium — logic is somewhat stable but edge cases in HTML parsing are probable
+## Repository Hygiene
+
+- Working tree has deleted tracked `.planning/codebase/*.md` files, untracked tooling dirs (`.agents/`, `.bg-shell/`, `.claude/`, `.cursor/`, `.gsd-path/`), and untracked `AGENTS.md`/`WORKFLOW.md`. Decide which to commit or gitignore.
 
 ---
 
-*Concerns audit: 2026-11-03*
+*Concerns audit: 2026-11-22*

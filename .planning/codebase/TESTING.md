@@ -1,317 +1,99 @@
 ---
-last_mapped_commit: 5122e6b9c4aa51ca49831917f1a1035fdc543870
-last_mapped_at: 2026-11-03
+last_mapped_commit: ee408de9974ea0cee802f332ee2386ef13b0428b
+last_mapped_at: 2026-11-22
 ---
 # Testing Patterns
 
-**Analysis Date:** 2026-11-03
+**Analysis Date:** 2026-11-22
 
 ## Test Framework
 
 **Runner:**
-- Rust built-in test harness (no external test runner)
-- Run tests: `cargo test`
-- Run tests with output: `cargo test -- --nocapture`
-- Run tests with threads: `cargo test -- --test-threads=1` (for serial execution)
+- Built-in `cargo test`; async tests use `#[tokio::test]` (dev-dependency `tokio` with `test-util` for paused time, `#[tokio::test(start_paused = true)]`).
+- Config: none beyond `Cargo.toml`; toolchain pinned in `rust-toolchain.toml`.
 
-**Assertion Library:**
-- Rust standard library: `assert!()`, `assert_eq!()`, `assert_ne!()`
-- No external assertion library currently in use
+**Assertion Library:** std `assert!`, `assert_eq!`.
 
 **Run Commands:**
 ```bash
-cargo test                    # Run all tests
-cargo test --lib             # Run library tests only
-cargo test -- --nocapture    # Show println! output
-cargo test test_name          # Run specific test by name
+cargo test                     # unit + tests/ integration (root crate)
+cargo test -- --ignored        # openssl / network / fixture-dependent tests
+cargo clippy --all-targets     # pedantic lints
+cd plugins/rss && cargo test   # plugin crates are separate (not in workspace)
 ```
+Coverage: no tooling configured. No CI workflow detected (`.github/` absent).
 
 ## Test File Organization
 
 **Location:**
-- Tests are co-located with source code in `#[cfg(test)] mod tests` blocks
-- Found in: `src/check.rs`, `src/args.rs`
-- No separate `tests/` directory for integration tests
+- Unit tests co-located: `#[cfg(test)] mod tests { use super::*; ... }` at the bottom of source files (about 50 files, e.g. `src/plugins/config.rs`, `src/plugins/host/scheduler.rs`, `src/commands/consume.rs`).
+- Larger host suites live in sibling `*_tests.rs` modules: `src/plugins/host/wasm_tests.rs`, `https_tests.rs`, `integration_tests.rs`.
+- Binary-level tests in `tests/auth_cli.rs`, `tests/plugins_cli.rs`.
+- Plugin crates: unit tests in `plugins/*/src/*.rs`; replay tests in `plugins/reddit/tests/replay.rs`, `plugins/youtube/tests/replay.rs`, plus `fixtures_manifest.rs`.
 
-**Naming:**
-- Test functions use `test_` prefix
-- Descriptive names indicating what is tested
-- Examples: `test_validate_with_all_valid`, `test_load_config_success`
-
-**Structure:**
-```
-src/module.rs
-├── pub struct/fn/impl definitions
-├── private helpers
-└── #[cfg(test)]
-    mod tests {
-        use super::*;
-        
-        #[test]
-        fn test_case_name() { ... }
-    }
-```
+**Naming:** behavior sentences in snake_case; ignored network groups use a `net_` prefix.
 
 ## Test Structure
 
 **Suite Organization:**
-- All tests for a module grouped in single `#[cfg(test)] mod tests` block
-- `use super::*;` imports everything from parent module
-- Example from `src/args.rs:38-143`:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(initial: u64, max: u64, multiplier: f64) -> BackoffConfig { ... }
+
+    #[test]
+    fn step_sequence_doubles_until_cap() { ... assert_eq!(got, want); }
+}
+```
 
 **Patterns:**
-
-### Basic Test Pattern
-```rust
-#[test]
-fn test_parse_default() {
-    let args = Args::parse_from(vec!["prog"]);
-    assert_eq!(args.ls, None);
-    assert_eq!(args.config, "config.json");
-}
-```
-
-### Setup Pattern
-- Create temporary resources at test start
-- Use `std::fs::File::create()` for temp files
-- Clean up with `fs::remove_file()` at end
-- Example from `src/args.rs:80-87`:
-```rust
-#[test]
-fn test_load_config_success() {
-    let config_path = "test_config_success.json";
-    let mut file = File::create(config_path).unwrap();
-    file.write_all(b"{\"ls\": [\"x\", \"y\"]}").unwrap();
-    let res = load_config(config_path).unwrap();
-    assert_eq!(res, vec!["x".to_string(), "y".to_string()]);
-    fs::remove_file(config_path).unwrap();
-}
-```
-
-### Teardown Pattern
-- Cleanup in same test function (no separate teardown)
-- Use `fs::remove_file()` to delete temp files
-- Run unconditionally (not guarded by assertions)
-
-### Assertion Pattern
-- `assert_eq!(actual, expected)` for equality
-- `assert_ne!()` for inequality
-- `assert!()` for boolean conditions
-- `.is_err()`, `.is_ok()` for `Result` checking
-- `.is_none()`, `.is_some()` for `Option` checking
-- Example from `src/args.rs:89-93`:
-```rust
-#[test]
-fn test_load_config_file_not_found() {
-    let res = load_config("nonexistent.json");
-    assert!(res.is_err());
-}
-```
+- Small local builder helpers at the top of each test module.
+- Table-style expected vectors compared in one `assert_eq!`.
+- Temp dirs via `tempfile::TempDir` for registry/state/token files.
+- CLI tests drive the real binary with `Command::new(env!("CARGO_BIN_EXE_fili"))`, stripping `FILI_REGISTRY`, `FILI_STATE_DIR`, `RUST_LOG` first (`fn fili()` in `tests/auth_cli.rs`), and use inline TOML string constants for plugin configs.
+- Secret-safety: sentinel tokens (`ACCESS_SENTINEL`) asserted absent from both stdout and stderr.
+- Time-dependent scheduler/backoff tests use paused tokio time.
 
 ## Mocking
 
-**Framework:** No external mocking framework
-- Manual fixtures for known test cases
-- File I/O mocking via actual temp files
-- No use of `mockall`, `Mocker`, or similar libraries
+**Framework:** None (no mockall). Hand-written fakes in `src/plugins/host/testing.rs` (cfg(test) only): `InstanceFactory`/`PluginInstance` fakes, `VecSink` as an `ItemSink`, `fixture_wasm(crate_dir, file)` locating prebuilt components under `plugins/<crate>/target/wasm32-unknown-unknown/release`.
 
-**Patterns:**
-- Create real files for I/O testing
-- Pass different inputs to test multiple code paths
-- Example from `src/check.rs:63-75`:
-```rust
-fn is_even_validator(s: &str) -> Result<String, ItemError> {
-    match s.parse::<i32>() {
-        Ok(num) if num % 2 == 0 => Ok(num.to_string()),
-        Ok(_) => Err(ItemError {
-            item: s.to_string(),
-            message: "Odd number".to_string(),
-        }),
-        Err(_) => Err(ItemError {
-            item: s.to_string(),
-            message: "Not a number".to_string(),
-        }),
-    }
-}
-
-#[test]
-fn test_validate_with_all_valid() {
-    let items = vec!["2", "4", "6"];
-    let result = items.validate_with(is_even_validator);
-    assert_eq!(...);
-}
-```
-
-**What to Mock:**
-- File I/O: Create actual temp files for testing
-- Simple functions: Pass different inputs, validate outputs
-- Structures: Build test instances directly
-
-**What NOT to Mock:**
-- External service connections (not tested)
-- Fluvio cluster interactions (require running infrastructure)
-- Long-running async operations (use real timeouts)
+**What to Mock:** the plugin instance, sink, HTTP fetcher (via replay-fetcher/stub-fetcher/fault-source plugins), clock (paused time).
+**What NOT to Mock:** the CLI binary, config parsing, TOML loading; use real files in temp dirs. Fluvio cluster is not needed by tests.
 
 ## Fixtures and Factories
 
-**Test Data:**
-- Inline test helper functions for creating test objects
-- Example from `src/args.rs:69-77`:
-```rust
-#[test]
-fn test_produce_links_with_ls() {
-    let mut args = Args {
-        ls: Some(vec!["a".to_string(), "b".to_string()]),
-        config: "config.json".to_string(),
-    };
-    let links = args.produce_links();
-    assert_eq!(links, vec!["a", "b"]);
-}
-```
-
-**Location:**
-- Test helper functions defined within `#[cfg(test)] mod tests` block
-- Reused across multiple tests in same module
+- HTML sample: `examples/fixtures/news-article.html`.
+- Reddit/YouTube HTTP replay JSON in `plugins/reddit/tests/fixtures/` (documented in its `README.md`), with `.meta.json` for status codes (e.g. `rate_limited_429.meta.json`); `fixtures_manifest.rs` checks the manifest.
+- Example plugin configs in `examples/plugins/*.toml`.
 
 ## Coverage
 
-**Requirements:** None enforced (no coverage tool configured)
-
-**View Coverage:**
-- No built-in coverage view
-- Would need to add via `cargo tarpaulin` or `cargo llvm-cov` if desired
-
-**Current Coverage:**
-- `src/check.rs`: Full coverage with 7 tests (module logic, partition_map trait, error display)
-- `src/args.rs`: Good coverage with 9 tests (CLI parsing, config loading, panic cases)
-- Other modules: No tests defined (`src/models.rs`, `src/output.rs`, `src/crawler.rs`, `src/streaming.rs`, etc.)
+**Requirements:** None enforced.
 
 ## Test Types
 
-**Unit Tests:**
-- Scope: Individual functions and structs
-- Approach: Test business logic in isolation
-- Examples:
-  - `test_validate_with_*` tests: Validate the custom `partition_map` trait
-  - `test_parse_*` tests: Validate CLI argument parsing
-  - `test_load_config_*` tests: Validate JSON config file loading
-  - `test_item_error_display` test: Validate error formatting
-
-**Integration Tests:**
-- Scope: Not currently implemented
-- Would require: Real Fluvio cluster, full pipeline coordination
-- Location: Would go in `tests/` directory if added
-- Candidates: Full `produce` → `consume` flow, SmartModule processing
-
-**E2E Tests:**
-- Framework: Not used
-- Note: Project uses Fluvio for streaming; true E2E would require running cluster
-- Shell-based tests exist in `fluvio/tests/` (external test suite)
+**Unit Tests:** pure logic (backoff, cursors, PKCE, config validation, args/CLI parsing).
+**Integration Tests:** `tests/*.rs` against the compiled binary; `src/plugins/host/integration_tests.rs` and `wasm_tests.rs` run real wasm components (need prebuilt fixtures, panic with build instructions otherwise).
+**E2E Tests:** shell scripts `scripts/live-e2e.sh` and `scripts/verify-authoring.sh` (needs `cargo component`); require Fluvio/compose. Not run by `cargo test`.
 
 ## Common Patterns
 
+**Ignored tests:** always with reason:
+```rust
+#[ignore = "needs the openssl binary: see plugins/README.md"]
+```
+
 **Async Testing:**
-- No async tests currently (tests are blocking)
-- Would use `#[tokio::test]` for async test support if needed
-- Example structure (not in codebase):
 ```rust
-#[tokio::test]
-async fn test_async_operation() {
-    let result = some_async_fn().await;
-    assert!(result.is_ok());
-}
+#[tokio::test(start_paused = true)]
+async fn ... { /* advance paused time, assert on report */ }
 ```
 
-**Error Testing:**
-- Test `Result::Err` cases with `.is_err()`:
-```rust
-#[test]
-fn test_load_config_file_not_found() {
-    let res = load_config("nonexistent.json");
-    assert!(res.is_err());
-}
-```
-
-- Test panic with `#[should_panic]` attribute:
-```rust
-#[test]
-#[should_panic]
-fn test_produce_panic_file_not_found() {
-    let mut args = Args {
-        ls: None,
-        config: "nonexistent.json".to_string(),
-    };
-    args.produce();  // Should panic
-}
-```
-
-**Data Validation Tests:**
-- Create instances with known data
-- Call validation functions
-- Assert expected behavior
-- Example from `src/check.rs:102-115`:
-```rust
-#[test]
-fn test_validate_with_mixed() {
-    let items = vec!["2", "1", "4", "three", "6"];
-    let result = items.validate_with(is_even_validator);
-    assert_eq!(
-        result.valid,
-        vec!["2".to_string(), "4".to_string(), "6".to_string()]
-    );
-    assert_eq!(result.invalid.len(), 2);
-    assert_eq!(result.invalid[0].item, "1");
-    assert_eq!(result.invalid[0].message, "Odd number");
-}
-```
-
-## Test Recommendations (Gaps)
-
-**Critical Missing Coverage:**
-1. `src/streaming.rs` - No tests for Fluvio integration
-   - Would need: Running Fluvio cluster or mock client
-   - Risk: Stream producer/consumer logic uncovered
-   
-2. `src/crawler.rs` - No tests for web crawling logic
-   - Would need: Mock HTTP client or VCR-style recordings
-   - Risk: Link extraction, priority scoring, URL normalization untested
-   
-3. `src/models.rs` - No tests for data structures
-   - Would need: Serialization/deserialization round-trip tests
-   - Risk: Silent data corruption in Fluvio pipeline
-   
-4. `src/output.rs` - No tests for formatting/output
-   - Would need: File I/O and formatting verification
-   - Risk: User-facing output could be malformed
-
-**Recommended Next Steps:**
-1. Add `dev-dependencies` section to `Cargo.toml`:
-   ```toml
-   [dev-dependencies]
-   tokio = { version = "1", features = ["full"] }
-   serde_json = "1"
-   tempfile = "3"
-   ```
-
-2. Add async test support:
-   ```rust
-   #[tokio::test]
-   async fn test_streaming_operations() { ... }
-   ```
-
-3. Test data serialization:
-   ```rust
-   #[test]
-   fn test_raw_page_serialization() {
-       let page = RawPage { ... };
-       let json = serde_json::to_string(&page).unwrap();
-       let restored: RawPage = serde_json::from_str(&json).unwrap();
-       assert_eq!(page, restored);
-   }
-   ```
-
-4. Mock Fluvio client for integration tests (consider: `mockito` or manual mocks)
+**Error Testing:** assert on diagnostic code/text of `ConfigError` variants and on absence of secrets in output.
 
 ---
 
-*Testing analysis: 2026-11-03*
+*Testing analysis: 2026-11-22*

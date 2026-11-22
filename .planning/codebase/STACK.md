@@ -1,128 +1,81 @@
 ---
-last_mapped_commit: 5122e6b9c4aa51ca49831917f1a1035fdc543870
-last_mapped_at: 2026-11-03
+last_mapped_commit: ee408de9974ea0cee802f332ee2386ef13b0428b
+last_mapped_at: 2026-11-22
 ---
 # Technology Stack
 
-**Analysis Date:** 2026-11-03
+**Analysis Date:** 2026-11-22
 
 ## Languages
 
 **Primary:**
-- Rust 1.85.0 - Core application; required for SmartModule WASM compilation (`Cargo.toml` line 4)
+- Rust (edition 2024, toolchain 1.96.0 pinned in `rust-toolchain.toml`, MSRV 1.95 in `Cargo.toml`) - CLI binary `fili` (`src/`), SmartModules, plugins
 
 **Secondary:**
-- WASM (Rust compiled) - SmartModule transformations in Fluvio pipeline
-- Python 3.12 - Optional model downloader helper in Docker setup
+- WIT (WebAssembly Interface Types) - plugin contract in `wit/host.wit`, `wit/types.wit`, `wit/worlds.wit`
+- Shell - `scripts/live-e2e.sh`, `scripts/register-compose-spu.sh`, `scripts/verify-authoring.sh`
+- YAML / JSON - `transforms*.yaml`, `config.json`, `docker-compose.yml`
 
 ## Runtime
 
 **Environment:**
-- Native binary compiled to Linux/macOS/Windows (via Rust)
-- Docker deployment with Debian bookworm-slim runtime image
+- Native binary (tokio async runtime); Wasm components hosted via wasmtime
+- Plugins compile to wasm32 components via cargo-component
 
 **Package Manager:**
-- Cargo 1.85.0 (Rust package manager)
-- Lockfile: `Cargo.lock` present and required (--locked flag used in Docker)
+- Cargo
+- Lockfile: present (`Cargo.lock`)
 
 ## Frameworks
 
 **Core:**
-- Fluvio 0.50 - Event streaming platform for pipeline coordination (`Cargo.toml` line 36)
-- Tokio 1.0 (with full features) - Async runtime for concurrent operations (`Cargo.toml` line 30)
+- clap 4 (derive, env) - CLI (`src/cli.rs`, `src/args.rs`, `src/commands/`)
+- tokio 1 (full) - async runtime
+- fluvio 0.50 - streaming client (`src/streaming.rs`)
+- wasmtime 48 (component-model, cranelift) - plugin host (`src/plugins/host/`)
+- gline-rs 1.0 + orp 0.9 (ONNX Runtime via `ort` 2.0.0-rc.9) - GLiNER NER scoring (`src/scorer.rs`), model in `models/gliner_small-v2.1`
+- reqwest 0.12 (blocking, rustls-tls) + scraper 0.21 - crawling (`src/crawler.rs`)
+- miette 7 / thiserror 2 - error reporting; tracing + tracing-subscriber - logging
+- watchexec 8 - file watching
 
-**CLI & Utilities:**
-- Clap 4 (with derive and env features) - Command-line argument parsing (`Cargo.toml` line 19)
-- Miette 7 (with fancy) - Enhanced error reporting and diagnostics (`Cargo.toml` line 31)
+**Testing:**
+- Built-in `cargo test`; tokio `test-util` (paused time)
 
-**Data Processing:**
-- Scraper 0.21 - HTML parsing for content extraction (`Cargo.toml` line 21)
-- Serde 1.0 + Serde_json 1.0 - JSON serialization/deserialization (`Cargo.toml` lines 22-23)
+**Build/Dev:**
+- Workspace members: `.`, `smartmodules/filter-relevance`, `smartmodules/map-preprocess`, `smartmodules/map-extract` (fluvio-smartmodule 0.50, cdylib)
+- `plugins/` excluded from workspace; each plugin (`plugins/rss`, `reddit`, `youtube`, `http-fetcher`, `replay-fetcher`, `stub-*`, `fault-source`, `template`) has its own `[workspace]`, wit-bindgen-rt 0.41
+- Lints: clippy `all` + `pedantic` warn, `unsafe_code` warn
+- Profile `release-lto` (lto, opt-level s)
+- `fluvio/` directory is a vendored Fluvio checkout (own Cargo.lock/Makefile)
 
-**File & System Watch:**
-- Watchexec 8.0 - Filesystem event monitoring (`Cargo.toml` line 27)
-- Watchexec-events 6.0 - Event type definitions (`Cargo.toml` line 28)
-- Watchexec-signals 5.0 - Signal handling (`Cargo.toml` line 29)
+## Key Dependencies
 
-**ML/NER:**
-- GLiNER (via gline-rs 1.0) - Zero-shot Named Entity Recognition engine (`Cargo.toml` line 32)
-- ORP 0.9 - ONNX Runtime bindings for model inference (`Cargo.toml` line 33)
+**Critical:**
+- fluvio 0.50, wasmtime 48, gline-rs/orp/ort, reqwest, serde/serde_json, toml 1
 
-**Logging & Tracing:**
-- Tracing 0.1 - Structured logging framework (`Cargo.toml` line 38)
-- Tracing-subscriber 0.3 (with env-filter) - Log filtering and output control (`Cargo.toml` line 39)
-
-**Utilities:**
-- Reqwest 0.12 (with blocking + rustls-tls, no default-features) - HTTP client for web crawling (`Cargo.toml` line 20)
-- URL 2.0 - URL parsing and manipulation (`Cargo.toml` line 24)
-- Regex 1.0 - Pattern matching for text processing (`Cargo.toml` line 25)
-- Tempfile 3.0 - Temporary file/directory creation (`Cargo.toml` line 26)
-- Futures-util 0.3 - Async utilities (`Cargo.toml` line 37)
-
-## SmartModule Dependencies
-
-**SmartModule Framework:**
-- fluvio-smartmodule 0.50 - WASM framework for streaming transformations
-  - Used in: `smartmodules/map-preprocess/Cargo.toml`
-  - Used in: `smartmodules/map-extract/Cargo.toml`
-  - Used in: `smartmodules/filter-relevance/Cargo.toml`
+**Infrastructure:**
+- sha2, base64, getrandom 0.3, open 5 (PKCE/OAuth login in `src/plugins/auth/`), tokio-util, regex, url, chrono, tempfile
+- Plugin-side: quick-xml 0.37 (RSS), time 0.3, percent-encoding 2 (YouTube)
 
 ## Configuration
 
 **Environment:**
-- Runtime configuration via environment variables (see INTEGRATIONS.md)
-- Fluvio cluster connection: `FLUVIO_CLUSTER_ADDR` env var (default: localhost:9003)
-- Model paths: `TOKENIZER_PATH` and `MODEL_PATH` env vars
+- `.env` (present, not read) and `.env.example`; keys: `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`, `REDDIT_USER_AGENT_CONTACT`
+- Plugin secrets resolved from process env then `.env` (`src/plugins/secrets.rs`) via `[host.secrets]` aliases
+- App config: `config.json`, `src/config.rs`, plugin registry `src/plugins/config.rs`; Fluvio client config in `docker/fluvio-config`
+- Transform chains: `transforms.yaml`, `transforms-extract-only.yaml`, `transforms-filter-only.yaml`
 
 **Build:**
-- Rust 1.85.0 edition 2024 (`Cargo.toml` line 4)
-- Linting: Clippy (all + pedantic warnings) and unsafe_code warning (`Cargo.toml` lines 7-12)
-- Release profile with LTO and optimization (`Cargo.toml` lines 49-52)
-- WASM target: wasm32-unknown-unknown (for SmartModules)
-
-**Workspace:**
-- Monorepo structure with main binary and SmartModule crates (`Cargo.toml` lines 41-47):
-  - Root: filimon (main application)
-  - `smartmodules/filter-relevance`
-  - `smartmodules/map-preprocess`
-  - `smartmodules/map-extract`
+- `Cargo.toml`, `rust-toolchain.toml`, `Dockerfile` (multi-stage; ORT_STRATEGY=download, ONNX Runtime 1.24), `docker-compose.yml`
 
 ## Platform Requirements
 
 **Development:**
-- Rust 1.85.0 (exact version required due to SmartModule WASM linker issue in newer versions)
-- Fluvio CLI 0.18.1+ for cluster management
-- SMDK (SmartModule Development Kit) for building transformations
-- Docker + Docker Compose (for containerized deployment)
+- Rust 1.96.0 with clippy/rustfmt, cargo-component for plugins, cmake/pkg-config/libssl for Docker build, Unix (file mode 0o600 usage)
 
 **Production:**
-- Fluvio cluster (local or remote) with at least 1 SC and 1 SPU
-- Linux/macOS/Windows with:
-  - Libc (glibc or musl depending on build)
-  - OpenSSL 3.x (or rustls-tls feature handles it)
-  - ONNX Runtime 1.24 (auto-downloaded via ort crate)
-- Minimum 2GB RAM (1.5GB for GLiNER small model + 500MB headroom)
-- Recommended: 4+ CPU cores
-
-## Docker Build Stack
-
-**Build Stage: Rust 1-slim-bookworm**
-- Base: Official Rust image on Debian bookworm
-- Build tools: gcc, g++, pkg-config, libssl-dev, cmake
-- ONNX Runtime: Downloaded at cargo build time via `ORT_STRATEGY=download`
-
-**Runtime Stage: Debian bookworm-slim**
-- Minimal dependencies: ca-certificates, libssl3
-- ONNX Runtime library: Copied from builder stage and registered with ldconfig
-- Binary size: ~15-20MB (filimon binary)
-- Image size: ~100-150MB (with ONNX Runtime)
-
-## Binary Output
-
-**Main executable:** `fili` (compiled at `target/release/fili`)
-- Entrypoint in Docker: `/usr/local/bin/fili`
-- CLI binary supporting: produce, consume, watch, file, stream modes
+- Docker Compose: `fluvio-sc`, `fluvio-spu` (infinyon/fluvio), `filimon`, optional `model-downloader` (profile `setup`)
 
 ---
 
-*Stack analysis: 2026-11-03*
+*Stack analysis: 2026-11-22*

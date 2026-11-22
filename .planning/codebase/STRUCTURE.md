@@ -1,206 +1,77 @@
 ---
-last_mapped_commit: 5122e6b9c4aa51ca49831917f1a1035fdc543870
-last_mapped_at: 2026-11-03
+last_mapped_commit: ee408de9974ea0cee802f332ee2386ef13b0428b
+last_mapped_at: 2026-11-22
 ---
 # Codebase Structure
 
-**Analysis Date:** 2026-11-03
+**Analysis Date:** 2026-11-22
 
 ## Directory Layout
 
 ```
 filimon/
-├── src/                          # Main application source
-│   ├── main.rs                   # CLI entry point and command dispatch
-│   ├── cli.rs                    # Clap CLI struct definitions
-│   ├── args.rs                   # Additional argument types
-│   ├── commands/                 # Command handlers (produce, consume, watch)
-│   │   ├── mod.rs                # Re-exports for command module
-│   │   ├── produce.rs            # Crawl and produce news SourceItems
-│   │   ├── consume.rs            # Merge news (chain) and social streams, NER, JSON output
-│   │   └── watch.rs              # Watch directories for HTML files
-│   ├── streaming.rs              # Fluvio layer: topics, news chain, preflight, topic_stream
-│   ├── models.rs                 # Data structures (SourceItem, ExtractedArticle, OutputRecord, etc.)
-│   ├── crawler.rs                # Web crawling and link extraction
-│   ├── scorer.rs                 # GLiNER-based NER
-│   ├── output.rs                 # Formatting and JSON output
-│   ├── config.rs                 # Load watch directories from JSON
-│   └── check.rs                  # Validation helpers
-│
-├── smartmodules/                 # WASM-based Fluvio transformations
-│   ├── map-preprocess/           # Stage 2: tokenization
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
-│   ├── map-extract/              # Stage 3: extraction and relevance scoring
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
-│   └── filter-relevance/         # Stage 4: relevance threshold filter
-│       ├── Cargo.toml
-│       └── src/lib.rs
-│
-├── fluvio/                       # Fluvio ecosystem submodule (vendored)
-│   ├── .github/
-│   ├── crates/
-│   └── ...
-│
-├── models/                       # GLiNER model files (local, not in repo)
-│   └── gliner_small-v2.1/
-│       ├── tokenizer.json
-│       └── onnx/model.onnx
-│
-├── output/                       # Output directory for JSON results
-│
-├── Cargo.toml                    # Workspace manifest
-├── Cargo.lock                    # Dependency lock file
-│
-├── docker-compose.yml            # Fluvio cluster setup
-├── Dockerfile                    # Containerized build
-│
-├── README.md                     # Project documentation
-│
-├── transforms.yaml               # Fluvio pipeline config (all stages)
-├── transforms-extract-only.yaml  # Alternative: skip preprocessing
-├── transforms-filter-only.yaml   # Alternative: final filtering only
-│
-├── test_config_panic.json        # Test fixture for config loading
-│
-├── .gitignore                    # Git ignore patterns
-├── config.json                   # Watch mode configuration (local)
-│
-└── .planning/codebase/           # Generated codebase analysis
-    ├── ARCHITECTURE.md           # Architecture and data flow
-    └── STRUCTURE.md              # This file
+├── src/                  # Main `fili` binary
+│   ├── main.rs           # Entry, logging, subcommand routing
+│   ├── cli.rs, args.rs   # clap definitions
+│   ├── commands/         # auth, consume, plugins, produce, run, watch
+│   ├── crawler.rs, check.rs, models.rs, scorer.rs, streaming.rs, output.rs, config.rs
+│   └── plugins/          # config, secrets, error, auth/, host/
+├── plugins/              # Wasm guest crates (each standalone, own Cargo.lock)
+│   ├── rss/ reddit/ youtube/        # source plugins
+│   ├── stub-source/ fault-source/   # test sources
+│   ├── http-fetcher/ replay-fetcher/ stub-fetcher/  # fetchers
+│   └── template/                    # starter plugin
+├── smartmodules/         # filter-relevance, map-extract, map-preprocess
+├── wit/                  # host.wit, types.wit, worlds.wit
+├── examples/plugins/     # filimon.toml registry + per-plugin tomls
+├── examples/fixtures/    # sample HTML
+├── tests/                # CLI integration tests (auth_cli.rs, plugins_cli.rs)
+├── scripts/              # live-e2e.sh, register-compose-spu.sh, verify-authoring.sh
+├── docker/, Dockerfile, docker-compose.yml  # Fluvio cluster + service
+├── docs/plugin-guide.md
+├── transforms*.yaml      # SmartModule chain definitions
+├── config.json
+├── models/               # GLiNER model (gitignored)
+├── fluvio/, target/, output/  # gitignored
+└── .planning/            # GSD planning artifacts
 ```
 
 ## Directory Purposes
 
-**`src/`:**
-- Purpose: Main Rust binary source code
-- Contains: CLI logic, streaming abstraction, data models, transformations
-- Key files: `main.rs` (entry), `streaming.rs` (Fluvio wrapper), `models.rs` (data shapes)
-
-**`src/commands/`:**
-- Purpose: Distinct operational modes
-- Contains: produce.rs, consume.rs, watch.rs (and produce/consume/file/watch dispatchers)
-- Key files: `produce.rs` (crawl + send), `consume.rs` (subscribe + enrich), `watch.rs` (stubbed)
-
-**`smartmodules/`:**
-- Purpose: WASM transformations deployed to Fluvio cluster
-- Contains: Three independent Cargo projects for map-preprocess, map-extract, filter-relevance
-- Key files: Each has `src/lib.rs` with `#[smartmodule(...)]` macro
-- Notes: Compiled to WASM and registered with Fluvio before pipeline runs
-
-**`fluvio/`:**
-- Purpose: Fluvio community source (submodule)
-- Contains: Full Fluvio SDK and CLI source
-- Used for: Building from source; normally not needed if Fluvio binaries are pre-installed
-
-**`models/`:**
-- Purpose: Local cache of GLiNER NER model files
-- Contains: `gliner_small-v2.1/` with tokenizer.json and ONNX model
-- Notes: Downloaded separately; path configured via `--tokenizer` and `--model` CLI flags
-
-**`output/`:**
-- Purpose: Directory for JSON output files
-- Contains: Results from consume operations (wise_output.json)
-- Notes: User-writeable; created on first run
+**`src/commands/`:** one file per subcommand, exported via `src/commands/mod.rs`.
+**`src/plugins/host/`:** wasm runtime; unit tests in `*_tests.rs` and `testing.rs` (cfg(test)).
+**`src/plugins/auth/`:** OAuth client, PKCE, callback server, token store, providers.
+**`plugins/<name>/`:** guest crate; larger ones split into `component.rs`, `poll.rs`, `cursor.rs`, `http.rs`, `settings.rs`, `api.rs`, `feed.rs`; tests in `tests/replay.rs` with `tests/fixtures/`.
+**`wit/`:** the only guest/host contract; change here affects `src/plugins/host/engine.rs` and every plugin.
 
 ## Key File Locations
 
-**Entry Points:**
-- `src/main.rs`: Async main entry point; parses CLI, loads NER engine, dispatches to commands
-- `src/cli.rs`: Clap struct definitions (Cli, Command enum with variants)
-
-**Configuration:**
-- `Cargo.toml`: Workspace manifest; defines dependencies and SmartModule members
-- `docker-compose.yml`: Fluvio cluster and dependencies (Zookeeper, SPU)
-- `transforms.yaml`: Fluvio pipeline; maps topics to SmartModules
-
-**Core Logic:**
-- `src/streaming.rs`: Fluvio client wrapper; topic names (`TOPIC_RAW_PAGES`, `TOPIC_SOCIAL_ITEMS`); `NEWS_CHAIN` / `news_chain()`; `preflight`; `topic_stream` (`consumer_with_config`); producers; topic management
-- `src/models.rs`: `SourceItem` input envelope (news and social); chain shapes RawPage → TokenizedContent → PreprocessedBundle → ExtractedArticle → NamedEntity; `OutputRecord` / `ArticleMeta` output
-- `src/crawler.rs`: URL crawling, link extraction, priority scoring
-- `src/scorer.rs`: GLiNER NER engine initialization and inference
-
-**Commands:**
-- `src/commands/produce.rs`: Crawl, discover links, send news `SourceItem`s to `filimon-raw-pages`
-- `src/commands/consume.rs`: Merge the `filimon-raw-pages` news stream (through the SmartModule chain) and the `filimon-social-items` social stream (no SmartModules), honour `--source` / `--limit`, optional NER enrichment for both kinds, and write one JSON array (`--output`, default `output/wise_output.json`)
-- `src/commands/watch.rs`: Stubbed; should watch directories for HTML changes
-
-**Testing & Configuration:**
-- `test_config_panic.json`: Test fixture for JSON deserialization errors
-- `config.json`: Watch mode config (JSON list of directories)
+**Entry Points:** `src/main.rs`; workspace is declared in `Cargo.toml` (`[workspace]`).
+**Configuration:** `Cargo.toml`, `rust-toolchain.toml`, `config.json`, `examples/plugins/filimon.toml`, `.env.example`.
+**Core Logic:** `src/plugins/host/scheduler.rs`, `src/streaming.rs`, `src/models.rs`.
+**Testing:** inline `#[cfg(test)]` modules, `tests/*.rs`, `plugins/*/tests/`.
 
 ## Naming Conventions
 
-**Files:**
-- Rust source: `snake_case.rs` (e.g., `map_extract.rs`, `run_consume.rs`)
-- WASM modules: `kebab-case` directories (e.g., `map-extract/`, `filter-relevance/`)
-- Config: JSON files in project root (e.g., `config.json`, `transforms.yaml`)
-
-**Directories:**
-- Command modules: `commands/` with `mod.rs` centralizing re-exports
-- Fluvio artifacts: `smartmodules/` with each module as a sub-directory
-- Output: `output/` (user-writeable, typically git-ignored)
-
-**Types:**
-- Structs: `PascalCase` (e.g., RawPage, ExtractedArticle, PipelineCoordinator)
-- Enums: `PascalCase` variants (e.g., Command::Produce, Command::Consume)
-- Functions: `snake_case` (e.g., `run_produce`, `fetch_page`, `score_link_priority`)
-- Constants: `SCREAMING_SNAKE_CASE` (e.g., TOPIC_RAW_PAGES, ARTICLE_SIGNALS)
-
-**Modules:**
-- Library modules: `mod.rs` in directory; re-exports in parent
-- Private submodules: prefix with `_` if needed; use `pub use` to expose publicly
+**Files:** snake_case `.rs`; test-only modules `*_tests.rs`; plugin crates kebab-case directories.
+**Directories:** lowercase kebab-case (`stub-source`, `map-extract`).
+**Topics:** `filimon-<name>` constants `TOPIC_*` in `src/streaming.rs`.
+**Source file header:** a banner comment block naming the file and its purpose.
 
 ## Where to Add New Code
 
-**New Feature (e.g., database output):**
-- Primary code: `src/output.rs` (add new save function for database)
-- Models: `src/models.rs` (add DatabaseConfig struct if needed)
-- Commands: `src/commands/consume.rs` (add new flag to command struct in cli.rs)
-- Tests: Co-located in same files with `#[cfg(test)]` modules
-
-**New SmartModule (e.g., sentiment analysis):**
-- Create: `smartmodules/sentiment-analysis/` directory
-- Structure: Copy `smartmodules/map-extract/` layout (Cargo.toml + src/lib.rs)
-- Registration: Update `transforms.yaml` to add topic and SmartModule binding
-- Input/output: Define new serde structs in module's `lib.rs`; use in main app via `models.rs`
-
-**New CLI Command (e.g., export):**
-- File: Create `src/commands/export.rs`
-- Struct: Define variant in `Command` enum in `src/cli.rs`
-- Handler: Implement `pub async fn run(...)` in export.rs
-- Dispatch: Add `Command::Export { ... }` pattern match in `src/main.rs:58`
-- Module: Add `pub mod export;` and `pub use export::run as run_export;` to `src/commands/mod.rs`
-
-**Utilities & Helpers:**
-- Shared helpers: `src/check.rs` or new `src/utils.rs`
-- Validation: Add to `src/check.rs` (ItemError struct already defined)
-- Extensions: Trait impls in the module where they're used; avoid `src/ext.rs` unless many
+**New subcommand:** variant in `src/cli.rs`, handler `src/commands/<name>.rs`, export in `src/commands/mod.rs`, route in `src/main.rs`; CLI tests in `tests/`.
+**New source plugin:** copy `plugins/template/`, add `examples/plugins/<name>.toml` and register in `examples/plugins/filimon.toml`; follow `plugins/rss/` layout; see `docs/plugin-guide.md`.
+**New SmartModule:** `smartmodules/<name>/` with `SmartModule.toml`; wire in `transforms*.yaml`.
+**Host feature:** `src/plugins/host/<file>.rs`, declare in `src/plugins/host/mod.rs`.
+**Shared helpers:** `src/output.rs` or `src/models.rs`.
 
 ## Special Directories
 
-**`target/`:**
-- Purpose: Rust build artifacts (compiled binaries, dependencies)
-- Generated: Yes
-- Committed: No (in .gitignore)
-
-**`.gsd-path/`:**
-- Purpose: GSD Path pipeline state (not product code)
-- Generated: Yes (by orchestrator)
-- Committed: No
-
-**`node_modules/` (if added):**
-- Purpose: JavaScript dependencies (not present; Rust-only project)
-- Generated: Yes (if npm used)
-- Committed: No
-
-**`smartmodules/target/`:**
-- Purpose: WASM build artifacts
-- Generated: Yes
-- Committed: No
+**`target/`, `fluvio/`, `models/`, `output/`:** generated or vendored, gitignored.
+**`plugins/*/tests/fixtures/`:** recorded HTTP responses for replay tests, committed.
+**`.planning/`, `.project/`, `.gsd-path/`:** pipeline artifacts, not product code.
 
 ---
 
-*Structure analysis: 2026-11-03*
+*Structure analysis: 2026-11-22*
